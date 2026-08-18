@@ -1,0 +1,47 @@
+{
+  "name": "yagami",
+  "version": "0.1.0",
+  "description": "Self-hosted Anthropic-compatible API backed by your signed-in Claude Code CLI, plus an embeddable library for driving Claude Code sessions from your own apps.",
+  "type": "module",
+  "license": "MIT",
+  "author": "justin06lee",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "yagami": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/cli.ts start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.0",
+    "@hono/node-server": "^1.14.0",
+    "commander": "^14.0.0",
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0"
+  }
+}
