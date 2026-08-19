@@ -9,7 +9,13 @@
  * Server mode lives in `yagami/server` (or the `yagami` CLI).
  */
 
-export { YagamiEngine, type EngineOptions, type CompleteResult, type StreamStart } from "./core/engine.js";
+export {
+  YagamiEngine,
+  type EngineOptions,
+  type CompleteResult,
+  type StreamStart,
+  type EngineModel,
+} from "./core/engine.js";
 export { claudeCodeSession, type ClaudeSessionOptions } from "./core/session.js";
 export type {
   AgentOptions,

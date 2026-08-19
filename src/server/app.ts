@@ -4,13 +4,14 @@ import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError, type MessagesRequest } from "../core/types.js";
-import type { CompleteResult, StreamStart } from "../core/engine.js";
+import type { CompleteResult, EngineModel, StreamStart } from "../core/engine.js";
 
 /** What the app needs from an engine — lets tests inject a fake. */
 export interface EngineLike {
   claudePath: string;
   complete(req: MessagesRequest): Promise<CompleteResult>;
   stream(req: MessagesRequest, opts?: { signal?: AbortSignal }): StreamStart;
+  listModels(): Promise<EngineModel[]>;
 }
 
 export interface AppOptions {
@@ -20,13 +21,13 @@ export interface AppOptions {
   version?: string;
 }
 
-/** Model ids surfaced by GET /v1/models. Any id your CLI accepts works. */
-const KNOWN_MODELS = [
+/** Served by GET /v1/models only when probing the CLI fails. */
+const FALLBACK_MODELS: EngineModel[] = [
   "claude-fable-5",
   "claude-opus-5",
   "claude-sonnet-5",
   "claude-haiku-4-5-20251001",
-];
+].map((id) => ({ id, display_name: id }));
 
 function safeEqual(a: string, b: string): boolean {
   const ha = createHash("sha256").update(a).digest();
@@ -62,14 +63,26 @@ export function createApp(options: AppOptions): Hono {
     await next();
   });
 
-  app.get("/v1/models", (c) =>
-    c.json({
-      data: KNOWN_MODELS.map((id) => ({ type: "model", id, display_name: id })),
+  app.get("/v1/models", async (c) => {
+    let models = FALLBACK_MODELS;
+    let source = "fallback";
+    try {
+      const probed = await engine.listModels();
+      if (probed.length > 0) {
+        models = probed;
+        source = "engine";
+      }
+    } catch {
+      // engine unavailable or slow — the static list keeps clients working
+    }
+    c.header("x-yagami-models-source", source);
+    return c.json({
+      data: models.map((m) => ({ type: "model", ...m })),
       has_more: false,
-      first_id: KNOWN_MODELS[0],
-      last_id: KNOWN_MODELS[KNOWN_MODELS.length - 1],
-    }),
-  );
+      first_id: models[0]?.id,
+      last_id: models[models.length - 1]?.id,
+    });
+  });
 
   app.post("/v1/messages", async (c) => {
     let body: unknown;

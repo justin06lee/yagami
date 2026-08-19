@@ -26,6 +26,9 @@ function fakeEngine(overrides: Partial<EngineLike> = {}): EngineLike {
         yield { event: "message_stop", data: { type: "message_stop" } };
       })(),
     }),
+    listModels: async () => [
+      { id: "sonnet", display_name: "Sonnet", resolved_model: "claude-sonnet-5" },
+    ],
     ...overrides,
   };
 }
@@ -124,12 +127,32 @@ describe("POST /v1/messages", () => {
 });
 
 describe("misc routes", () => {
-  it("serves /v1/models", async () => {
+  it("serves /v1/models from the engine", async () => {
     const app = createApp({ engine: fakeEngine(), apiKeys: [KEY] });
     const res = await app.request("/v1/models", { headers: { "x-api-key": KEY } });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { data: unknown[] };
+    expect(res.headers.get("x-yagami-models-source")).toBe("engine");
+    const body = (await res.json()) as { data: Array<Record<string, unknown>> };
+    expect(body.data).toEqual([
+      { type: "model", id: "sonnet", display_name: "Sonnet", resolved_model: "claude-sonnet-5" },
+    ]);
+  });
+
+  it("falls back to the static model list when probing fails", async () => {
+    const app = createApp({
+      engine: fakeEngine({
+        listModels: async () => {
+          throw new Error("engine down");
+        },
+      }),
+      apiKeys: [KEY],
+    });
+    const res = await app.request("/v1/models", { headers: { "x-api-key": KEY } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-yagami-models-source")).toBe("fallback");
+    const body = (await res.json()) as { data: Array<{ id: string }> };
     expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data.map((m) => m.id)).toContain("claude-sonnet-5");
   });
 
   it("404s unknown routes with Anthropic-shaped body", async () => {

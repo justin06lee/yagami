@@ -179,6 +179,35 @@ describe("YagamiEngine.complete with prefill", () => {
   });
 });
 
+describe("YagamiEngine.listModels", () => {
+  it("probes the CLI once and caches the result", async () => {
+    queryMock.mockImplementation(() => ({
+      supportedModels: async () => [
+        { value: "sonnet", displayName: "Sonnet", description: "fast", resolvedModel: "claude-sonnet-5" },
+      ],
+    }));
+    const engine = makeEngine();
+    const models = await engine.listModels();
+    expect(models).toEqual([
+      { id: "sonnet", display_name: "Sonnet", description: "fast", resolved_model: "claude-sonnet-5" },
+    ]);
+    await engine.listModels();
+    expect(queryMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not cache a failed probe", async () => {
+    queryMock.mockImplementation(() => ({
+      supportedModels: async () => {
+        throw new Error("engine down");
+      },
+    }));
+    const engine = makeEngine();
+    await expect(engine.listModels()).rejects.toThrowError(/engine down/);
+    await expect(engine.listModels()).rejects.toThrowError(/engine down/);
+    expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("YagamiEngine resume fallback", () => {
   const FOLLOW_UP = {
     model: "claude-x",
