@@ -1,17 +1,28 @@
+<div align="center">
+
+<img src="assets/yagami.svg" alt="yagami" width="330" />
+
 # yagami
 
-Your signed-in Claude Code CLI, exposed as a self-hosted **Anthropic-compatible API** — or embedded directly in your own app as a library.
+**Your signed-in Claude Code CLI as a self-hosted Anthropic-compatible API.**<br>
+*Point any Anthropic client at your own subscription — or embed the engine as a library.*
+
+</div>
+
+---
 
 yagami does the T3-Code trick: it drives the Claude Agent SDK with `pathToClaudeCodeExecutable` pointed at the `claude` binary you already installed and logged into. No API key from Anthropic, no separate auth — the spawned engine uses the same login your terminal sessions do. On top of that it serves `POST /v1/messages` with Anthropic request/response shapes and SSE streaming, so anything that accepts an Anthropic `baseURL` + `apiKey` can use it as a drop-in.
 
 > **Personal use only.** This exists so *you* can point *your own tools* at *your own subscription*. Offering subscription-backed access to other people is against Anthropic's terms. Keep the endpoint private and don't share keys.
 
-## Server mode
+## Install
 
 ```sh
-pnpm install && pnpm build     # or: npm i -g yagami (if published)
-node dist/cli.js start         # first run generates + saves an API key and prints it
+make          # bun install + build + install `yagami` onto your PATH (~/.local/bin)
+yagami start  # first run generates + saves an API key and prints it
 ```
+
+`make update` stops any running yagami server, rebuilds, reinstalls, and restarts it.
 
 ```
 yagami v0.1.0
@@ -120,6 +131,7 @@ Extra response headers: `x-yagami-cost-usd` (what the turn would have cost at AP
 ## Development
 
 ```sh
-pnpm typecheck && pnpm test   # unit tests (no tokens spent)
-pnpm smoke                    # live end-to-end through your real CLI (tiny token cost)
+bun run typecheck && bun run test   # unit tests (no tokens spent)
+bun run smoke                       # live end-to-end through your real CLI (tiny token cost)
+make build                          # build dist/ only
 ```

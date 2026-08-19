@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" role="img" aria-label="yagami">
+  <rect width="600" height="600" fill="#0C0C0F"/>
+
+  <!-- night sky -->
+  <circle cx="432" cy="138" r="64" fill="#E9E4D4"/>
+  <circle cx="406" cy="118" r="58" fill="#0C0C0F"/>
+  <path d="M141 106 L144 115 L153 118 L144 121 L141 130 L138 121 L129 118 L138 115 Z" fill="#7E8398" opacity="0.85"/>
+  <path d="M206 196 L208 202 L214 204 L208 206 L206 212 L204 206 L198 204 L204 202 Z" fill="#5C6072" opacity="0.8"/>
+  <path d="M497 268 L499 274 L505 276 L499 278 L497 284 L495 278 L489 276 L495 274 Z" fill="#5C6072" opacity="0.8"/>
+
+  <!-- notebook -->
+  <g transform="rotate(-7 300 330)">
+    <!-- page block under the cover -->
+    <rect x="191" y="251" width="226" height="170" fill="#DDD8C8"/>
+    <rect x="191" y="251" width="226" height="170" fill="#0C0C0F" opacity="0.28"/>
+    <!-- cover -->
+    <rect x="185" y="245" width="226" height="166" fill="#17171C" stroke="#2A2A33" stroke-width="2"/>
+    <!-- spine -->
+    <rect x="185" y="245" width="14" height="166" fill="#101014"/>
+    <!-- ribbon -->
+    <polygon points="356,411 380,411 380,468 368,454 356,468" fill="#B03A32"/>
+    <!-- cover title marks -->
+    <rect x="252" y="302" width="100" height="6" fill="#E5E1D2" opacity="0.8"/>
+    <rect x="264" y="320" width="76" height="4" fill="#E5E1D2" opacity="0.5"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="300" y="522" text-anchor="middle" font-family="-apple-system, 'Helvetica Neue', Arial, sans-serif"
+    font-size="58" font-weight="700" letter-spacing="3" fill="#E9E6DC">yagami</text>
+  <text x="300" y="564" text-anchor="middle" font-family="-apple-system, 'Hiragino Sans', 'Helvetica Neue', sans-serif"
+    font-size="24" fill="#9A4B45">夜神</text>
+</svg>
