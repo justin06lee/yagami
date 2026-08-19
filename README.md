@@ -25,7 +25,7 @@ yagami start  # first run generates + saves an API key and prints it
 `make update` stops any running yagami server, rebuilds, reinstalls, and restarts it.
 
 ```
-yagami v0.1.0
+yagami v0.3.0
   listening   http://127.0.0.1:8787
   claude      /Users/you/.local/bin/claude (2.1.235 (Claude Code))
   api key     ygm_…

@@ -1,6 +1,6 @@
 {
   "name": "yagami",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Self-hosted Anthropic-compatible API backed by your signed-in Claude Code CLI, plus an embeddable library for driving Claude Code sessions from your own apps.",
   "type": "module",
   "license": "MIT",
