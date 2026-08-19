@@ -4,13 +4,13 @@ import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError, type MessagesRequest } from "../core/types.js";
-import type { CompleteResult, EngineModel, StreamStart } from "../core/engine.js";
+import type { CompleteResult, EngineModel, StreamOptions, StreamStart } from "../core/engine.js";
 
 /** What the app needs from an engine — lets tests inject a fake. */
 export interface EngineLike {
   claudePath: string;
   complete(req: MessagesRequest): Promise<CompleteResult>;
-  stream(req: MessagesRequest, opts?: { signal?: AbortSignal }): StreamStart;
+  stream(req: MessagesRequest, opts?: StreamOptions): StreamStart;
   listModels(): Promise<EngineModel[]>;
 }
 
@@ -19,6 +19,8 @@ export interface AppOptions {
   apiKeys: string[];
   cors?: boolean;
   version?: string;
+  /** Sink for one-line request logs; omit to disable request logging. */
+  log?: (line: string) => void;
 }
 
 /** Served by GET /v1/models only when probing the CLI fails. */
@@ -39,9 +41,29 @@ function errorBody(type: ApiError["type"], message: string) {
   return { type: "error" as const, error: { type, message } };
 }
 
+function requestLine(
+  status: number,
+  model: string,
+  startedAt: number,
+  extra: { cost?: number; session?: string; stream?: boolean; error?: string } = {},
+): string {
+  const parts = [
+    new Date().toISOString(),
+    `POST /v1/messages ${status}`,
+    `model=${model}`,
+    `${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+  ];
+  if (extra.stream) parts.push("stream");
+  if (extra.cost !== undefined) parts.push(`cost=$${extra.cost.toFixed(6)}`);
+  if (extra.session) parts.push(`session=${extra.session}`);
+  if (extra.error) parts.push(`error=${extra.error}`);
+  return parts.join(" ");
+}
+
 export function createApp(options: AppOptions): Hono {
-  const { engine, apiKeys } = options;
+  const { engine, apiKeys, log } = options;
   const app = new Hono();
+  const stats = { startedAt: Date.now(), requests: 0, totalCostUsd: 0 };
 
   if (options.cors) app.use("*", cors());
 
@@ -51,7 +73,15 @@ export function createApp(options: AppOptions): Hono {
   });
 
   app.get("/healthz", (c) =>
-    c.json({ ok: true, service: "yagami", version: options.version, claude: engine.claudePath }),
+    c.json({
+      ok: true,
+      service: "yagami",
+      version: options.version,
+      claude: engine.claudePath,
+      uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
+      requests: stats.requests,
+      total_cost_usd: stats.totalCostUsd,
+    }),
   );
 
   app.use("/v1/*", async (c, next) => {
@@ -92,11 +122,26 @@ export function createApp(options: AppOptions): Hono {
       return c.json(errorBody("invalid_request_error", "request body must be valid JSON"), 400);
     }
     const req = body as MessagesRequest;
+    const startedAt = Date.now();
+    const model = typeof req.model === "string" ? req.model : "(default)";
+    stats.requests += 1;
 
     try {
       if (req.stream === true) {
         const abortController = new AbortController();
-        const { ignored, events } = engine.stream(req, { signal: abortController.signal });
+        const { ignored, events } = engine.stream(req, {
+          signal: abortController.signal,
+          onResult: (info) => {
+            if (info.costUsd !== undefined) stats.totalCostUsd += info.costUsd;
+            log?.(
+              requestLine(200, model, startedAt, {
+                stream: true,
+                ...(info.costUsd !== undefined ? { cost: info.costUsd } : {}),
+                ...(info.sessionId ? { session: info.sessionId } : {}),
+              }),
+            );
+          },
+        });
         if (ignored.length > 0) c.header("x-yagami-ignored", ignored.join(","));
         return streamSSE(c, async (stream) => {
           stream.onAbort(() => abortController.abort());
@@ -107,15 +152,24 @@ export function createApp(options: AppOptions): Hono {
       }
 
       const result = await engine.complete(req);
+      if (result.costUsd !== undefined) stats.totalCostUsd += result.costUsd;
+      log?.(
+        requestLine(200, model, startedAt, {
+          ...(result.costUsd !== undefined ? { cost: result.costUsd } : {}),
+          ...(result.sessionId ? { session: result.sessionId } : {}),
+        }),
+      );
       if (result.ignored.length > 0) c.header("x-yagami-ignored", result.ignored.join(","));
       if (result.costUsd !== undefined) c.header("x-yagami-cost-usd", result.costUsd.toFixed(6));
       if (result.sessionId) c.header("x-yagami-session", result.sessionId);
       return c.json(result.response);
     } catch (err) {
       if (err instanceof ApiError) {
+        log?.(requestLine(err.status, model, startedAt, { error: err.type }));
         return c.json(err.toBody(), err.status as ContentfulStatusCode);
       }
       const message = err instanceof Error ? err.message : String(err);
+      log?.(requestLine(500, model, startedAt, { error: "api_error" }));
       return c.json(errorBody("api_error", message), 500);
     }
   });
