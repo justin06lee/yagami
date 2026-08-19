@@ -179,6 +179,80 @@ describe("YagamiEngine.complete with prefill", () => {
   });
 });
 
+describe("YagamiEngine resume fallback", () => {
+  const FOLLOW_UP = {
+    model: "claude-x",
+    messages: [
+      { role: "user" as const, content: "one" },
+      { role: "assistant" as const, content: "first reply" },
+      { role: "user" as const, content: "two" },
+    ],
+  };
+
+  /** Seed the cache so FOLLOW_UP's prefix maps to sess-1, then make any
+   *  resumed attempt die the way a garbage-collected session does. */
+  async function seedThenBreakResume(engine: YagamiEngine, text = "ok") {
+    queryMock.mockImplementation(() => sdkComplete({ text: "first reply" }));
+    await engine.complete({ model: "claude-x", messages: [{ role: "user", content: "one" }] });
+    queryMock.mockImplementation(({ options }: { options: { resume?: string } }) => {
+      if (options.resume) throw new Error("No conversation found with session ID sess-1");
+      return sdkComplete({ text, sessionId: "sess-2" });
+    });
+  }
+
+  it("retries complete() without resume when the session is gone", async () => {
+    const engine = makeEngine();
+    await seedThenBreakResume(engine, "recovered");
+    const { response } = await engine.complete(FOLLOW_UP);
+    expect(response.content).toEqual([{ type: "text", text: "recovered" }]);
+    const attempts = queryMock.mock.calls.slice(1);
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]![0].options.resume).toBe("sess-1");
+    expect(attempts[1]![0].options.resume).toBeUndefined();
+    expect(attempts[1]![0].prompt).toContain("<conversation-history>");
+  });
+
+  it("drops the stale cache entry so the next request replays directly", async () => {
+    const engine = makeEngine();
+    await seedThenBreakResume(engine);
+    await engine.complete(FOLLOW_UP);
+    queryMock.mockClear();
+    queryMock.mockImplementation(() => sdkComplete({ text: "again", sessionId: "sess-3" }));
+    await engine.complete(FOLLOW_UP);
+    expect(queryMock).toHaveBeenCalledOnce();
+    expect(queryMock.mock.calls[0]![0].options.resume).toBeUndefined();
+  });
+
+  it("does not retry when no resume was involved", async () => {
+    queryMock.mockImplementation(async function* () {
+      throw new Error("boom");
+    });
+    const engine = makeEngine();
+    await expect(
+      engine.complete({ model: "claude-x", messages: [{ role: "user", content: "hi" }] }),
+    ).rejects.toThrowError(/boom/);
+    expect(queryMock).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a stream that dies before emitting events", async () => {
+    const engine = makeEngine();
+    queryMock.mockImplementation(() => sdkComplete({ text: "first reply" }));
+    await engine.complete({ model: "claude-x", messages: [{ role: "user", content: "one" }] });
+
+    queryMock.mockImplementation(({ options }: { options: { resume?: string } }) => {
+      if (options.resume) throw new Error("No conversation found with session ID sess-1");
+      return sdkStream({ deltas: ["recovered"], sessionId: "sess-2" });
+    });
+    const { events } = engine.stream({ ...FOLLOW_UP, stream: true });
+    const all = await collect(events);
+    expect(all.some((e) => e.event === "error")).toBe(false);
+    const texts = all
+      .filter((e) => e.event === "content_block_delta")
+      .map((e) => (e.data as { delta: { text: string } }).delta.text);
+    expect(texts.join("")).toBe("recovered");
+  });
+});
+
 describe("YagamiEngine.complete with media blocks", () => {
   const IMAGE = { type: "image", source: { type: "base64", media_type: "image/png", data: "aaa" } };
 

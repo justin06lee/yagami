@@ -77,6 +77,8 @@ interface PreparedQuery {
   options: Options;
   norm: NormalizedRequest;
   requestedModel: string;
+  /** Cache key the resume came from — set only when resuming a session. */
+  resumeKey?: string;
 }
 
 /**
@@ -101,7 +103,7 @@ export class YagamiEngine {
     fs.mkdirSync(this.workDir, { recursive: true });
   }
 
-  private prepare(req: MessagesRequest): PreparedQuery {
+  private prepare(req: MessagesRequest, opts: { skipResume?: boolean } = {}): PreparedQuery {
     const norm = normalizeRequest(req);
     const model = req.model ?? this.defaultModel;
     if (!model || typeof model !== "string") {
@@ -110,9 +112,13 @@ export class YagamiEngine {
 
     let promptText = norm.lastUserText;
     let resume: string | undefined;
+    let resumeKey: string | undefined;
     if (norm.messages.length > 1) {
       const history = norm.messages.slice(0, -1);
-      resume = this.cache.get(prefixKey(norm.system, history));
+      if (!opts.skipResume) {
+        resumeKey = prefixKey(norm.system, history);
+        resume = this.cache.get(resumeKey);
+      }
       if (!resume) {
         // Media in the history can't be replayed as text; only a live cached
         // session (which already holds those blocks) can continue from here.
@@ -164,7 +170,30 @@ export class YagamiEngine {
       options.effort = req.effort as EffortLevel;
     }
 
-    return { prompt, options, norm, requestedModel: model };
+    return {
+      prompt,
+      options,
+      norm,
+      requestedModel: model,
+      ...(resume && resumeKey ? { resumeKey } : {}),
+    };
+  }
+
+  /**
+   * A failed resumed attempt usually means the cached Claude Code session no
+   * longer exists (garbage-collected transcript, different machine). Drop the
+   * stale mapping and re-prepare from scratch — the transcript-replay path.
+   * Returns undefined when falling back is impossible (no resume was used,
+   * or the history contains media that can't be replayed as text).
+   */
+  private prepareResumeFallback(req: MessagesRequest, failed: PreparedQuery): PreparedQuery | undefined {
+    if (!failed.resumeKey) return undefined;
+    this.cache.delete(failed.resumeKey);
+    try {
+      return this.prepare(req, { skipResume: true });
+    } catch {
+      return undefined;
+    }
   }
 
   private storeSession(norm: NormalizedRequest, continuation: string, sessionId: string | undefined): void {
@@ -177,7 +206,18 @@ export class YagamiEngine {
   }
 
   async complete(req: MessagesRequest): Promise<CompleteResult> {
-    const { prompt, options, norm, requestedModel } = this.prepare(req);
+    const prepared = this.prepare(req);
+    try {
+      return await this.attemptComplete(prepared);
+    } catch (err) {
+      const fallback = this.prepareResumeFallback(req, prepared);
+      if (!fallback) throw err;
+      return await this.attemptComplete(fallback);
+    }
+  }
+
+  private async attemptComplete(prepared: PreparedQuery): Promise<CompleteResult> {
+    const { prompt, options, norm, requestedModel } = prepared;
 
     let sessionId: string | undefined;
     let assistant: SDKAssistantMessage | undefined;
@@ -244,11 +284,40 @@ export class YagamiEngine {
     const prepared = this.prepare(req);
     return {
       ignored: prepared.norm.ignored,
-      events: this.runStream(prepared, streamOptions.signal),
+      events: this.runStream(req, prepared, streamOptions.signal),
     };
   }
 
   private async *runStream(
+    req: MessagesRequest,
+    prepared: PreparedQuery,
+    signal: AbortSignal | undefined,
+  ): AsyncGenerator<SseEvent, void, undefined> {
+    let emitted = false;
+    try {
+      for await (const ev of this.attemptStream(prepared, signal)) {
+        emitted = true;
+        yield ev;
+      }
+      return;
+    } catch (err) {
+      if (signal?.aborted) return;
+      // A resumed session that died before emitting anything can be retried
+      // transparently against a fresh session (transcript replay).
+      const fallback = emitted ? undefined : this.prepareResumeFallback(req, prepared);
+      if (!fallback) {
+        yield errorEvent(toApiError(err));
+        return;
+      }
+      try {
+        yield* this.attemptStream(fallback, signal);
+      } catch (err2) {
+        if (!signal?.aborted) yield errorEvent(toApiError(err2));
+      }
+    }
+  }
+
+  private async *attemptStream(
     prepared: PreparedQuery,
     signal: AbortSignal | undefined,
   ): AsyncGenerator<SseEvent, void, undefined> {
@@ -312,8 +381,7 @@ export class YagamiEngine {
         }
       }
     } catch (err) {
-      if (!signal?.aborted) yield errorEvent(toApiError(err));
-      return;
+      throw toApiError(err);
     } finally {
       signal?.removeEventListener("abort", onAbort);
     }
@@ -325,8 +393,7 @@ export class YagamiEngine {
         result && "errors" in result && result.errors.length > 0
           ? result.errors.join("; ")
           : (result?.subtype ?? "engine terminated without a result");
-      yield errorEvent(new ApiError(500, "api_error", `Claude Code engine error: ${detail}`));
-      return;
+      throw new ApiError(500, "api_error", `Claude Code engine error: ${detail}`);
     }
 
     // Some engine paths may not emit partial events; synthesize a valid
