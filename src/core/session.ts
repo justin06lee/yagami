@@ -16,8 +16,8 @@ export interface ClaudeSessionOptions {
 /**
  * Full agentic Claude Code session (tools, permissions, plan mode — the
  * works), backed by the user's installed, signed-in CLI. This is the
- * embeddable "what T3 Code does" primitive for building UIs like ruri:
- * unlike the Messages-API engine, nothing is restricted here.
+ * embeddable "what T3 Code does" primitive for building UIs on top of
+ * Claude Code: unlike the Messages-API engine, nothing is restricted here.
  *
  * Defaults to the `claude_code` system prompt preset so behavior matches the
  * interactive CLI; pass `options.systemPrompt` to override.

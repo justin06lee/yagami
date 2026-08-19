@@ -88,7 +88,7 @@ Env overrides: `YAGAMI_HOST`, `YAGAMI_PORT`, `YAGAMI_API_KEY`, `YAGAMI_CLAUDE_PA
 
 ## Library mode
 
-For apps that want the engine in-process with no HTTP hop (e.g. a desktop app like ruri):
+For apps that want the engine in-process with no HTTP hop (e.g. a desktop app):
 
 ```ts
 import { YagamiEngine, claudeCodeSession } from "yagami";
