@@ -60,9 +60,13 @@ curl http://127.0.0.1:8787/v1/messages \
 
 | Command | What it does |
 |---|---|
-| `yagami start` | Start the server (`-p` port, `-H` host, `--claude <path>`, `--cors`) |
+| `yagami start` | Start the server (`-p` port, `-H` host, `--claude <path>`, `--cors`). Add `--daemon` to run it in the background (`--log <file>` overrides the default log at `~/.config/yagami/yagami.log`) |
+| `yagami stop` | Stop the running server |
+| `yagami status` | Show whether it's running, plus uptime, request count, and cumulative would-be API cost |
 | `yagami keygen` | Generate another API key and save it to the config |
 | `yagami doctor` | Check binary/config/keys; `--live` sends one tiny real completion |
+
+Every request is logged as one line (time, status, model, duration, cost, session) to stdout — or to the log file in `--daemon` mode.
 
 ### Config
 
@@ -119,7 +123,7 @@ The server is also embeddable: `import { startYagami } from "yagami/server"`.
 - **Models**: `GET /v1/models` asks your CLI which models it actually supports (probed once per process, then cached). If the probe fails, a static fallback list is served — `x-yagami-models-source` says which you got.
 - **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else.
 
-Extra response headers: `x-yagami-cost-usd` (what the turn would have cost at API prices), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params).
+Extra response headers: `x-yagami-cost-usd` (what the turn would have cost at API prices), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params). `/healthz` (unauthenticated) reports uptime, request count, and the cumulative would-be cost — `yagami status` shows the same.
 
 ## Limitations (v1)
 

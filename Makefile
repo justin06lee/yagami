@@ -16,14 +16,14 @@ install:
 	@echo "installed $(BIN) -> $(CURDIR)/dist/cli.js"
 
 update:
-	@RUNNING=$$(pgrep -f "yagami(.js)? start" || true); \
+	@RUNNING=""; \
+	if $(BIN) status >/dev/null 2>&1; then RUNNING=1; fi; \
 	if [ -n "$$RUNNING" ]; then \
 		echo "stopping running yagami server"; \
-		pkill -f "yagami(.js)? start" || true; \
+		$(BIN) stop || true; \
 	fi; \
 	rm -f $(BIN); \
 	$(MAKE) build install; \
 	if [ -n "$$RUNNING" ]; then \
-		echo "restarting yagami server (log: /tmp/yagami.log)"; \
-		nohup $(BIN) start >/tmp/yagami.log 2>&1 & \
+		$(BIN) start --daemon; \
 	fi

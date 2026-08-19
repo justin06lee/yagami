@@ -31,6 +31,58 @@ export function sessionCachePath(): string {
   return path.join(yagamiConfigDir(), "sessions.json");
 }
 
+export function serverStatePath(): string {
+  return path.join(yagamiConfigDir(), "server.json");
+}
+
+export function logFilePath(): string {
+  return path.join(yagamiConfigDir(), "yagami.log");
+}
+
+/** What a running server records about itself for `stop`/`status`. */
+export interface ServerState {
+  pid: number;
+  host: string;
+  port: number;
+  url: string;
+  startedAt: string;
+  version: string;
+  log?: string;
+}
+
+export function readServerState(): ServerState | undefined {
+  try {
+    const state = JSON.parse(fs.readFileSync(serverStatePath(), "utf8")) as ServerState;
+    return typeof state?.pid === "number" ? state : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeServerState(state: ServerState): void {
+  fs.mkdirSync(yagamiConfigDir(), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(serverStatePath(), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** Remove the state file; with `pid`, only if it still belongs to that pid. */
+export function clearServerState(pid?: number): void {
+  try {
+    if (pid !== undefined && readServerState()?.pid !== pid) return;
+    fs.unlinkSync(serverStatePath());
+  } catch {
+    // already gone
+  }
+}
+
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Config as stored on disk, without env overrides (safe to save back). */
 export function loadFileConfig(): YagamiConfig {
   let fromFile: Partial<YagamiConfig> = {};

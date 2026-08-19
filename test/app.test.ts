@@ -19,13 +19,16 @@ function fakeEngine(overrides: Partial<EngineLike> = {}): EngineLike {
   return {
     claudePath: "/fake/claude",
     complete: async () => ({ response: RESPONSE, costUsd: 0.0123, sessionId: "sess-1", ignored: ["max_tokens"] }),
-    stream: () => ({
-      ignored: [],
-      events: (async function* () {
-        yield { event: "message_start", data: { type: "message_start" } };
-        yield { event: "message_stop", data: { type: "message_stop" } };
-      })(),
-    }),
+    stream: (_req, opts) => {
+      opts?.onResult?.({ costUsd: 0.005, sessionId: "sess-s" });
+      return {
+        ignored: [],
+        events: (async function* () {
+          yield { event: "message_start", data: { type: "message_start" } };
+          yield { event: "message_stop", data: { type: "message_stop" } };
+        })(),
+      };
+    },
     listModels: async () => [
       { id: "sonnet", display_name: "Sonnet", resolved_model: "claude-sonnet-5" },
     ],
@@ -123,6 +126,43 @@ describe("POST /v1/messages", () => {
     expect(text).toContain("event: message_start");
     expect(text).toContain("event: message_stop");
     expect(text).toContain('data: {"type":"message_start"}');
+  });
+});
+
+describe("stats and request logging", () => {
+  it("tracks requests and cumulative cost in /healthz", async () => {
+    const app = createApp({ engine: fakeEngine(), apiKeys: [KEY] });
+    await post(app, BASIC_REQ);
+    await (await post(app, { ...BASIC_REQ, stream: true })).text();
+    const res = await app.request("/healthz");
+    const body = (await res.json()) as { requests: number; total_cost_usd: number; uptime_s: number };
+    expect(body.requests).toBe(2);
+    expect(body.total_cost_usd).toBeCloseTo(0.0173, 6);
+    expect(body.uptime_s).toBeGreaterThanOrEqual(0);
+  });
+
+  it("writes one log line per completed request", async () => {
+    const lines: string[] = [];
+    const app = createApp({ engine: fakeEngine(), apiKeys: [KEY], log: (l) => lines.push(l) });
+    await post(app, BASIC_REQ);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/POST \/v1\/messages 200 model=claude-sonnet-5 .*cost=\$0\.012300 session=sess-1/);
+  });
+
+  it("logs failed requests with their error type", async () => {
+    const lines: string[] = [];
+    const app = createApp({
+      engine: fakeEngine({
+        complete: async () => {
+          throw new ApiError(400, "invalid_request_error", "bad");
+        },
+      }),
+      apiKeys: [KEY],
+      log: (l) => lines.push(l),
+    });
+    await post(app, BASIC_REQ);
+    expect(lines[0]).toContain("POST /v1/messages 400");
+    expect(lines[0]).toContain("error=invalid_request_error");
   });
 });
 

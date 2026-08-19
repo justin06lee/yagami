@@ -14,6 +14,8 @@ export {
   type EngineOptions,
   type CompleteResult,
   type StreamStart,
+  type StreamOptions,
+  type StreamResultInfo,
   type EngineModel,
 } from "./core/engine.js";
 export { claudeCodeSession, type ClaudeSessionOptions } from "./core/session.js";

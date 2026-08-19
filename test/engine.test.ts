@@ -381,6 +381,19 @@ describe("YagamiEngine.stream", () => {
     expect(texts.join("")).toBe(" 42.");
   });
 
+  it("reports cost and session via onResult when the stream completes", async () => {
+    queryMock.mockImplementation(() => sdkStream());
+    const engine = makeEngine();
+    const onResult = vi.fn();
+    const { events } = engine.stream(
+      { model: "claude-x", messages: [{ role: "user", content: "ping" }], stream: true },
+      { onResult },
+    );
+    await collect(events);
+    expect(onResult).toHaveBeenCalledOnce();
+    expect(onResult).toHaveBeenCalledWith({ costUsd: 0.01, sessionId: "sess-1" });
+  });
+
   it("emits an error event when the engine fails mid-stream", async () => {
     queryMock.mockImplementation(async function* () {
       yield { type: "system", subtype: "init", session_id: "sess-1" };

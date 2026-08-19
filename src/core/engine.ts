@@ -72,6 +72,18 @@ export interface StreamStart {
   events: AsyncGenerator<SseEvent, void, undefined>;
 }
 
+/** Metadata about a finished streaming turn, reported via `onResult`. */
+export interface StreamResultInfo {
+  costUsd?: number;
+  sessionId?: string;
+}
+
+export interface StreamOptions {
+  signal?: AbortSignal;
+  /** Called once when a streamed turn completes successfully. */
+  onResult?: (info: StreamResultInfo) => void;
+}
+
 /** A model the backing CLI reports as available. */
 export interface EngineModel {
   id: string;
@@ -355,22 +367,23 @@ export class YagamiEngine {
    * Validates synchronously (throws ApiError), then returns a lazy generator
    * of Anthropic-style SSE events.
    */
-  stream(req: MessagesRequest, streamOptions: { signal?: AbortSignal } = {}): StreamStart {
+  stream(req: MessagesRequest, streamOptions: StreamOptions = {}): StreamStart {
     const prepared = this.prepare(req);
     return {
       ignored: prepared.norm.ignored,
-      events: this.runStream(req, prepared, streamOptions.signal),
+      events: this.runStream(req, prepared, streamOptions),
     };
   }
 
   private async *runStream(
     req: MessagesRequest,
     prepared: PreparedQuery,
-    signal: AbortSignal | undefined,
+    streamOptions: StreamOptions,
   ): AsyncGenerator<SseEvent, void, undefined> {
+    const { signal } = streamOptions;
     let emitted = false;
     try {
-      for await (const ev of this.attemptStream(prepared, signal)) {
+      for await (const ev of this.attemptStream(prepared, streamOptions)) {
         emitted = true;
         yield ev;
       }
@@ -385,7 +398,7 @@ export class YagamiEngine {
         return;
       }
       try {
-        yield* this.attemptStream(fallback, signal);
+        yield* this.attemptStream(fallback, streamOptions);
       } catch (err2) {
         if (!signal?.aborted) yield errorEvent(toApiError(err2));
       }
@@ -394,8 +407,9 @@ export class YagamiEngine {
 
   private async *attemptStream(
     prepared: PreparedQuery,
-    signal: AbortSignal | undefined,
+    streamOptions: StreamOptions,
   ): AsyncGenerator<SseEvent, void, undefined> {
+    const { signal } = streamOptions;
     const { prompt, options, norm, requestedModel } = prepared;
     const abortController = new AbortController();
     const onAbort = () => abortController.abort();
@@ -479,6 +493,10 @@ export class YagamiEngine {
     }
 
     this.storeSession(norm, assistantText || stripLeading(result.result, norm.prefill), sessionId);
+    streamOptions.onResult?.({
+      ...(result.total_cost_usd !== undefined ? { costUsd: result.total_cost_usd } : {}),
+      ...(sessionId ? { sessionId } : {}),
+    });
   }
 }
 
