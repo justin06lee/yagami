@@ -122,8 +122,8 @@ Extra response headers: `x-yagami-cost-usd` (what the turn would have cost at AP
 
 ## Limitations (v1)
 
-- No `tools` / `tool_choice` (rejected with 400 — by design, see above).
-- Text content blocks only: no images, documents, or tool results.
+- No `tools` / `tool_choice` (rejected with 400 — by design, see above). `tool_use`/`tool_result` content blocks are rejected too.
+- User messages may contain `text`, `image`, and `document` blocks; `system` and assistant messages are text-only. One caveat: a conversation whose *history* contains images/documents can only be continued while the server that produced it still has that session cached — text history can be replayed from scratch, media history can't.
 - Assistant prefill (a trailing `assistant` message) is emulated: the engine is instructed to continue from the prefill text, and the response carries only the continuation, like the real API. An accidentally repeated prefill is stripped from the reply, including mid-stream.
 - `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` are accepted but ignored (reported via `x-yagami-ignored`) — the CLI engine doesn't expose them.
 - `thinking` and a yagami-extension `effort` ("low"…"max") are passed through to the engine.

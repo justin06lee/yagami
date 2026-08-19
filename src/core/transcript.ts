@@ -9,6 +9,8 @@ import {
 export interface NormalizedMessage {
   role: "user" | "assistant";
   text: string;
+  /** Image/document blocks (user messages only), passed through to the engine. */
+  media?: ContentBlockParam[];
 }
 
 export interface NormalizedRequest {
@@ -50,23 +52,42 @@ export function extractSystemText(system: SystemParam | undefined): string | und
   return joined.length > 0 ? joined : undefined;
 }
 
-function contentToText(content: string | ContentBlockParam[], role: string): string {
-  if (typeof content === "string") return content;
+/** Block types (besides text) accepted in user messages and forwarded raw. */
+const USER_MEDIA_TYPES: ReadonlySet<string> = new Set(["image", "document"]);
+
+function contentToParts(
+  content: string | ContentBlockParam[],
+  role: string,
+): { text: string; media: ContentBlockParam[] } {
+  if (typeof content === "string") return { text: content, media: [] };
   if (!Array.isArray(content)) {
     throw new ApiError(400, "invalid_request_error", `message content for role "${role}" must be a string or an array of blocks`);
   }
   const parts: string[] = [];
+  const media: ContentBlockParam[] = [];
   for (const block of content) {
-    if (block?.type !== "text" || typeof block["text"] !== "string") {
+    if (block?.type === "text" && typeof block["text"] === "string") {
+      parts.push(block["text"] as string);
+    } else if (role === "user" && USER_MEDIA_TYPES.has(String(block?.type))) {
+      if (block["source"] == null || typeof block["source"] !== "object") {
+        throw new ApiError(
+          400,
+          "invalid_request_error",
+          `"${block.type}" blocks must carry a \`source\` object`,
+        );
+      }
+      media.push(block);
+    } else {
       throw new ApiError(
         400,
         "invalid_request_error",
-        `yagami only supports "text" content blocks (got "${String(block?.type)}"). Images, tool_use, and tool_result blocks are not supported.`,
+        role === "user"
+          ? `unsupported content block type "${String(block?.type)}" (user messages may contain text, image, and document blocks; tool_use/tool_result are not supported)`
+          : `assistant messages may only contain "text" blocks (got "${String(block?.type)}")`,
       );
     }
-    parts.push(block["text"] as string);
   }
-  return parts.join("\n");
+  return { text: parts.join("\n"), media };
 }
 
 export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
@@ -88,7 +109,8 @@ export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
     if (m?.role !== "user" && m?.role !== "assistant") {
       throw new ApiError(400, "invalid_request_error", `messages[${i}].role must be "user" or "assistant"`);
     }
-    return { role: m.role, text: contentToText(m.content, m.role) };
+    const { text, media } = contentToParts(m.content, m.role);
+    return media.length > 0 ? { role: m.role, text, media } : { role: m.role, text };
   });
 
   // A trailing assistant message is prefill: the reply continues from it.
@@ -195,7 +217,16 @@ export class PrefillStripper {
  * that session instead of replaying history.
  */
 export function prefixKey(system: string | undefined, messages: NormalizedMessage[]): string {
-  const payload = JSON.stringify([system ?? "", messages.map((m) => [m.role, m.text])]);
+  // Media identity is folded in as a digest; text-only messages keep the
+  // original payload shape so existing persisted caches stay valid.
+  const payload = JSON.stringify([
+    system ?? "",
+    messages.map((m) =>
+      m.media && m.media.length > 0
+        ? [m.role, m.text, createHash("sha256").update(JSON.stringify(m.media)).digest("hex")]
+        : [m.role, m.text],
+    ),
+  ]);
   return createHash("sha256").update(payload).digest("hex");
 }
 

@@ -38,13 +38,46 @@ describe("normalizeRequest", () => {
     ).toThrowError(ApiError);
   });
 
-  it("rejects image blocks", () => {
+  it("accepts image and document blocks in user messages", () => {
+    const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aaa" } };
+    const doc = { type: "document", source: { type: "base64", media_type: "application/pdf", data: "bbb" } };
+    const norm = normalizeRequest({
+      model: "m",
+      messages: [{ role: "user", content: [image, doc, { type: "text", text: "what's this?" }] }],
+    });
+    expect(norm.lastUserText).toBe("what's this?");
+    expect(norm.messages[0]!.media).toEqual([image, doc]);
+  });
+
+  it("rejects media blocks without a source", () => {
     expect(() =>
       normalizeRequest({
         model: "m",
-        messages: [{ role: "user", content: [{ type: "image", source: {} }] }],
+        messages: [{ role: "user", content: [{ type: "image" }] }],
       }),
-    ).toThrowError(/text/);
+    ).toThrowError(/source/);
+  });
+
+  it("rejects media blocks in assistant messages", () => {
+    expect(() =>
+      normalizeRequest({
+        model: "m",
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: [{ type: "image", source: { type: "base64" } }] },
+          { role: "user", content: "again" },
+        ],
+      }),
+    ).toThrowError(/assistant messages/);
+  });
+
+  it("rejects tool_result blocks", () => {
+    expect(() =>
+      normalizeRequest({
+        model: "m",
+        messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] }],
+      }),
+    ).toThrowError(/tool_use\/tool_result/);
   });
 
   it("treats a trailing assistant message as prefill", () => {
@@ -123,6 +156,15 @@ describe("prefixKey", () => {
     expect(prefixKey("s", msgs)).not.toBe(prefixKey("other", msgs));
     expect(prefixKey("s", msgs)).not.toBe(prefixKey("s", [{ role: "user", text: "yo" }]));
     expect(prefixKey("s", msgs)).not.toBe(prefixKey("s", [{ role: "assistant", text: "hi" }]));
+  });
+
+  it("distinguishes messages by their media blocks", () => {
+    const img = (data: string) => [{ type: "image", source: { type: "base64", data } }];
+    const withA = [{ role: "user" as const, text: "hi", media: img("aaa") }];
+    const withB = [{ role: "user" as const, text: "hi", media: img("bbb") }];
+    expect(prefixKey("s", withA)).not.toBe(prefixKey("s", msgs));
+    expect(prefixKey("s", withA)).not.toBe(prefixKey("s", withB));
+    expect(prefixKey("s", withA)).toBe(prefixKey("s", [{ role: "user", text: "hi", media: img("aaa") }]));
   });
 });
 
