@@ -124,7 +124,7 @@ Extra response headers: `x-yagami-cost-usd` (what the turn would have cost at AP
 
 - No `tools` / `tool_choice` (rejected with 400 — by design, see above).
 - Text content blocks only: no images, documents, or tool results.
-- No assistant prefill (last message must be `user`).
+- Assistant prefill (a trailing `assistant` message) is emulated: the engine is instructed to continue from the prefill text, and the response carries only the continuation, like the real API. An accidentally repeated prefill is stripped from the reply, including mid-stream.
 - `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` are accepted but ignored (reported via `x-yagami-ignored`) — the CLI engine doesn't expose them.
 - `thinking` and a yagami-extension `effort` ("low"…"max") are passed through to the engine.
 
