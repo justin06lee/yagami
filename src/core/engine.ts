@@ -72,6 +72,15 @@ export interface StreamStart {
   events: AsyncGenerator<SseEvent, void, undefined>;
 }
 
+/** A model the backing CLI reports as available. */
+export interface EngineModel {
+  id: string;
+  display_name: string;
+  description?: string;
+  /** Canonical wire id an alias resolves to (e.g. "sonnet" → "claude-sonnet-5"). */
+  resolved_model?: string;
+}
+
 interface PreparedQuery {
   prompt: string | AsyncIterable<SDKUserMessage>;
   options: Options;
@@ -91,6 +100,7 @@ export class YagamiEngine {
   private readonly workDir: string;
   private readonly defaultModel: string | undefined;
   private readonly cache: SessionCache;
+  private modelsPromise: Promise<EngineModel[]> | undefined;
 
   constructor(options: EngineOptions = {}) {
     this.claudePath = resolveClaudeExecutable(options.claudePath);
@@ -193,6 +203,71 @@ export class YagamiEngine {
       return this.prepare(req, { skipResume: true });
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Models the backing CLI actually accepts, probed once per process (the
+   * first call spawns a short-lived engine just to ask) and cached. A failed
+   * probe is not cached, so the next request tries again.
+   */
+  listModels(): Promise<EngineModel[]> {
+    if (!this.modelsPromise) {
+      this.modelsPromise = this.probeModels().catch((err) => {
+        this.modelsPromise = undefined;
+        throw err;
+      });
+    }
+    return this.modelsPromise;
+  }
+
+  private async probeModels(): Promise<EngineModel[]> {
+    const abortController = new AbortController();
+    // A streaming-input prompt that stays open: the spawned CLI idles while
+    // the supported-models control request runs, then gets torn down.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const idle = (async function* (): AsyncGenerator<SDKUserMessage> {
+      await gate;
+    })();
+
+    const q = query({
+      prompt: idle,
+      options: {
+        pathToClaudeCodeExecutable: this.claudePath,
+        cwd: this.workDir,
+        tools: [],
+        settingSources: [],
+        maxTurns: 1,
+        canUseTool: DENY_ALL_TOOLS,
+        abortController,
+        env: {
+          ...process.env,
+          ...(this.claudeConfigDir ? { CLAUDE_CONFIG_DIR: this.claudeConfigDir } : {}),
+          CLAUDE_AGENT_SDK_CLIENT_APP: `yagami/${VERSION}`,
+        },
+      },
+    });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const models = await Promise.race([
+        q.supportedModels(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("timed out probing supported models")), 15_000);
+          timer.unref?.();
+        }),
+      ]);
+      return models.map((m) => ({
+        id: m.value,
+        display_name: m.displayName,
+        ...(m.description ? { description: m.description } : {}),
+        ...(m.resolvedModel ? { resolved_model: m.resolvedModel } : {}),
+      }));
+    } finally {
+      if (timer) clearTimeout(timer);
+      release();
+      abortController.abort();
     }
   }
 
