@@ -179,6 +179,66 @@ describe("YagamiEngine.complete with prefill", () => {
   });
 });
 
+describe("YagamiEngine.complete with media blocks", () => {
+  const IMAGE = { type: "image", source: { type: "base64", media_type: "image/png", data: "aaa" } };
+
+  it("sends media via streaming input with the text appended last", async () => {
+    queryMock.mockImplementation(() => sdkComplete());
+    const engine = makeEngine();
+    await engine.complete({
+      model: "claude-x",
+      messages: [{ role: "user", content: [IMAGE, { type: "text", text: "what is this?" }] }],
+    });
+    const { prompt } = queryMock.mock.calls[0]![0];
+    expect(typeof prompt).not.toBe("string");
+    const yielded = [];
+    for await (const m of prompt) yielded.push(m);
+    expect(yielded).toHaveLength(1);
+    expect(yielded[0].message).toEqual({
+      role: "user",
+      content: [IMAGE, { type: "text", text: "what is this?" }],
+    });
+    expect(yielded[0].parent_tool_use_id).toBeNull();
+  });
+
+  it("rejects unmatched history containing media blocks", async () => {
+    queryMock.mockImplementation(() => sdkComplete());
+    const engine = makeEngine();
+    await expect(
+      engine.complete({
+        model: "claude-x",
+        messages: [
+          { role: "user", content: [IMAGE, { type: "text", text: "look" }] },
+          { role: "assistant", content: "nice pic" },
+          { role: "user", content: "and now?" },
+        ],
+      }),
+    ).rejects.toThrowError(/image\/document blocks/);
+  });
+
+  it("resumes past media history when the session is cached", async () => {
+    queryMock.mockImplementation(() => sdkComplete({ text: "nice pic" }));
+    const engine = makeEngine();
+    await engine.complete({
+      model: "claude-x",
+      messages: [{ role: "user", content: [IMAGE, { type: "text", text: "look" }] }],
+    });
+
+    queryMock.mockImplementation(() => sdkComplete({ text: "sure", sessionId: "sess-2" }));
+    await engine.complete({
+      model: "claude-x",
+      messages: [
+        { role: "user", content: [IMAGE, { type: "text", text: "look" }] },
+        { role: "assistant", content: "nice pic" },
+        { role: "user", content: "and now?" },
+      ],
+    });
+    const second = queryMock.mock.calls[1]![0];
+    expect(second.options.resume).toBe("sess-1");
+    expect(second.prompt).toBe("and now?");
+  });
+});
+
 describe("YagamiEngine.stream", () => {
   it("passes raw stream events through", async () => {
     queryMock.mockImplementation(() => sdkStream());

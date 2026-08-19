@@ -8,6 +8,7 @@ import {
   type Options,
   type SDKAssistantMessage,
   type SDKResultMessage,
+  type SDKUserMessage,
   type ThinkingConfig,
   type EffortLevel,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -24,6 +25,7 @@ import {
 import {
   ApiError,
   type ContentBlock,
+  type ContentBlockParam,
   type MessagesRequest,
   type MessagesResponse,
   type SseEvent,
@@ -71,7 +73,7 @@ export interface StreamStart {
 }
 
 interface PreparedQuery {
-  prompt: string;
+  prompt: string | AsyncIterable<SDKUserMessage>;
   options: Options;
   norm: NormalizedRequest;
   requestedModel: string;
@@ -106,13 +108,28 @@ export class YagamiEngine {
       throw new ApiError(400, "invalid_request_error", "`model` is required (no defaultModel configured)");
     }
 
-    let prompt = norm.lastUserText;
+    let promptText = norm.lastUserText;
     let resume: string | undefined;
     if (norm.messages.length > 1) {
-      resume = this.cache.get(prefixKey(norm.system, norm.messages.slice(0, -1)));
-      if (!resume) prompt = flattenConversation(norm.messages);
+      const history = norm.messages.slice(0, -1);
+      resume = this.cache.get(prefixKey(norm.system, history));
+      if (!resume) {
+        // Media in the history can't be replayed as text; only a live cached
+        // session (which already holds those blocks) can continue from here.
+        if (history.some((m) => m.media && m.media.length > 0)) {
+          throw new ApiError(
+            400,
+            "invalid_request_error",
+            "conversation history contains image/document blocks and no cached session matches this prefix; yagami can only replay text history. Continue such conversations against the server that produced them.",
+          );
+        }
+        promptText = flattenConversation(norm.messages);
+      }
     }
-    if (norm.prefill) prompt = `${prompt}\n\n${prefillDirective(norm.prefill)}`;
+    if (norm.prefill) promptText = `${promptText}\n\n${prefillDirective(norm.prefill)}`;
+
+    const lastMedia = norm.messages[norm.messages.length - 1]!.media;
+    const prompt = lastMedia && lastMedia.length > 0 ? mediaPrompt(promptText, lastMedia) : promptText;
 
     const options: Options = {
       pathToClaudeCodeExecutable: this.claudePath,
@@ -321,6 +338,23 @@ export class YagamiEngine {
 
     this.storeSession(norm, assistantText || stripLeading(result.result, norm.prefill), sessionId);
   }
+}
+
+/**
+ * User turn carrying image/document blocks: sent via the SDK's streaming
+ * input mode, which accepts full Anthropic content blocks. The iterable
+ * yields exactly one message, so the turn (and process) still ends normally.
+ */
+function mediaPrompt(text: string, media: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
+  const content = [...media, ...(text.length > 0 ? [{ type: "text", text }] : [])];
+  const message = {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+  } as unknown as SDKUserMessage;
+  return (async function* () {
+    yield message;
+  })();
 }
 
 /** Like the real API, the response carries only the continuation: drop an
