@@ -12,6 +12,14 @@ describe("SessionCache", () => {
     expect(cache.get("missing")).toBeUndefined();
   });
 
+  it("deletes entries", () => {
+    const cache = new SessionCache();
+    cache.set("a", "s1");
+    cache.delete("a");
+    expect(cache.get("a")).toBeUndefined();
+    expect(cache.size).toBe(0);
+  });
+
   it("evicts least-recently-used entries beyond maxEntries", () => {
     const cache = new SessionCache({ maxEntries: 2 });
     cache.set("a", "s1");

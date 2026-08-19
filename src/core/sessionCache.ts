@@ -37,6 +37,11 @@ export class SessionCache {
     return value;
   }
 
+  /** Drop a mapping, e.g. when its session turns out to be gone. */
+  delete(key: string): void {
+    if (this.map.delete(key)) this.schedulePersist();
+  }
+
   set(key: string, sessionId: string): void {
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, sessionId);
