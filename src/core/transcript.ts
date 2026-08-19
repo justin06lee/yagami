@@ -13,8 +13,11 @@ export interface NormalizedMessage {
 
 export interface NormalizedRequest {
   system?: string;
+  /** The conversation ending in the final user message (prefill removed). */
   messages: NormalizedMessage[];
   lastUserText: string;
+  /** Trailing assistant message text: the reply must continue from here. */
+  prefill?: string;
   /** Accepted-but-ignored request params, surfaced via a response header. */
   ignored: string[];
 }
@@ -81,20 +84,33 @@ export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
     throw new ApiError(400, "invalid_request_error", "`messages` must be a non-empty array");
   }
 
-  const messages: NormalizedMessage[] = req.messages.map((m, i) => {
+  let messages: NormalizedMessage[] = req.messages.map((m, i) => {
     if (m?.role !== "user" && m?.role !== "assistant") {
       throw new ApiError(400, "invalid_request_error", `messages[${i}].role must be "user" or "assistant"`);
     }
     return { role: m.role, text: contentToText(m.content, m.role) };
   });
 
+  // A trailing assistant message is prefill: the reply continues from it.
+  let prefill: string | undefined;
+  if (messages[messages.length - 1]!.role === "assistant") {
+    prefill = messages[messages.length - 1]!.text;
+    messages = messages.slice(0, -1);
+    if (prefill.length === 0) {
+      throw new ApiError(400, "invalid_request_error", "assistant prefill must contain non-empty text");
+    }
+    if (messages.length === 0 || messages[messages.length - 1]!.role !== "user") {
+      throw new ApiError(
+        400,
+        "invalid_request_error",
+        "assistant prefill must directly follow a user message",
+      );
+    }
+  }
+
   const last = messages[messages.length - 1]!;
   if (last.role !== "user") {
-    throw new ApiError(
-      400,
-      "invalid_request_error",
-      "the final message must have role \"user\" (assistant prefill is not supported by yagami)",
-    );
+    throw new ApiError(400, "invalid_request_error", "the final message must have role \"user\"");
   }
 
   const ignored = IGNORABLE_PARAMS.filter((p) => req[p] != null);
@@ -103,8 +119,74 @@ export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
     system: extractSystemText(req.system),
     messages,
     lastUserText: last.text,
+    ...(prefill !== undefined ? { prefill } : {}),
     ignored: [...ignored],
   };
+}
+
+/**
+ * Instruction appended to the outgoing prompt when the request ends with an
+ * assistant prefill. The engine can't literally seed the assistant turn, so
+ * the model is told to continue from the prefill text instead.
+ */
+export function prefillDirective(prefill: string): string {
+  return [
+    "<assistant-prefill>",
+    prefill,
+    "</assistant-prefill>",
+    "",
+    "Your reply has already been started with the exact text inside <assistant-prefill>.",
+    "Continue seamlessly from where it stops. Output ONLY the continuation — do not",
+    "repeat any part of the prefill and do not acknowledge these instructions.",
+  ].join("\n");
+}
+
+/**
+ * Removes an accidentally repeated prefill from the front of the reply,
+ * incrementally, so it works on stream deltas as well as whole responses.
+ * Holds text back only until the "did the model repeat the prefill?"
+ * question is settled, then passes everything through untouched.
+ */
+export class PrefillStripper {
+  private buffer = "";
+  private settled = false;
+
+  constructor(private readonly prefill: string) {}
+
+  /** True while text is being held back pending the repeat/no-repeat call. */
+  get pending(): boolean {
+    return !this.settled && this.buffer.length > 0;
+  }
+
+  /** Feed a chunk of reply text; returns the text safe to emit now. */
+  push(chunk: string): string {
+    if (this.settled) return chunk;
+    this.buffer += chunk;
+    if (this.buffer.length <= this.prefill.length) {
+      if (this.prefill.startsWith(this.buffer)) return ""; // still ambiguous — hold
+      this.settled = true;
+      const out = this.buffer;
+      this.buffer = "";
+      return out;
+    }
+    this.settled = true;
+    const out = this.buffer.startsWith(this.prefill)
+      ? this.buffer.slice(this.prefill.length)
+      : this.buffer;
+    this.buffer = "";
+    return out;
+  }
+
+  /** Emit whatever is still held once the reply has ended. */
+  flush(): string {
+    if (this.settled) return "";
+    this.settled = true;
+    // Held text is a prefix of the prefill: a full match is a bare repeat
+    // (empty continuation); a partial one is emitted rather than dropped.
+    const out = this.buffer === this.prefill ? "" : this.buffer;
+    this.buffer = "";
+    return out;
+  }
 }
 
 /**

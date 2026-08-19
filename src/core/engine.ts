@@ -16,6 +16,8 @@ import { SessionCache } from "./sessionCache.js";
 import {
   flattenConversation,
   normalizeRequest,
+  prefillDirective,
+  PrefillStripper,
   prefixKey,
   type NormalizedRequest,
 } from "./transcript.js";
@@ -110,6 +112,7 @@ export class YagamiEngine {
       resume = this.cache.get(prefixKey(norm.system, norm.messages.slice(0, -1)));
       if (!resume) prompt = flattenConversation(norm.messages);
     }
+    if (norm.prefill) prompt = `${prompt}\n\n${prefillDirective(norm.prefill)}`;
 
     const options: Options = {
       pathToClaudeCodeExecutable: this.claudePath,
@@ -147,9 +150,12 @@ export class YagamiEngine {
     return { prompt, options, norm, requestedModel: model };
   }
 
-  private storeSession(norm: NormalizedRequest, assistantText: string, sessionId: string | undefined): void {
-    if (!sessionId || !assistantText) return;
-    const played = [...norm.messages, { role: "assistant" as const, text: assistantText }];
+  private storeSession(norm: NormalizedRequest, continuation: string, sessionId: string | undefined): void {
+    // Clients replay prefill + continuation as one assistant message, so the
+    // stored prefix must record the full text, not just what we returned.
+    const fullText = (norm.prefill ?? "") + continuation;
+    if (!sessionId || !fullText) return;
+    const played = [...norm.messages, { role: "assistant" as const, text: fullText }];
     this.cache.set(prefixKey(norm.system, played), sessionId);
   }
 
@@ -190,11 +196,12 @@ export class YagamiEngine {
     if (content.length === 0 && result.result) {
       content = [{ type: "text", text: result.result }];
     }
+    if (norm.prefill) content = stripPrefillFromContent(content, norm.prefill);
     const assistantText =
       content
         .filter((b) => b.type === "text")
         .map((b) => (typeof b["text"] === "string" ? (b["text"] as string) : ""))
-        .join("") || result.result;
+        .join("") || stripLeading(result.result, norm.prefill);
 
     this.storeSession(norm, assistantText, sessionId);
 
@@ -238,6 +245,7 @@ export class YagamiEngine {
     let sawStreamEvent = false;
     let stopped = false;
     let result: SDKResultMessage | undefined;
+    const stripper = norm.prefill ? new PrefillStripper(norm.prefill) : undefined;
 
     try {
       const q = query({
@@ -254,7 +262,29 @@ export class YagamiEngine {
           if (event.type === "content_block_delta") {
             const delta = event["delta"] as { type?: string; text?: string } | undefined;
             if (delta?.type === "text_delta" && typeof delta.text === "string") {
-              assistantText += delta.text;
+              const out = stripper ? stripper.push(delta.text) : delta.text;
+              assistantText += out;
+              if (stripper && out !== delta.text) {
+                // Withheld or shortened by the prefill check: rewrite (or
+                // skip) the delta so clients only ever see the continuation.
+                if (out !== "") {
+                  yield { event: event.type, data: { ...event, delta: { ...delta, text: out } } };
+                }
+                continue;
+              }
+            }
+          } else if (event.type === "content_block_stop" && stripper?.pending) {
+            const held = stripper.flush();
+            if (held !== "") {
+              assistantText += held;
+              yield {
+                event: "content_block_delta",
+                data: {
+                  type: "content_block_delta",
+                  index: event["index"],
+                  delta: { type: "text_delta", text: held },
+                },
+              };
             }
           }
           yield { event: event.type, data: event };
@@ -285,12 +315,29 @@ export class YagamiEngine {
     // Some engine paths may not emit partial events; synthesize a valid
     // stream from the final result so clients always get a complete message.
     if (!sawStreamEvent) {
-      assistantText = result.result;
-      yield* synthesizeStream(result.result, requestedModel, mapUsage(result.usage as unknown as Record<string, unknown>));
+      assistantText = stripLeading(result.result, norm.prefill);
+      yield* synthesizeStream(assistantText, requestedModel, mapUsage(result.usage as unknown as Record<string, unknown>));
     }
 
-    this.storeSession(norm, assistantText || result.result, sessionId);
+    this.storeSession(norm, assistantText || stripLeading(result.result, norm.prefill), sessionId);
   }
+}
+
+/** Like the real API, the response carries only the continuation: drop an
+ *  accidentally repeated prefill from the first text block. */
+function stripPrefillFromContent(content: ContentBlock[], prefill: string): ContentBlock[] {
+  const i = content.findIndex((b) => b.type === "text" && typeof b["text"] === "string");
+  if (i === -1) return content;
+  const text = content[i]!["text"] as string;
+  if (!text.startsWith(prefill)) return content;
+  const next = [...content];
+  next[i] = { ...content[i]!, text: text.slice(prefill.length) };
+  return next;
+}
+
+function stripLeading(text: string, prefill: string | undefined): string {
+  if (!prefill) return text;
+  return text.startsWith(prefill) ? text.slice(prefill.length) : text;
 }
 
 function mapThinking(req: MessagesRequest): ThinkingConfig | undefined {
