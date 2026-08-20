@@ -94,3 +94,87 @@ export function parseModelRef(model: string | undefined, providerIds: Iterable<s
 export function qualifiedModel(providerId: string, model: string): string {
   return `${providerId}:${model}`;
 }
+
+// ---------------------------------------------------------------------------
+// Agentic sessions (library mode): tools, permissions, the works.
+// ---------------------------------------------------------------------------
+
+export type PermissionDecision = "allow" | "allow_always" | "deny" | "deny_always";
+
+/** A harness asking the host whether a tool may run. */
+export interface PermissionRequest {
+  provider: string;
+  sessionId?: string;
+  /** Tool name as the harness calls it (e.g. "Bash", "Edit", or an ACP title). */
+  tool: string;
+  /** Coarse category when known: read | edit | delete | execute | fetch | other … */
+  kind?: string;
+  title?: string;
+  input?: unknown;
+  /** Provider-native payload for hosts that want to go deep. */
+  raw?: unknown;
+}
+
+export interface PermissionHandler {
+  decide(req: PermissionRequest, signal?: AbortSignal): Promise<PermissionDecision>;
+}
+
+export type AgentEvent =
+  | { type: "session"; sessionId: string }
+  | { type: "text"; text: string }
+  | { type: "thinking"; text: string }
+  | {
+      type: "tool_call";
+      id: string;
+      name: string;
+      status: "started" | "updated" | "completed" | "failed";
+      title?: string;
+      kind?: string;
+      input?: unknown;
+      output?: unknown;
+    }
+  | { type: "permission"; request: PermissionRequest; decision: PermissionDecision }
+  | { type: "done"; usage?: Usage; costUsd?: number; stopReason?: string }
+  /** Anything the harness said that has no normalized shape. */
+  | { type: "raw"; provider: string; payload: unknown };
+
+export interface AgentSessionOptions {
+  /** Project directory the agent works in. */
+  cwd: string;
+  model?: string;
+  /** Provider session id to continue. */
+  resume?: string;
+  /**
+   * "terminal" loads the same settings the interactive CLI would — user and
+   * project config, CLAUDE.md, skills, hooks, MCP servers. "isolated" loads
+   * none of it. Default "terminal", because that is the promise.
+   */
+  parity?: "terminal" | "isolated";
+  permissions: PermissionHandler;
+  appName?: string;
+  effort?: string;
+  thinking?: ThinkingParam;
+  /** Override the harness's interactive system prompt. */
+  systemPrompt?: string;
+  /** Provider-specific escape hatch (Claude: Agent SDK Options; Codex: { sandbox }; ACP: { mode }). */
+  native?: Record<string, unknown>;
+}
+
+/** One live conversation with a harness: send turns, get normalized events. */
+export interface AgentSession {
+  readonly provider: string;
+  /** Provider session id once known (use it to resume later). */
+  readonly id: string | undefined;
+  send(input: string | ContentBlockParam[]): AsyncGenerator<AgentEvent, void, undefined>;
+  interrupt(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/** Providers that can host agentic sessions implement this too. */
+export interface SessionProvider extends Provider {
+  openSession(options: AgentSessionOptions): AgentSession;
+}
+
+export function isSessionProvider(p: Provider): p is SessionProvider {
+  return typeof (p as Partial<SessionProvider>).openSession === "function";
+}
