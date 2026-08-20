@@ -145,6 +145,40 @@ for await (const msg of claudeCodeSession("fix the failing test", {
 
 Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `ProviderError`.
 
+### Building a UI on Claude Code
+
+`YagamiEngine` is completions-only by design. To build an actual coding UI — tools, permissions, plan mode, a warm session across turns — use `AgentSession`, which wraps the full Claude Code agent with the lifecycle the interactive terminal gives you for free:
+
+```ts
+import { AgentSession } from "yagami";
+
+const session = new AgentSession({
+  cwd: "/path/to/project",
+  parity: "terminal",          // load your CLAUDE.md, skills, hooks, .mcp.json — like the CLI
+  appName: "my-app",           // reported to Claude as the client
+  onPermission: async (req) => {
+    // Your approve/deny UI. Policy stays here; yagami owns the state machine.
+    const ok = await showDialog(req.toolName, req.input);
+    return ok ? { behavior: "allow" } : { behavior: "deny", message: "user declined" };
+  },
+});
+
+session.send("fix the failing test");     // process starts here and stays warm
+for await (const msg of session) {        // raw SDKMessages — render however you like
+  render(msg);
+  if (msg.type === "result") break;
+}
+session.send("now add a test for the edge case");   // next turn resumes the same session
+await session.interrupt();                // the CLI's Esc
+await session.setModel("opus");           // the CLI's /model
+await session.setPermissionMode("plan");  // shift+tab
+session.close();
+```
+
+This resolves the parts of embedding Claude Code that every host would otherwise reimplement identically — process lifecycle, session resume, interrupt, settings parity, and the permission state machine. What stays yours are the genuinely app-specific choices: rendering the `SDKMessage` stream, deciding what to auto-approve, and picking the working directory. `parity` is `"terminal"` (load user+project+local settings, matching your CLI), `"project"` (project+local only), or `"isolated"` (load nothing — reproducible, no personal config). The permission `fallback` defaults to `"deny"`, so a session is safe before the UI is wired up; `autoAllow`/`autoDeny` skip the handler for named tools.
+
+For a lower-level handle, `claudeCodeSession(prompt, { options })` returns the raw Agent SDK `Query`.
+
 The server is also embeddable: `import { startYagami } from "yagami/server"`.
 
 ## How it works

@@ -19,6 +19,15 @@ export {
   type EngineModel,
 } from "./core/engine.js";
 export { claudeCodeSession, type ClaudeSessionOptions } from "./core/session.js";
+export { AgentSession, startAgentSession, type AgentSessionOptions } from "./core/agentSession.js";
+export {
+  PermissionAdapter,
+  type PermissionHandler,
+  type PermissionRequest,
+  type PermissionDecision,
+  type PermissionAdapterOptions,
+} from "./core/permission.js";
+export { settingSourcesFor, type Parity } from "./core/parity.js";
 export type { Provider, ProviderCapabilities, TurnRequest, TurnEvent, ModelRef } from "./core/provider.js";
 export { parseModelRef, qualifiedModel } from "./core/provider.js";
 export { ClaudeProvider, type ClaudeProviderOptions } from "./core/providers/claude.js";

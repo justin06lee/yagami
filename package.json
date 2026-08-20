@@ -1,6 +1,6 @@
 {
   "name": "yagami",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Self-hosted Anthropic-compatible API backed by your signed-in Claude Code CLI, plus an embeddable library for driving Claude Code sessions from your own apps.",
   "type": "module",
   "license": "MIT",
@@ -30,7 +30,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
-    "live:providers": "tsx scripts/live-providers.ts"
+    "live:providers": "tsx scripts/live-providers.ts",
+    "live:session": "tsx scripts/live-session.ts"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.3.0",
