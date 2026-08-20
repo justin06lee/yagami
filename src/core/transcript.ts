@@ -68,6 +68,10 @@ function contentToParts(
   for (const block of content) {
     if (block?.type === "text" && typeof block["text"] === "string") {
       parts.push(block["text"] as string);
+    } else if (role === "assistant" && (block?.type === "thinking" || block?.type === "redacted_thinking")) {
+      // Clients echo thinking blocks back verbatim; they carry nothing the
+      // replayed transcript needs, so they are dropped rather than rejected.
+      continue;
     } else if (role === "user" && USER_MEDIA_TYPES.has(String(block?.type))) {
       if (block["source"] == null || typeof block["source"] !== "object") {
         throw new ApiError(
@@ -216,10 +220,11 @@ export class PrefillStripper {
  * through a Claude Code session". Matching a prefix lets the engine resume
  * that session instead of replaying history.
  */
-export function prefixKey(system: string | undefined, messages: NormalizedMessage[]): string {
-  // Media identity is folded in as a digest; text-only messages keep the
-  // original payload shape so existing persisted caches stay valid.
+export function prefixKey(system: string | undefined, messages: NormalizedMessage[], provider = "claude"): string {
+  // Scoped per provider: a Claude session id means nothing to Codex. Media
+  // identity is folded in as a digest.
   const payload = JSON.stringify([
+    provider,
     system ?? "",
     messages.map((m) =>
       m.media && m.media.length > 0

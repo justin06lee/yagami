@@ -19,6 +19,31 @@ export {
   type EngineModel,
 } from "./core/engine.js";
 export { claudeCodeSession, type ClaudeSessionOptions } from "./core/session.js";
+export type { Provider, ProviderCapabilities, TurnRequest, TurnEvent, ModelRef } from "./core/provider.js";
+export { parseModelRef, qualifiedModel } from "./core/provider.js";
+export { ClaudeProvider, type ClaudeProviderOptions } from "./core/providers/claude.js";
+export { CodexProvider, type CodexProviderOptions, type CodexSandboxMode } from "./core/providers/codex.js";
+export { AcpProvider, type AcpProviderOptions, type AcpConnection } from "./core/providers/acp.js";
+export {
+  PROVIDER_PRESETS,
+  createProvider,
+  loadProviders,
+  detectProviders,
+  presetFor,
+  type ProviderPreset,
+  type ProviderKind,
+  type ProviderConfigEntry,
+  type LoadedProviders,
+  type DetectedProvider,
+} from "./core/providers/registry.js";
+export {
+  YagamiError,
+  ProviderNotInstalledError,
+  AuthRequiredError,
+  ProviderError,
+  toApiError,
+  type VersionSkew,
+} from "./core/errors.js";
 export type {
   AgentOptions,
   Query,
@@ -27,7 +52,7 @@ export type {
   PermissionMode,
   CanUseTool,
 } from "./core/session.js";
-export { resolveClaudeExecutable } from "./core/executable.js";
+export { resolveClaudeExecutable, resolveExecutable, findExecutable } from "./core/executable.js";
 export { SessionCache, type SessionCacheOptions } from "./core/sessionCache.js";
 export {
   ApiError,

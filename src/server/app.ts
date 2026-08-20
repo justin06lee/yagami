@@ -4,11 +4,15 @@ import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError, type MessagesRequest } from "../core/types.js";
+import { toApiError } from "../core/errors.js";
 import type { CompleteResult, EngineModel, StreamOptions, StreamStart } from "../core/engine.js";
 
 /** What the app needs from an engine — lets tests inject a fake. */
 export interface EngineLike {
-  claudePath: string;
+  /** Executable of the default provider. */
+  executable: string;
+  defaultProviderId: string;
+  providerIds: string[];
   complete(req: MessagesRequest): Promise<CompleteResult>;
   stream(req: MessagesRequest, opts?: StreamOptions): StreamStart;
   listModels(): Promise<EngineModel[]>;
@@ -77,7 +81,9 @@ export function createApp(options: AppOptions): Hono {
       ok: true,
       service: "yagami",
       version: options.version,
-      claude: engine.claudePath,
+      provider: engine.defaultProviderId,
+      providers: engine.providerIds,
+      executable: engine.executable,
       uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
       requests: stats.requests,
       total_cost_usd: stats.totalCostUsd,
@@ -129,7 +135,7 @@ export function createApp(options: AppOptions): Hono {
     try {
       if (req.stream === true) {
         const abortController = new AbortController();
-        const { ignored, events } = engine.stream(req, {
+        const { ignored, provider, events } = engine.stream(req, {
           signal: abortController.signal,
           onResult: (info) => {
             if (info.costUsd !== undefined) stats.totalCostUsd += info.costUsd;
@@ -142,6 +148,7 @@ export function createApp(options: AppOptions): Hono {
             );
           },
         });
+        c.header("x-yagami-provider", provider);
         if (ignored.length > 0) c.header("x-yagami-ignored", ignored.join(","));
         return streamSSE(c, async (stream) => {
           stream.onAbort(() => abortController.abort());
@@ -159,18 +166,15 @@ export function createApp(options: AppOptions): Hono {
           ...(result.sessionId ? { session: result.sessionId } : {}),
         }),
       );
+      c.header("x-yagami-provider", result.provider);
       if (result.ignored.length > 0) c.header("x-yagami-ignored", result.ignored.join(","));
       if (result.costUsd !== undefined) c.header("x-yagami-cost-usd", result.costUsd.toFixed(6));
       if (result.sessionId) c.header("x-yagami-session", result.sessionId);
       return c.json(result.response);
     } catch (err) {
-      if (err instanceof ApiError) {
-        log?.(requestLine(err.status, model, startedAt, { error: err.type }));
-        return c.json(err.toBody(), err.status as ContentfulStatusCode);
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      log?.(requestLine(500, model, startedAt, { error: "api_error" }));
-      return c.json(errorBody("api_error", message), 500);
+      const apiErr = toApiError(err);
+      log?.(requestLine(apiErr.status, model, startedAt, { error: apiErr.type }));
+      return c.json(apiErr.toBody(), apiErr.status as ContentfulStatusCode);
     }
   });
 
@@ -179,8 +183,8 @@ export function createApp(options: AppOptions): Hono {
   );
 
   app.onError((err, c) => {
-    if (err instanceof ApiError) return c.json(err.toBody(), err.status as ContentfulStatusCode);
-    return c.json(errorBody("api_error", err.message), 500);
+    const apiErr = toApiError(err);
+    return c.json(apiErr.toBody(), apiErr.status as ContentfulStatusCode);
   });
 
   return app;

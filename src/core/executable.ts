@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ProviderNotInstalledError } from "./errors.js";
 
 export function expandHome(p: string): string {
   if (p === "~") return os.homedir();
@@ -16,16 +17,66 @@ function isFile(p: string): boolean {
   }
 }
 
-function commonInstallPaths(): string[] {
+/** Directories CLIs commonly install into when they aren't on PATH. */
+function commonBinDirs(): string[] {
   const home = os.homedir();
   return [
-    path.join(home, ".local", "bin", "claude"),
-    "/opt/homebrew/bin/claude",
-    "/usr/local/bin/claude",
-    path.join(home, ".claude", "local", "claude"),
-    path.join(home, ".npm-global", "bin", "claude"),
-    path.join(home, "bin", "claude"),
+    path.join(home, ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    path.join(home, ".npm-global", "bin"),
+    path.join(home, "bin"),
+    path.join(home, ".bun", "bin"),
+    path.join(home, ".cargo", "bin"),
   ];
+}
+
+export interface FindExecutableOptions {
+  /** Explicit path from config/CLI flags; wins when set, errors when wrong. */
+  explicit?: string;
+  /** Extra absolute candidates to try after PATH. */
+  extraPaths?: string[];
+}
+
+/**
+ * Locate a CLI binary: explicit path first, then PATH, then the usual
+ * install directories. Returns undefined when nothing is found.
+ */
+export function findExecutable(name: string, options: FindExecutableOptions = {}): string | undefined {
+  if (options.explicit) {
+    const p = expandHome(options.explicit);
+    return isFile(p) ? p : undefined;
+  }
+  if (name.includes("/")) {
+    const p = expandHome(name);
+    return isFile(p) ? p : undefined;
+  }
+  for (const dir of (process.env["PATH"] ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    if (isFile(candidate)) return candidate;
+  }
+  for (const dir of commonBinDirs()) {
+    const candidate = path.join(dir, name);
+    if (isFile(candidate)) return candidate;
+  }
+  for (const candidate of options.extraPaths ?? []) {
+    if (isFile(expandHome(candidate))) return expandHome(candidate);
+  }
+  return undefined;
+}
+
+/** Like findExecutable, but throws a typed, actionable error when missing. */
+export function resolveExecutable(
+  providerId: string,
+  name: string,
+  installHint: string,
+  options: FindExecutableOptions = {},
+): string {
+  const found = findExecutable(name, options);
+  if (found) return found;
+  const detail = options.explicit ? `configured path ${options.explicit} does not exist` : `\`${name}\` not on PATH`;
+  throw new ProviderNotInstalledError(providerId, installHint, detail);
 }
 
 /**
@@ -36,25 +87,13 @@ function commonInstallPaths(): string[] {
  */
 export function resolveClaudeExecutable(explicit?: string): string {
   const configured = explicit ?? process.env["YAGAMI_CLAUDE_PATH"];
-  if (configured) {
-    const p = expandHome(configured);
-    if (isFile(p)) return p;
-    throw new Error(`claude executable not found at configured path: ${configured}`);
-  }
-
-  for (const dir of (process.env["PATH"] ?? "").split(path.delimiter)) {
-    if (!dir) continue;
-    const candidate = path.join(dir, "claude");
-    if (isFile(candidate)) return candidate;
-  }
-
-  for (const candidate of commonInstallPaths()) {
-    if (isFile(candidate)) return candidate;
-  }
-
-  throw new Error(
-    "Could not find the Claude Code CLI (`claude`). Install it and sign in " +
-      "(run `claude` and use /login), or point yagami at it with " +
-      "YAGAMI_CLAUDE_PATH or the `claudePath` config option.",
+  return resolveExecutable(
+    "claude",
+    "claude",
+    "Install Claude Code and sign in (run `claude`, then /login), or point yagami at it with YAGAMI_CLAUDE_PATH or providers.claude.path.",
+    {
+      ...(configured ? { explicit: configured } : {}),
+      extraPaths: [path.join(os.homedir(), ".claude", "local", "claude")],
+    },
   );
 }

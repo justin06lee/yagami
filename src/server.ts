@@ -38,10 +38,13 @@ export async function startYagami(overrides: StartOptions = {}): Promise<Running
 
   const sessionCache = new SessionCache({ persistPath: sessionCachePath() });
   const engine = new YagamiEngine({
-    claudePath: config.claudePath,
-    claudeConfigDir: config.claudeConfigDir,
-    defaultModel: config.defaultModel,
+    ...(config.providers ? { providerConfig: config.providers } : {}),
+    ...(config.defaultProvider ? { defaultProvider: config.defaultProvider } : {}),
+    ...(config.claudePath ? { claudePath: config.claudePath } : {}),
+    ...(config.claudeConfigDir ? { claudeConfigDir: config.claudeConfigDir } : {}),
+    ...(config.defaultModel ? { defaultModel: config.defaultModel } : {}),
     sessionCache,
+    appName: "yagami",
   });
 
   const app = createApp({
