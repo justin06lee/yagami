@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/yagami.svg" alt="yagami" width="330" />
+<img src="assets/yagami.png" alt="yagami" width="330" />
 
 # yagami
 
