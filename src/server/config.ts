@@ -2,15 +2,22 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ProviderConfigEntry } from "../core/providers/registry.js";
 
 export interface YagamiConfig {
   host: string;
   port: number;
   apiKeys: string[];
+  /** @deprecated Use providers.claude.path. */
   claudePath?: string;
+  /** @deprecated Use providers.claude.configDir. */
   claudeConfigDir?: string;
   defaultModel?: string;
   cors?: boolean;
+  /** Provider used for bare model ids (default: claude). */
+  defaultProvider?: string;
+  /** Per-provider settings, keyed by provider id. */
+  providers?: Record<string, ProviderConfigEntry>;
 }
 
 export const DEFAULT_CONFIG: YagamiConfig = {
@@ -111,6 +118,7 @@ export function loadConfig(): YagamiConfig {
   }
   if (env["YAGAMI_CLAUDE_PATH"]) cfg.claudePath = env["YAGAMI_CLAUDE_PATH"];
   if (env["YAGAMI_DEFAULT_MODEL"]) cfg.defaultModel = env["YAGAMI_DEFAULT_MODEL"];
+  if (env["YAGAMI_PROVIDER"]) cfg.defaultProvider = env["YAGAMI_PROVIDER"];
   return cfg;
 }
 

@@ -71,6 +71,24 @@ describe("normalizeRequest", () => {
     ).toThrowError(/assistant messages/);
   });
 
+  it("drops thinking blocks echoed back in assistant messages", () => {
+    const norm = normalizeRequest({
+      model: "m",
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "hmm", signature: "" },
+            { type: "text", text: "hello" },
+          ],
+        },
+        { role: "user", content: "again" },
+      ],
+    });
+    expect(norm.messages[1]).toEqual({ role: "assistant", text: "hello" });
+  });
+
   it("rejects tool_result blocks", () => {
     expect(() =>
       normalizeRequest({
@@ -156,6 +174,11 @@ describe("prefixKey", () => {
     expect(prefixKey("s", msgs)).not.toBe(prefixKey("other", msgs));
     expect(prefixKey("s", msgs)).not.toBe(prefixKey("s", [{ role: "user", text: "yo" }]));
     expect(prefixKey("s", msgs)).not.toBe(prefixKey("s", [{ role: "assistant", text: "hi" }]));
+  });
+
+  it("is scoped per provider", () => {
+    expect(prefixKey("s", msgs, "claude")).toBe(prefixKey("s", msgs));
+    expect(prefixKey("s", msgs, "codex")).not.toBe(prefixKey("s", msgs, "claude"));
   });
 
   it("distinguishes messages by their media blocks", () => {

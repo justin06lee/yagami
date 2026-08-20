@@ -17,12 +17,21 @@ const RESPONSE: MessagesResponse = {
 
 function fakeEngine(overrides: Partial<EngineLike> = {}): EngineLike {
   return {
-    claudePath: "/fake/claude",
-    complete: async () => ({ response: RESPONSE, costUsd: 0.0123, sessionId: "sess-1", ignored: ["max_tokens"] }),
+    executable: "/fake/claude",
+    defaultProviderId: "claude",
+    providerIds: ["claude", "codex"],
+    complete: async () => ({
+      response: RESPONSE,
+      costUsd: 0.0123,
+      sessionId: "sess-1",
+      provider: "claude",
+      ignored: ["max_tokens"],
+    }),
     stream: (_req, opts) => {
       opts?.onResult?.({ costUsd: 0.005, sessionId: "sess-s" });
       return {
         ignored: [],
+        provider: "claude",
         events: (async function* () {
           yield { event: "message_start", data: { type: "message_start" } };
           yield { event: "message_stop", data: { type: "message_stop" } };
@@ -72,11 +81,14 @@ describe("auth", () => {
     expect(res.status).toBe(200);
   });
 
-  it("leaves /healthz open", async () => {
+  it("leaves /healthz open and reports providers", async () => {
     const app = createApp({ engine: fakeEngine(), apiKeys: [KEY] });
     const res = await app.request("/healthz");
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+    const body = (await res.json()) as { ok: boolean; provider: string; providers: string[] };
+    expect(body.ok).toBe(true);
+    expect(body.provider).toBe("claude");
+    expect(body.providers).toEqual(["claude", "codex"]);
   });
 });
 
@@ -88,6 +100,7 @@ describe("POST /v1/messages", () => {
     expect(await res.json()).toEqual(RESPONSE);
     expect(res.headers.get("x-yagami-cost-usd")).toBe("0.012300");
     expect(res.headers.get("x-yagami-session")).toBe("sess-1");
+    expect(res.headers.get("x-yagami-provider")).toBe("claude");
     expect(res.headers.get("x-yagami-ignored")).toBe("max_tokens");
     expect(res.headers.get("request-id")).toMatch(/^req_/);
   });

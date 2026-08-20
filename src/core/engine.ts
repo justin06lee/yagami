@@ -2,18 +2,12 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-  query,
-  type CanUseTool,
-  type Options,
-  type SDKAssistantMessage,
-  type SDKResultMessage,
-  type SDKUserMessage,
-  type ThinkingConfig,
-  type EffortLevel,
-} from "@anthropic-ai/claude-agent-sdk";
-import { resolveClaudeExecutable } from "./executable.js";
+import { ProviderError, ProviderNotInstalledError, toApiError } from "./errors.js";
+import type { EngineModel } from "./models.js";
+import { parseModelRef, qualifiedModel, type Provider, type TurnEvent, type TurnRequest } from "./provider.js";
+import { loadProviders, type ProviderConfigEntry } from "./providers/registry.js";
 import { SessionCache } from "./sessionCache.js";
+import { SseSynthesizer } from "./sse.js";
 import {
   flattenConversation,
   normalizeRequest,
@@ -22,53 +16,44 @@ import {
   prefixKey,
   type NormalizedRequest,
 } from "./transcript.js";
-import {
-  ApiError,
-  type ContentBlock,
-  type ContentBlockParam,
-  type MessagesRequest,
-  type MessagesResponse,
-  type SseEvent,
-  type Usage,
-} from "./types.js";
-import { VERSION } from "../version.js";
+import { ApiError, type ContentBlock, type MessagesRequest, type MessagesResponse, type SseEvent } from "./types.js";
+
+export type { EngineModel } from "./models.js";
 
 const EFFORT_LEVELS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max"]);
-
-// The API surface is pure completions: even though `tools: []` removes every
-// built-in tool, deny anything that somehow still asks.
-const DENY_ALL_TOOLS: CanUseTool = async (toolName) => ({
-  behavior: "deny",
-  message: `yagami is a completions-only endpoint; tool "${toolName}" is disabled.`,
-  interrupt: true,
-});
-
-interface RawStreamEvent {
-  type: string;
-  [key: string]: unknown;
-}
+const THINKING_TYPES: ReadonlySet<string> = new Set(["enabled", "disabled", "adaptive"]);
 
 export interface EngineOptions {
-  /** Path to the `claude` binary. Auto-resolved when omitted. */
+  /** Explicit provider instances (library mode). Overrides config-driven loading. */
+  providers?: Provider[];
+  /** Per-provider settings (`providers.<id>` in config.json). */
+  providerConfig?: Record<string, ProviderConfigEntry>;
+  /** Provider used for bare model ids (default: claude if installed, else the first available). */
+  defaultProvider?: string;
+  /** @deprecated Use providerConfig.claude.path. */
   claudePath?: string;
-  /** Optional CLAUDE_CONFIG_DIR override for the spawned CLI. */
+  /** @deprecated Use providerConfig.claude.configDir. */
   claudeConfigDir?: string;
-  /** Working directory for engine sessions (inert — tools are disabled). */
+  /** Working directory for completion turns (inert — tools are disabled/sandboxed). */
   workDir?: string;
-  /** Model used when a request omits `model`. */
+  /** Model used when a request omits `model` (may be `provider:model`). */
   defaultModel?: string;
   sessionCache?: SessionCache;
+  /** Reported to the CLIs as the client application name. */
+  appName?: string;
 }
 
 export interface CompleteResult {
   response: MessagesResponse;
   costUsd?: number;
   sessionId?: string;
+  provider: string;
   ignored: string[];
 }
 
 export interface StreamStart {
   ignored: string[];
+  provider: string;
   events: AsyncGenerator<SseEvent, void, undefined>;
 }
 
@@ -84,52 +69,152 @@ export interface StreamOptions {
   onResult?: (info: StreamResultInfo) => void;
 }
 
-/** A model the backing CLI reports as available. */
-export interface EngineModel {
-  id: string;
-  display_name: string;
-  description?: string;
-  /** Canonical wire id an alias resolves to (e.g. "sonnet" → "claude-sonnet-5"). */
-  resolved_model?: string;
-}
-
-interface PreparedQuery {
-  prompt: string | AsyncIterable<SDKUserMessage>;
-  options: Options;
+interface PreparedTurn {
+  provider: Provider;
+  turn: TurnRequest;
   norm: NormalizedRequest;
+  /** Model id to report back (qualified unless it's the default provider's). */
   requestedModel: string;
+  ignored: string[];
   /** Cache key the resume came from — set only when resuming a session. */
   resumeKey?: string;
 }
 
 /**
- * Translates Anthropic Messages API requests into Claude Agent SDK sessions
- * backed by the user's installed, signed-in Claude Code CLI.
+ * Translates Anthropic Messages API requests into turns on whichever
+ * signed-in coding harness the model id names — Claude Code by default,
+ * `codex:…`, `opencode:…`, `gemini:…` and friends on request.
  */
 export class YagamiEngine {
-  readonly claudePath: string;
-  private readonly claudeConfigDir: string | undefined;
-  private readonly workDir: string;
+  readonly providers: Map<string, Provider>;
+  readonly unavailable: Map<string, string>;
+  readonly defaultProviderId: string;
   private readonly defaultModel: string | undefined;
   private readonly cache: SessionCache;
-  private modelsPromise: Promise<EngineModel[]> | undefined;
+  private readonly modelsPromises = new Map<string, Promise<EngineModel[]>>();
 
   constructor(options: EngineOptions = {}) {
-    this.claudePath = resolveClaudeExecutable(options.claudePath);
-    this.claudeConfigDir = options.claudeConfigDir;
+    const workDir = options.workDir ?? path.join(os.tmpdir(), "yagami-workspace");
+    fs.mkdirSync(workDir, { recursive: true });
     this.defaultModel = options.defaultModel;
     this.cache = options.sessionCache ?? new SessionCache();
-    // A fixed cwd for every session: keeps resume lookups consistent and
-    // guarantees no real project directory is ever the session context.
-    this.workDir = options.workDir ?? path.join(os.tmpdir(), "yagami-workspace");
-    fs.mkdirSync(this.workDir, { recursive: true });
+
+    if (options.providers) {
+      this.providers = new Map(options.providers.map((p) => [p.id, p]));
+      this.unavailable = new Map();
+    } else {
+      const config: Record<string, ProviderConfigEntry> = { ...options.providerConfig };
+      if (options.claudePath || options.claudeConfigDir) {
+        config["claude"] = {
+          ...config["claude"],
+          ...(options.claudePath ? { path: options.claudePath } : {}),
+          ...(options.claudeConfigDir ? { configDir: options.claudeConfigDir } : {}),
+        };
+      }
+      const loaded = loadProviders(config, { workDir, ...(options.appName ? { appName: options.appName } : {}) });
+      this.providers = loaded.providers;
+      this.unavailable = loaded.unavailable;
+    }
+
+    const wanted = options.defaultProvider ?? (this.providers.has("claude") ? "claude" : [...this.providers.keys()][0]);
+    if (!wanted || !this.providers.has(wanted)) {
+      const reason = wanted ? this.unavailable.get(wanted) : "no supported coding-agent CLI was found on this machine";
+      throw new ProviderNotInstalledError(wanted ?? "(none)", reason ?? "not installed");
+    }
+    this.defaultProviderId = wanted;
   }
 
-  private prepare(req: MessagesRequest, opts: { skipResume?: boolean } = {}): PreparedQuery {
+  get defaultProvider(): Provider {
+    return this.providers.get(this.defaultProviderId)!;
+  }
+
+  /** Executable of the default provider. */
+  get executable(): string {
+    return this.defaultProvider.executable;
+  }
+
+  /** @deprecated Use `executable`. */
+  get claudePath(): string {
+    return this.executable;
+  }
+
+  get providerIds(): string[] {
+    return [...this.providers.keys()];
+  }
+
+  /** Route a request's model id to a provider and its native model. */
+  resolve(model: string | undefined): { provider: Provider; model?: string } {
+    const ref = parseModelRef(model ?? this.defaultModel, this.providers.keys());
+    if (ref.providerId && !this.providers.has(ref.providerId)) {
+      throw new ApiError(503, "api_error", `provider "${ref.providerId}" is not available: ${this.unavailable.get(ref.providerId) ?? "not installed"}`);
+    }
+    const provider = this.providers.get(ref.providerId ?? this.defaultProviderId)!;
+    return ref.model ? { provider, model: ref.model } : { provider };
+  }
+
+  /**
+   * Models across every available provider. The default provider's ids are
+   * listed bare as well as qualified; others only as `provider:model`.
+   * Providers whose probe fails are skipped (their error is not cached).
+   */
+  async listModels(): Promise<EngineModel[]> {
+    const out: EngineModel[] = [];
+    const entries = await Promise.all(
+      [...this.providers.entries()].map(async ([id, provider]) => {
+        try {
+          return [id, await this.providerModels(id, provider)] as const;
+        } catch {
+          return [id, []] as const;
+        }
+      }),
+    );
+    for (const [id, models] of entries) {
+      for (const m of models) {
+        if (id === this.defaultProviderId) out.push({ ...m, provider: id });
+        out.push({ ...m, id: qualifiedModel(id, m.id), provider: id });
+      }
+    }
+    return out;
+  }
+
+  private providerModels(id: string, provider: Provider): Promise<EngineModel[]> {
+    let promise = this.modelsPromises.get(id);
+    if (!promise) {
+      promise = provider.listModels().catch((err) => {
+        this.modelsPromises.delete(id);
+        throw err;
+      });
+      this.modelsPromises.set(id, promise);
+    }
+    return promise;
+  }
+
+  private prepare(req: MessagesRequest, opts: { skipResume?: boolean } = {}): PreparedTurn {
     const norm = normalizeRequest(req);
-    const model = req.model ?? this.defaultModel;
-    if (!model || typeof model !== "string") {
-      throw new ApiError(400, "invalid_request_error", "`model` is required (no defaultModel configured)");
+    const { provider, model } = this.resolve(req.model);
+    const caps = provider.capabilities;
+    const ignored = [...norm.ignored];
+
+    if (req.thinking != null) {
+      if (!THINKING_TYPES.has(String(req.thinking.type))) {
+        throw new ApiError(400, "invalid_request_error", `invalid \`thinking.type\`: ${String(req.thinking.type)}`);
+      }
+      if (!caps.thinking) ignored.push("thinking");
+    }
+    if (req.effort != null) {
+      if (typeof req.effort !== "string" || !EFFORT_LEVELS.has(req.effort)) {
+        throw new ApiError(400, "invalid_request_error", `invalid \`effort\`: ${String(req.effort)}`);
+      }
+      if (!caps.effort) ignored.push("effort");
+    }
+
+    const last = norm.messages[norm.messages.length - 1]!;
+    const lastMedia = last.media ?? [];
+    if (lastMedia.some((b) => b.type === "image") && !caps.images) {
+      throw new ApiError(400, "invalid_request_error", `provider "${provider.id}" does not accept image blocks`);
+    }
+    if (lastMedia.some((b) => b.type === "document") && !caps.documents) {
+      throw new ApiError(400, "invalid_request_error", `provider "${provider.id}" does not accept document blocks`);
     }
 
     let promptText = norm.lastUserText;
@@ -137,9 +222,12 @@ export class YagamiEngine {
     let resumeKey: string | undefined;
     if (norm.messages.length > 1) {
       const history = norm.messages.slice(0, -1);
-      if (!opts.skipResume) {
-        resumeKey = prefixKey(norm.system, history);
+      if (caps.resume && !opts.skipResume) {
+        resumeKey = prefixKey(norm.system, history, provider.id);
         resume = this.cache.get(resumeKey);
+        // Without fork support a resumed session is spent: the mapping must
+        // not be reused by a sibling branch, which would corrupt both.
+        if (resume && !caps.fork) this.cache.delete(resumeKey);
       }
       if (!resume) {
         // Media in the history can't be replayed as text; only a live cached
@@ -155,60 +243,34 @@ export class YagamiEngine {
       }
     }
     if (norm.prefill) promptText = `${promptText}\n\n${prefillDirective(norm.prefill)}`;
-
-    const lastMedia = norm.messages[norm.messages.length - 1]!.media;
-    const prompt = lastMedia && lastMedia.length > 0 ? mediaPrompt(promptText, lastMedia) : promptText;
-
-    const options: Options = {
-      pathToClaudeCodeExecutable: this.claudePath,
-      cwd: this.workDir,
-      model,
-      // Pure completions: no built-in tools, no settings/CLAUDE.md/skills
-      // leaking in, exactly one assistant turn per request.
-      tools: [],
-      settingSources: [],
-      maxTurns: 1,
-      canUseTool: DENY_ALL_TOOLS,
-      env: {
-        ...process.env,
-        ...(this.claudeConfigDir ? { CLAUDE_CONFIG_DIR: this.claudeConfigDir } : {}),
-        CLAUDE_AGENT_SDK_CLIENT_APP: `yagami/${VERSION}`,
-      },
-    };
-    if (norm.system !== undefined) options.systemPrompt = norm.system;
-    if (resume) {
-      options.resume = resume;
-      // Fork so several conversation branches can share one cached prefix
-      // without corrupting each other's transcripts.
-      options.forkSession = true;
+    if (norm.system !== undefined && !caps.systemPrompt) {
+      promptText = `<system>\n${norm.system}\n</system>\n\n${promptText}`;
     }
 
-    const thinking = mapThinking(req);
-    if (thinking) options.thinking = thinking;
-    if (typeof req.effort === "string") {
-      if (!EFFORT_LEVELS.has(req.effort)) {
-        throw new ApiError(400, "invalid_request_error", `invalid \`effort\`: ${req.effort}`);
-      }
-      options.effort = req.effort as EffortLevel;
-    }
-
-    return {
-      prompt,
-      options,
-      norm,
-      requestedModel: model,
-      ...(resume && resumeKey ? { resumeKey } : {}),
+    const turn: TurnRequest = {
+      prompt: promptText,
+      ...(lastMedia.length > 0 ? { media: lastMedia } : {}),
+      ...(norm.system !== undefined && caps.systemPrompt ? { system: norm.system } : {}),
+      ...(model ? { model } : {}),
+      ...(resume ? { resume } : {}),
+      ...(req.thinking != null && caps.thinking ? { thinking: req.thinking } : {}),
+      ...(typeof req.effort === "string" && caps.effort ? { effort: req.effort } : {}),
     };
+    const requestedModel = model
+      ? provider.id === this.defaultProviderId
+        ? model
+        : qualifiedModel(provider.id, model)
+      : provider.id;
+
+    return { provider, turn, norm, requestedModel, ignored, ...(resume && resumeKey ? { resumeKey } : {}) };
   }
 
   /**
-   * A failed resumed attempt usually means the cached Claude Code session no
-   * longer exists (garbage-collected transcript, different machine). Drop the
-   * stale mapping and re-prepare from scratch — the transcript-replay path.
-   * Returns undefined when falling back is impossible (no resume was used,
-   * or the history contains media that can't be replayed as text).
+   * A failed resumed attempt usually means the cached session no longer
+   * exists. Drop the stale mapping and re-prepare from scratch — the
+   * transcript-replay path. Undefined when falling back is impossible.
    */
-  private prepareResumeFallback(req: MessagesRequest, failed: PreparedQuery): PreparedQuery | undefined {
+  private prepareResumeFallback(req: MessagesRequest, failed: PreparedTurn): PreparedTurn | undefined {
     if (!failed.resumeKey) return undefined;
     this.cache.delete(failed.resumeKey);
     try {
@@ -218,78 +280,14 @@ export class YagamiEngine {
     }
   }
 
-  /**
-   * Models the backing CLI actually accepts, probed once per process (the
-   * first call spawns a short-lived engine just to ask) and cached. A failed
-   * probe is not cached, so the next request tries again.
-   */
-  listModels(): Promise<EngineModel[]> {
-    if (!this.modelsPromise) {
-      this.modelsPromise = this.probeModels().catch((err) => {
-        this.modelsPromise = undefined;
-        throw err;
-      });
-    }
-    return this.modelsPromise;
-  }
-
-  private async probeModels(): Promise<EngineModel[]> {
-    const abortController = new AbortController();
-    // A streaming-input prompt that stays open: the spawned CLI idles while
-    // the supported-models control request runs, then gets torn down.
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
-    const idle = (async function* (): AsyncGenerator<SDKUserMessage> {
-      await gate;
-    })();
-
-    const q = query({
-      prompt: idle,
-      options: {
-        pathToClaudeCodeExecutable: this.claudePath,
-        cwd: this.workDir,
-        tools: [],
-        settingSources: [],
-        maxTurns: 1,
-        canUseTool: DENY_ALL_TOOLS,
-        abortController,
-        env: {
-          ...process.env,
-          ...(this.claudeConfigDir ? { CLAUDE_CONFIG_DIR: this.claudeConfigDir } : {}),
-          CLAUDE_AGENT_SDK_CLIENT_APP: `yagami/${VERSION}`,
-        },
-      },
-    });
-
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const models = await Promise.race([
-        q.supportedModels(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("timed out probing supported models")), 15_000);
-          timer.unref?.();
-        }),
-      ]);
-      return models.map((m) => ({
-        id: m.value,
-        display_name: m.displayName,
-        ...(m.description ? { description: m.description } : {}),
-        ...(m.resolvedModel ? { resolved_model: m.resolvedModel } : {}),
-      }));
-    } finally {
-      if (timer) clearTimeout(timer);
-      release();
-      abortController.abort();
-    }
-  }
-
-  private storeSession(norm: NormalizedRequest, continuation: string, sessionId: string | undefined): void {
+  private storeSession(prepared: PreparedTurn, continuation: string, sessionId: string | undefined): void {
+    const { norm, provider } = prepared;
     // Clients replay prefill + continuation as one assistant message, so the
     // stored prefix must record the full text, not just what we returned.
     const fullText = (norm.prefill ?? "") + continuation;
-    if (!sessionId || !fullText) return;
+    if (!sessionId || !fullText || !provider.capabilities.resume) return;
     const played = [...norm.messages, { role: "assistant" as const, text: fullText }];
-    this.cache.set(prefixKey(norm.system, played), sessionId);
+    this.cache.set(prefixKey(norm.system, played, provider.id), sessionId);
   }
 
   async complete(req: MessagesRequest): Promise<CompleteResult> {
@@ -298,69 +296,55 @@ export class YagamiEngine {
       return await this.attemptComplete(prepared);
     } catch (err) {
       const fallback = this.prepareResumeFallback(req, prepared);
-      if (!fallback) throw err;
-      return await this.attemptComplete(fallback);
+      if (!fallback) throw toApiError(err);
+      try {
+        return await this.attemptComplete(fallback);
+      } catch (err2) {
+        throw toApiError(err2);
+      }
     }
   }
 
-  private async attemptComplete(prepared: PreparedQuery): Promise<CompleteResult> {
-    const { prompt, options, norm, requestedModel } = prepared;
-
+  private async attemptComplete(prepared: PreparedTurn): Promise<CompleteResult> {
+    const { provider, turn, norm, requestedModel, ignored } = prepared;
+    const stripper = norm.prefill ? new PrefillStripper(norm.prefill) : undefined;
     let sessionId: string | undefined;
-    let assistant: SDKAssistantMessage | undefined;
-    let result: SDKResultMessage | undefined;
+    let text = "";
+    let thinking = "";
+    let done: Extract<TurnEvent, { type: "done" }> | undefined;
 
-    try {
-      for await (const msg of query({ prompt, options })) {
-        if (msg.type === "system" && msg.subtype === "init") {
-          sessionId = msg.session_id;
-        } else if (msg.type === "assistant" && msg.parent_tool_use_id === null) {
-          assistant = msg;
-        } else if (msg.type === "result") {
-          result = msg;
-          sessionId = msg.session_id;
-        }
-      }
-    } catch (err) {
-      throw toApiError(err);
+    for await (const ev of provider.run(turn)) {
+      if (ev.type === "session") sessionId = ev.sessionId;
+      else if (ev.type === "text") text += stripper ? stripper.push(ev.text) : ev.text;
+      else if (ev.type === "thinking") thinking += ev.text;
+      else done = ev;
     }
+    if (stripper) text += stripper.flush();
+    if (!done) throw new ProviderError(provider.id, "turn ended without a result");
 
-    if (!result) {
-      throw new ApiError(500, "api_error", "Claude Code engine terminated without producing a result");
-    }
-    if (result.subtype !== "success") {
-      const detail = "errors" in result && result.errors.length > 0 ? result.errors.join("; ") : result.subtype;
-      throw new ApiError(500, "api_error", `Claude Code engine error: ${detail}`);
-    }
+    this.storeSession(prepared, text, sessionId);
 
-    const raw = assistant?.message as
-      | { id?: string; model?: string; content?: ContentBlock[]; stop_reason?: string | null }
-      | undefined;
-    let content = (raw?.content ?? []).filter((b) => b.type !== "tool_use");
-    if (content.length === 0 && result.result) {
-      content = [{ type: "text", text: result.result }];
-    }
-    if (norm.prefill) content = stripPrefillFromContent(content, norm.prefill);
-    const assistantText =
-      content
-        .filter((b) => b.type === "text")
-        .map((b) => (typeof b["text"] === "string" ? (b["text"] as string) : ""))
-        .join("") || stripLeading(result.result, norm.prefill);
-
-    this.storeSession(norm, assistantText, sessionId);
-
+    const content: ContentBlock[] = [
+      ...(thinking ? [{ type: "thinking", thinking, signature: "" }] : []),
+      { type: "text", text },
+    ];
     const response: MessagesResponse = {
-      id: raw?.id ?? `msg_${randomUUID().replace(/-/g, "")}`,
+      id: `msg_${randomUUID().replace(/-/g, "")}`,
       type: "message",
       role: "assistant",
-      model: raw?.model ?? requestedModel,
+      model: done.model ?? requestedModel,
       content,
-      stop_reason: raw?.stop_reason ?? "end_turn",
+      stop_reason: done.stopReason ?? "end_turn",
       stop_sequence: null,
-      usage: mapUsage(result.usage as unknown as Record<string, unknown>),
+      usage: done.usage,
     };
-
-    return { response, costUsd: result.total_cost_usd, sessionId, ignored: norm.ignored };
+    return {
+      response,
+      ...(done.costUsd !== undefined ? { costUsd: done.costUsd } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      provider: provider.id,
+      ignored,
+    };
   }
 
   /**
@@ -370,14 +354,15 @@ export class YagamiEngine {
   stream(req: MessagesRequest, streamOptions: StreamOptions = {}): StreamStart {
     const prepared = this.prepare(req);
     return {
-      ignored: prepared.norm.ignored,
+      ignored: prepared.ignored,
+      provider: prepared.provider.id,
       events: this.runStream(req, prepared, streamOptions),
     };
   }
 
   private async *runStream(
     req: MessagesRequest,
-    prepared: PreparedQuery,
+    prepared: PreparedTurn,
     streamOptions: StreamOptions,
   ): AsyncGenerator<SseEvent, void, undefined> {
     const { signal } = streamOptions;
@@ -394,214 +379,67 @@ export class YagamiEngine {
       // transparently against a fresh session (transcript replay).
       const fallback = emitted ? undefined : this.prepareResumeFallback(req, prepared);
       if (!fallback) {
-        yield errorEvent(toApiError(err));
+        yield { event: "error", data: toApiError(err).toBody() };
         return;
       }
       try {
         yield* this.attemptStream(fallback, streamOptions);
       } catch (err2) {
-        if (!signal?.aborted) yield errorEvent(toApiError(err2));
+        if (!signal?.aborted) yield { event: "error", data: toApiError(err2).toBody() };
       }
     }
   }
 
   private async *attemptStream(
-    prepared: PreparedQuery,
+    prepared: PreparedTurn,
     streamOptions: StreamOptions,
   ): AsyncGenerator<SseEvent, void, undefined> {
+    const { provider, turn, norm, requestedModel } = prepared;
     const { signal } = streamOptions;
-    const { prompt, options, norm, requestedModel } = prepared;
-    const abortController = new AbortController();
-    const onAbort = () => abortController.abort();
-    signal?.addEventListener("abort", onAbort, { once: true });
-
-    let sessionId: string | undefined;
-    let assistantText = "";
-    let sawStreamEvent = false;
-    let stopped = false;
-    let result: SDKResultMessage | undefined;
     const stripper = norm.prefill ? new PrefillStripper(norm.prefill) : undefined;
+    const sse = new SseSynthesizer(`msg_${randomUUID().replace(/-/g, "")}`, requestedModel);
+    let sessionId: string | undefined;
+    let text = "";
+    let done: Extract<TurnEvent, { type: "done" }> | undefined;
+    // The envelope is sent with the first content event, not up front, so a
+    // resumed session that dies before producing anything can still be
+    // retried transparently (nothing has reached the client yet).
+    let started = false;
+    const start = (): SseEvent[] => {
+      if (started) return [];
+      started = true;
+      return sse.start();
+    };
 
-    try {
-      const q = query({
-        prompt,
-        options: { ...options, abortController, includePartialMessages: true },
-      });
-      for await (const msg of q) {
-        if (msg.type === "system" && msg.subtype === "init") {
-          sessionId = msg.session_id;
-        } else if (msg.type === "stream_event" && msg.parent_tool_use_id === null) {
-          if (stopped) continue;
-          const event = msg.event as unknown as RawStreamEvent;
-          sawStreamEvent = true;
-          if (event.type === "content_block_delta") {
-            const delta = event["delta"] as { type?: string; text?: string } | undefined;
-            if (delta?.type === "text_delta" && typeof delta.text === "string") {
-              const out = stripper ? stripper.push(delta.text) : delta.text;
-              assistantText += out;
-              if (stripper && out !== delta.text) {
-                // Withheld or shortened by the prefill check: rewrite (or
-                // skip) the delta so clients only ever see the continuation.
-                if (out !== "") {
-                  yield { event: event.type, data: { ...event, delta: { ...delta, text: out } } };
-                }
-                continue;
-              }
-            }
-          } else if (event.type === "content_block_stop" && stripper?.pending) {
-            const held = stripper.flush();
-            if (held !== "") {
-              assistantText += held;
-              yield {
-                event: "content_block_delta",
-                data: {
-                  type: "content_block_delta",
-                  index: event["index"],
-                  delta: { type: "text_delta", text: held },
-                },
-              };
-            }
-          }
-          yield { event: event.type, data: event };
-          if (event.type === "message_stop") stopped = true;
-        } else if (msg.type === "result") {
-          result = msg;
-          sessionId = msg.session_id;
-        }
+    for await (const ev of provider.run({ ...turn, ...(signal ? { signal } : {}) })) {
+      if (ev.type === "session") {
+        sessionId = ev.sessionId;
+      } else if (ev.type === "text") {
+        const out = stripper ? stripper.push(ev.text) : ev.text;
+        text += out;
+        yield* start();
+        yield* sse.text(out);
+      } else if (ev.type === "thinking") {
+        yield* start();
+        yield* sse.thinking(ev.text);
+      } else {
+        done = ev;
       }
-    } catch (err) {
-      throw toApiError(err);
-    } finally {
-      signal?.removeEventListener("abort", onAbort);
     }
-
     if (signal?.aborted) return;
-
-    if (!result || result.subtype !== "success") {
-      const detail =
-        result && "errors" in result && result.errors.length > 0
-          ? result.errors.join("; ")
-          : (result?.subtype ?? "engine terminated without a result");
-      throw new ApiError(500, "api_error", `Claude Code engine error: ${detail}`);
+    if (!done) throw new ProviderError(provider.id, "turn ended without a result");
+    yield* start();
+    if (stripper) {
+      const held = stripper.flush();
+      text += held;
+      yield* sse.text(held);
     }
+    yield* sse.finish(done.usage, done.stopReason ?? "end_turn");
 
-    // Some engine paths may not emit partial events; synthesize a valid
-    // stream from the final result so clients always get a complete message.
-    if (!sawStreamEvent) {
-      assistantText = stripLeading(result.result, norm.prefill);
-      yield* synthesizeStream(assistantText, requestedModel, mapUsage(result.usage as unknown as Record<string, unknown>));
-    }
-
-    this.storeSession(norm, assistantText || stripLeading(result.result, norm.prefill), sessionId);
+    this.storeSession(prepared, text, sessionId);
     streamOptions.onResult?.({
-      ...(result.total_cost_usd !== undefined ? { costUsd: result.total_cost_usd } : {}),
+      ...(done.costUsd !== undefined ? { costUsd: done.costUsd } : {}),
       ...(sessionId ? { sessionId } : {}),
     });
   }
-}
-
-/**
- * User turn carrying image/document blocks: sent via the SDK's streaming
- * input mode, which accepts full Anthropic content blocks. The iterable
- * yields exactly one message, so the turn (and process) still ends normally.
- */
-function mediaPrompt(text: string, media: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
-  const content = [...media, ...(text.length > 0 ? [{ type: "text", text }] : [])];
-  const message = {
-    type: "user",
-    message: { role: "user", content },
-    parent_tool_use_id: null,
-  } as unknown as SDKUserMessage;
-  return (async function* () {
-    yield message;
-  })();
-}
-
-/** Like the real API, the response carries only the continuation: drop an
- *  accidentally repeated prefill from the first text block. */
-function stripPrefillFromContent(content: ContentBlock[], prefill: string): ContentBlock[] {
-  const i = content.findIndex((b) => b.type === "text" && typeof b["text"] === "string");
-  if (i === -1) return content;
-  const text = content[i]!["text"] as string;
-  if (!text.startsWith(prefill)) return content;
-  const next = [...content];
-  next[i] = { ...content[i]!, text: text.slice(prefill.length) };
-  return next;
-}
-
-function stripLeading(text: string, prefill: string | undefined): string {
-  if (!prefill) return text;
-  return text.startsWith(prefill) ? text.slice(prefill.length) : text;
-}
-
-function mapThinking(req: MessagesRequest): ThinkingConfig | undefined {
-  const t = req.thinking;
-  if (t == null) return undefined;
-  if (t.type === "enabled") {
-    return typeof t.budget_tokens === "number"
-      ? { type: "enabled", budgetTokens: t.budget_tokens }
-      : { type: "enabled" };
-  }
-  if (t.type === "disabled") return { type: "disabled" };
-  if (t.type === "adaptive") return { type: "adaptive" };
-  throw new ApiError(400, "invalid_request_error", `invalid \`thinking.type\`: ${String(t.type)}`);
-}
-
-function mapUsage(usage: Record<string, unknown>): Usage {
-  const num = (key: string): number | undefined =>
-    typeof usage[key] === "number" ? (usage[key] as number) : undefined;
-  return {
-    input_tokens: num("input_tokens") ?? 0,
-    output_tokens: num("output_tokens") ?? 0,
-    cache_creation_input_tokens: num("cache_creation_input_tokens") ?? 0,
-    cache_read_input_tokens: num("cache_read_input_tokens") ?? 0,
-  };
-}
-
-function toApiError(err: unknown): ApiError {
-  if (err instanceof ApiError) return err;
-  const message = err instanceof Error ? err.message : String(err);
-  return new ApiError(500, "api_error", `Claude Code engine error: ${message}`);
-}
-
-function errorEvent(err: ApiError): SseEvent {
-  return { event: "error", data: err.toBody() };
-}
-
-function* synthesizeStream(text: string, model: string, usage: Usage): Generator<SseEvent> {
-  const id = `msg_${randomUUID().replace(/-/g, "")}`;
-  yield {
-    event: "message_start",
-    data: {
-      type: "message_start",
-      message: {
-        id,
-        type: "message",
-        role: "assistant",
-        model,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: usage.input_tokens, output_tokens: 0 },
-      },
-    },
-  };
-  yield {
-    event: "content_block_start",
-    data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-  };
-  yield {
-    event: "content_block_delta",
-    data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
-  };
-  yield { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } };
-  yield {
-    event: "message_delta",
-    data: {
-      type: "message_delta",
-      delta: { stop_reason: "end_turn", stop_sequence: null },
-      usage: { output_tokens: usage.output_tokens },
-    },
-  };
-  yield { event: "message_stop", data: { type: "message_stop" } };
 }

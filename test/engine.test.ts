@@ -1,359 +1,265 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SessionCache } from "../src/core/sessionCache.js";
-
-const { queryMock } = vi.hoisted(() => ({ queryMock: vi.fn() }));
-vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: queryMock }));
-
+import { describe, expect, it, vi } from "vitest";
 import { YagamiEngine } from "../src/core/engine.js";
+import { SessionCache } from "../src/core/sessionCache.js";
+import { ApiError } from "../src/core/types.js";
+import { collect, FakeProvider, FULL_CAPS, reply } from "./helpers/fakeProvider.js";
 
-/** A fake `claude` binary path: any real file satisfies the resolver. */
-const FAKE_CLAUDE = process.execPath;
-
-interface RunOptions {
-  sessionId?: string;
-  text?: string;
-  deltas?: string[];
-  model?: string;
+function makeEngine(providers: FakeProvider[], defaultProvider = providers[0]!.id) {
+  return new YagamiEngine({ providers, defaultProvider, sessionCache: new SessionCache() });
 }
 
-/** One successful non-streaming SDK run. */
-async function* sdkComplete({ sessionId = "sess-1", text = "hello", model = "claude-x" }: RunOptions = {}) {
-  yield { type: "system", subtype: "init", session_id: sessionId };
-  yield {
-    type: "assistant",
-    parent_tool_use_id: null,
-    message: {
-      id: "msg_raw",
-      model,
-      content: [{ type: "text", text }],
-      stop_reason: "end_turn",
-    },
-  };
-  yield {
-    type: "result",
-    subtype: "success",
-    session_id: sessionId,
-    result: text,
-    usage: { input_tokens: 3, output_tokens: 5 },
-    total_cost_usd: 0.01,
-  };
-}
+const USER = (content: string) => ({ role: "user" as const, content });
+const ASSISTANT = (content: string) => ({ role: "assistant" as const, content });
 
-/** One successful streaming SDK run emitting partial-message events. */
-async function* sdkStream({ sessionId = "sess-1", deltas = ["hel", "lo"], model = "claude-x" }: RunOptions = {}) {
-  yield { type: "system", subtype: "init", session_id: sessionId };
-  const ev = (event: Record<string, unknown>) => ({
-    type: "stream_event",
-    parent_tool_use_id: null,
-    event,
+describe("routing", () => {
+  it("sends bare model ids to the default provider", async () => {
+    const claude = new FakeProvider("claude");
+    const codex = new FakeProvider("codex");
+    const engine = makeEngine([claude, codex]);
+    const { response } = await engine.complete({ model: "sonnet", messages: [USER("ping")] });
+    expect(claude.calls[0]!.model).toBe("sonnet");
+    expect(codex.calls).toHaveLength(0);
+    expect(response.model).toBe("sonnet");
   });
-  yield ev({ type: "message_start", message: { id: "msg_raw", model } });
-  yield ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-  for (const text of deltas) {
-    yield ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
-  }
-  yield ev({ type: "content_block_stop", index: 0 });
-  yield ev({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } });
-  yield ev({ type: "message_stop" });
-  yield {
-    type: "result",
-    subtype: "success",
-    session_id: sessionId,
-    result: deltas.join(""),
-    usage: { input_tokens: 3, output_tokens: 5 },
-    total_cost_usd: 0.01,
-  };
-}
 
-function makeEngine(): YagamiEngine {
-  return new YagamiEngine({
-    claudePath: FAKE_CLAUDE,
-    defaultModel: "claude-x",
-    sessionCache: new SessionCache(),
+  it("routes provider:model to that provider and reports the qualified id", async () => {
+    const claude = new FakeProvider("claude");
+    const codex = new FakeProvider("codex");
+    const engine = makeEngine([claude, codex]);
+    const result = await engine.complete({ model: "codex:gpt-5", messages: [USER("ping")] });
+    expect(codex.calls[0]!.model).toBe("gpt-5");
+    expect(result.provider).toBe("codex");
+    expect(result.response.model).toBe("codex:gpt-5");
   });
-}
 
-async function collect<T>(gen: AsyncGenerator<T>): Promise<T[]> {
-  const out: T[] = [];
-  for await (const item of gen) out.push(item);
-  return out;
-}
+  it("treats a bare provider id as that provider's default model", async () => {
+    const claude = new FakeProvider("claude");
+    const codex = new FakeProvider("codex");
+    const engine = makeEngine([claude, codex]);
+    const { response } = await engine.complete({ model: "codex", messages: [USER("ping")] });
+    expect(codex.calls[0]!.model).toBeUndefined();
+    expect(response.model).toBe("codex");
+  });
 
-beforeEach(() => {
-  queryMock.mockReset();
+  it("leaves colons alone when the prefix is not a provider", async () => {
+    const claude = new FakeProvider("claude");
+    const engine = makeEngine([claude]);
+    await engine.complete({ model: "ollama/llama3:8b", messages: [USER("ping")] });
+    expect(claude.calls[0]!.model).toBe("ollama/llama3:8b");
+  });
+
+  it("uses defaultModel (possibly qualified) when the request omits model", async () => {
+    const claude = new FakeProvider("claude");
+    const codex = new FakeProvider("codex");
+    const engine = new YagamiEngine({ providers: [claude, codex], defaultModel: "codex:gpt-5", sessionCache: new SessionCache() });
+    await engine.complete({ messages: [USER("ping")] });
+    expect(codex.calls[0]!.model).toBe("gpt-5");
+  });
+
+  it("prefers the provider's model id in the response when it reports one", async () => {
+    const claude = new FakeProvider("claude", FULL_CAPS, () => reply("hi", { model: "claude-sonnet-5" }));
+    const engine = makeEngine([claude]);
+    const { response } = await engine.complete({ model: "sonnet", messages: [USER("ping")] });
+    expect(response.model).toBe("claude-sonnet-5");
+  });
+
+  it("throws when no default provider is available", () => {
+    expect(() => new YagamiEngine({ providers: [], sessionCache: new SessionCache() })).toThrowError(/no supported/);
+    expect(() => makeEngine([new FakeProvider("claude")], "codex")).toThrowError(/codex/);
+  });
 });
 
-describe("YagamiEngine.complete", () => {
-  it("sends the last user text as the prompt for single-turn requests", async () => {
-    queryMock.mockImplementation(() => sdkComplete());
-    const engine = makeEngine();
-    const { response, costUsd, sessionId } = await engine.complete({
-      model: "claude-x",
-      messages: [{ role: "user", content: "ping" }],
-    });
-    expect(queryMock).toHaveBeenCalledOnce();
-    expect(queryMock.mock.calls[0]![0].prompt).toBe("ping");
-    expect(response.content).toEqual([{ type: "text", text: "hello" }]);
-    expect(costUsd).toBe(0.01);
-    expect(sessionId).toBe("sess-1");
+describe("capabilities", () => {
+  const LIMITED = { ...FULL_CAPS, systemPrompt: false, thinking: false, effort: false, images: false, documents: false, fork: false };
+
+  it("emulates system prompts by prepending them for providers without native support", async () => {
+    const p = new FakeProvider("codex", LIMITED);
+    const engine = makeEngine([p]);
+    await engine.complete({ system: "Be terse.", messages: [USER("ping")] });
+    expect(p.calls[0]!.system).toBeUndefined();
+    expect(p.calls[0]!.prompt).toBe("<system>\nBe terse.\n</system>\n\nping");
   });
 
-  it("resumes a cached session for a known conversation prefix", async () => {
-    queryMock.mockImplementation(() => sdkComplete({ text: "first reply" }));
-    const engine = makeEngine();
-    await engine.complete({ model: "claude-x", messages: [{ role: "user", content: "one" }] });
+  it("passes system prompts natively when supported", async () => {
+    const p = new FakeProvider("claude");
+    const engine = makeEngine([p]);
+    await engine.complete({ system: "Be terse.", messages: [USER("ping")] });
+    expect(p.calls[0]!.system).toBe("Be terse.");
+    expect(p.calls[0]!.prompt).toBe("ping");
+  });
 
-    queryMock.mockImplementation(() => sdkComplete({ text: "second reply", sessionId: "sess-2" }));
-    await engine.complete({
-      model: "claude-x",
-      messages: [
-        { role: "user", content: "one" },
-        { role: "assistant", content: "first reply" },
-        { role: "user", content: "two" },
-      ],
+  it("reports unsupported thinking/effort as ignored instead of failing", async () => {
+    const p = new FakeProvider("codex", LIMITED);
+    const engine = makeEngine([p]);
+    const { ignored } = await engine.complete({
+      messages: [USER("ping")],
+      thinking: { type: "enabled" },
+      effort: "high",
+      max_tokens: 5,
     });
-    const second = queryMock.mock.calls[1]![0];
-    expect(second.prompt).toBe("two");
-    expect(second.options.resume).toBe("sess-1");
-    expect(second.options.forkSession).toBe(true);
+    expect(ignored.sort()).toEqual(["effort", "max_tokens", "thinking"]);
+    expect(p.calls[0]!.thinking).toBeUndefined();
+  });
+
+  it("still validates thinking/effort values for every provider", async () => {
+    const p = new FakeProvider("codex", LIMITED);
+    const engine = makeEngine([p]);
+    await expect(engine.complete({ messages: [USER("x")], effort: "extreme" })).rejects.toThrowError(/effort/);
+    await expect(engine.complete({ messages: [USER("x")], thinking: { type: "maybe" } })).rejects.toThrowError(/thinking/);
+  });
+
+  it("rejects media the provider cannot take", async () => {
+    const p = new FakeProvider("codex", LIMITED);
+    const engine = makeEngine([p]);
+    await expect(
+      engine.complete({
+        messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", data: "x" } }] }],
+      }),
+    ).rejects.toThrowError(/image blocks/);
+  });
+
+  it("consumes the session mapping when the provider cannot fork", async () => {
+    const p = new FakeProvider("codex", LIMITED, () => reply("first", { sessionId: "t-1" }));
+    const engine = makeEngine([p]);
+    await engine.complete({ messages: [USER("one")] });
+    const followUp = { messages: [USER("one"), ASSISTANT("first"), USER("two")] };
+    p.script = () => reply("second", { sessionId: "t-1" });
+    await engine.complete(followUp);
+    expect(p.calls[1]!.resume).toBe("t-1");
+    // A sibling branch from the same prefix must not reuse the spent session.
+    await engine.complete({ messages: [USER("one"), ASSISTANT("first"), USER("other")] });
+    expect(p.calls[2]!.resume).toBeUndefined();
+    expect(p.calls[2]!.prompt).toContain("<conversation-history>");
+  });
+
+  it("skips resume entirely for providers without it", async () => {
+    const p = new FakeProvider("gemini", { ...LIMITED, resume: false });
+    const engine = makeEngine([p]);
+    await engine.complete({ messages: [USER("one")] });
+    await engine.complete({ messages: [USER("one"), ASSISTANT("hello"), USER("two")] });
+    expect(p.calls[1]!.resume).toBeUndefined();
+    expect(p.calls[1]!.prompt).toContain("User: one");
+  });
+});
+
+describe("multi-turn", () => {
+  it("resumes a cached session for a known conversation prefix", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply("first reply"));
+    const engine = makeEngine([p]);
+    await engine.complete({ messages: [USER("one")] });
+    p.script = () => reply("second", { sessionId: "sess-2" });
+    await engine.complete({ messages: [USER("one"), ASSISTANT("first reply"), USER("two")] });
+    expect(p.calls[1]!.prompt).toBe("two");
+    expect(p.calls[1]!.resume).toBe("sess-1");
   });
 
   it("flattens unknown history into a single prompt", async () => {
-    queryMock.mockImplementation(() => sdkComplete());
-    const engine = makeEngine();
-    await engine.complete({
-      model: "claude-x",
-      messages: [
-        { role: "user", content: "one" },
-        { role: "assistant", content: "never seen" },
-        { role: "user", content: "two" },
-      ],
-    });
-    const { prompt, options } = queryMock.mock.calls[0]![0];
-    expect(options.resume).toBeUndefined();
-    expect(prompt).toContain("<conversation-history>");
-    expect(prompt).toContain("Assistant: never seen");
+    const p = new FakeProvider("claude");
+    const engine = makeEngine([p]);
+    await engine.complete({ messages: [USER("one"), ASSISTANT("never seen"), USER("two")] });
+    expect(p.calls[0]!.resume).toBeUndefined();
+    expect(p.calls[0]!.prompt).toContain("Assistant: never seen");
+  });
+
+  it("retries without resume when the session is gone and drops the mapping", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply("first reply"));
+    const engine = makeEngine([p]);
+    await engine.complete({ messages: [USER("one")] });
+    p.script = (req) => (req.resume ? new Error("No conversation found with session ID sess-1") : reply("recovered", { sessionId: "sess-2" }));
+    const followUp = { messages: [USER("one"), ASSISTANT("first reply"), USER("two")] };
+    const { response } = await engine.complete(followUp);
+    expect(response.content).toEqual([{ type: "text", text: "recovered" }]);
+    expect(p.calls).toHaveLength(3);
+    expect(p.calls[1]!.resume).toBe("sess-1");
+    expect(p.calls[2]!.resume).toBeUndefined();
+    expect(p.calls[2]!.prompt).toContain("<conversation-history>");
+
+    p.calls.length = 0;
+    await engine.complete(followUp);
+    expect(p.calls).toHaveLength(1);
+    expect(p.calls[0]!.resume).toBeUndefined();
+  });
+
+  it("does not retry when no resume was involved", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => new Error("boom"));
+    const engine = makeEngine([p]);
+    await expect(engine.complete({ messages: [USER("hi")] })).rejects.toThrowError(/boom/);
+    expect(p.calls).toHaveLength(1);
+  });
+
+  it("surfaces engine failures as ApiError", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => new Error("boom"));
+    const engine = makeEngine([p]);
+    await expect(engine.complete({ messages: [USER("hi")] })).rejects.toBeInstanceOf(ApiError);
   });
 });
 
-describe("YagamiEngine.complete with prefill", () => {
-  const PREFILL_REQ = {
-    model: "claude-x",
-    messages: [
-      { role: "user" as const, content: "answer?" },
-      { role: "assistant" as const, content: "The answer is" },
-    ],
-  };
+describe("prefill", () => {
+  const PREFILL_REQ = { messages: [USER("answer?"), ASSISTANT("The answer is")] };
 
-  it("appends the continuation directive to the prompt", async () => {
-    queryMock.mockImplementation(() => sdkComplete({ text: " 42." }));
-    const engine = makeEngine();
-    await engine.complete(PREFILL_REQ);
-    const { prompt } = queryMock.mock.calls[0]![0];
-    expect(prompt).toContain("answer?");
-    expect(prompt).toContain("<assistant-prefill>\nThe answer is\n</assistant-prefill>");
-  });
-
-  it("strips a repeated prefill from the response content", async () => {
-    queryMock.mockImplementation(() => sdkComplete({ text: "The answer is 42." }));
-    const engine = makeEngine();
+  it("appends the continuation directive and strips a repeated prefill", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply("The answer is 42."));
+    const engine = makeEngine([p]);
     const { response } = await engine.complete(PREFILL_REQ);
+    expect(p.calls[0]!.prompt).toContain("<assistant-prefill>\nThe answer is\n</assistant-prefill>");
     expect(response.content).toEqual([{ type: "text", text: " 42." }]);
   });
 
   it("stores the session under prefill + continuation so follow-ups resume", async () => {
-    queryMock.mockImplementation(() => sdkComplete({ text: " 42." }));
-    const engine = makeEngine();
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply(" 42."));
+    const engine = makeEngine([p]);
     await engine.complete(PREFILL_REQ);
-
-    queryMock.mockImplementation(() => sdkComplete({ text: "done", sessionId: "sess-2" }));
-    await engine.complete({
-      model: "claude-x",
-      messages: [
-        { role: "user", content: "answer?" },
-        { role: "assistant", content: "The answer is 42." },
-        { role: "user", content: "thanks" },
-      ],
-    });
-    expect(queryMock.mock.calls[1]![0].options.resume).toBe("sess-1");
+    await engine.complete({ messages: [USER("answer?"), ASSISTANT("The answer is 42."), USER("thanks")] });
+    expect(p.calls[1]!.resume).toBe("sess-1");
   });
 });
 
-describe("YagamiEngine.listModels", () => {
-  it("probes the CLI once and caches the result", async () => {
-    queryMock.mockImplementation(() => ({
-      supportedModels: async () => [
-        { value: "sonnet", displayName: "Sonnet", description: "fast", resolvedModel: "claude-sonnet-5" },
-      ],
-    }));
-    const engine = makeEngine();
-    const models = await engine.listModels();
-    expect(models).toEqual([
-      { id: "sonnet", display_name: "Sonnet", description: "fast", resolved_model: "claude-sonnet-5" },
-    ]);
-    await engine.listModels();
-    expect(queryMock).toHaveBeenCalledOnce();
-  });
-
-  it("does not cache a failed probe", async () => {
-    queryMock.mockImplementation(() => ({
-      supportedModels: async () => {
-        throw new Error("engine down");
-      },
-    }));
-    const engine = makeEngine();
-    await expect(engine.listModels()).rejects.toThrowError(/engine down/);
-    await expect(engine.listModels()).rejects.toThrowError(/engine down/);
-    expect(queryMock).toHaveBeenCalledTimes(2);
-  });
-});
-
-describe("YagamiEngine resume fallback", () => {
-  const FOLLOW_UP = {
-    model: "claude-x",
-    messages: [
-      { role: "user" as const, content: "one" },
-      { role: "assistant" as const, content: "first reply" },
-      { role: "user" as const, content: "two" },
-    ],
-  };
-
-  /** Seed the cache so FOLLOW_UP's prefix maps to sess-1, then make any
-   *  resumed attempt die the way a garbage-collected session does. */
-  async function seedThenBreakResume(engine: YagamiEngine, text = "ok") {
-    queryMock.mockImplementation(() => sdkComplete({ text: "first reply" }));
-    await engine.complete({ model: "claude-x", messages: [{ role: "user", content: "one" }] });
-    queryMock.mockImplementation(({ options }: { options: { resume?: string } }) => {
-      if (options.resume) throw new Error("No conversation found with session ID sess-1");
-      return sdkComplete({ text, sessionId: "sess-2" });
-    });
-  }
-
-  it("retries complete() without resume when the session is gone", async () => {
-    const engine = makeEngine();
-    await seedThenBreakResume(engine, "recovered");
-    const { response } = await engine.complete(FOLLOW_UP);
-    expect(response.content).toEqual([{ type: "text", text: "recovered" }]);
-    const attempts = queryMock.mock.calls.slice(1);
-    expect(attempts).toHaveLength(2);
-    expect(attempts[0]![0].options.resume).toBe("sess-1");
-    expect(attempts[1]![0].options.resume).toBeUndefined();
-    expect(attempts[1]![0].prompt).toContain("<conversation-history>");
-  });
-
-  it("drops the stale cache entry so the next request replays directly", async () => {
-    const engine = makeEngine();
-    await seedThenBreakResume(engine);
-    await engine.complete(FOLLOW_UP);
-    queryMock.mockClear();
-    queryMock.mockImplementation(() => sdkComplete({ text: "again", sessionId: "sess-3" }));
-    await engine.complete(FOLLOW_UP);
-    expect(queryMock).toHaveBeenCalledOnce();
-    expect(queryMock.mock.calls[0]![0].options.resume).toBeUndefined();
-  });
-
-  it("does not retry when no resume was involved", async () => {
-    queryMock.mockImplementation(async function* () {
-      throw new Error("boom");
-    });
-    const engine = makeEngine();
-    await expect(
-      engine.complete({ model: "claude-x", messages: [{ role: "user", content: "hi" }] }),
-    ).rejects.toThrowError(/boom/);
-    expect(queryMock).toHaveBeenCalledOnce();
-  });
-
-  it("recovers a stream that dies before emitting events", async () => {
-    const engine = makeEngine();
-    queryMock.mockImplementation(() => sdkComplete({ text: "first reply" }));
-    await engine.complete({ model: "claude-x", messages: [{ role: "user", content: "one" }] });
-
-    queryMock.mockImplementation(({ options }: { options: { resume?: string } }) => {
-      if (options.resume) throw new Error("No conversation found with session ID sess-1");
-      return sdkStream({ deltas: ["recovered"], sessionId: "sess-2" });
-    });
-    const { events } = engine.stream({ ...FOLLOW_UP, stream: true });
-    const all = await collect(events);
-    expect(all.some((e) => e.event === "error")).toBe(false);
-    const texts = all
-      .filter((e) => e.event === "content_block_delta")
-      .map((e) => (e.data as { delta: { text: string } }).delta.text);
-    expect(texts.join("")).toBe("recovered");
-  });
-});
-
-describe("YagamiEngine.complete with media blocks", () => {
+describe("media", () => {
   const IMAGE = { type: "image", source: { type: "base64", media_type: "image/png", data: "aaa" } };
 
-  it("sends media via streaming input with the text appended last", async () => {
-    queryMock.mockImplementation(() => sdkComplete());
-    const engine = makeEngine();
-    await engine.complete({
-      model: "claude-x",
-      messages: [{ role: "user", content: [IMAGE, { type: "text", text: "what is this?" }] }],
-    });
-    const { prompt } = queryMock.mock.calls[0]![0];
-    expect(typeof prompt).not.toBe("string");
-    const yielded = [];
-    for await (const m of prompt) yielded.push(m);
-    expect(yielded).toHaveLength(1);
-    expect(yielded[0].message).toEqual({
-      role: "user",
-      content: [IMAGE, { type: "text", text: "what is this?" }],
-    });
-    expect(yielded[0].parent_tool_use_id).toBeNull();
+  it("hands the last message's media to the provider", async () => {
+    const p = new FakeProvider("claude");
+    const engine = makeEngine([p]);
+    await engine.complete({ messages: [{ role: "user", content: [IMAGE, { type: "text", text: "what?" }] }] });
+    expect(p.calls[0]!.media).toEqual([IMAGE]);
+    expect(p.calls[0]!.prompt).toBe("what?");
   });
 
   it("rejects unmatched history containing media blocks", async () => {
-    queryMock.mockImplementation(() => sdkComplete());
-    const engine = makeEngine();
+    const p = new FakeProvider("claude");
+    const engine = makeEngine([p]);
     await expect(
       engine.complete({
-        model: "claude-x",
-        messages: [
-          { role: "user", content: [IMAGE, { type: "text", text: "look" }] },
-          { role: "assistant", content: "nice pic" },
-          { role: "user", content: "and now?" },
-        ],
+        messages: [{ role: "user", content: [IMAGE, { type: "text", text: "look" }] }, ASSISTANT("nice"), USER("and now?")],
       }),
     ).rejects.toThrowError(/image\/document blocks/);
   });
+});
 
-  it("resumes past media history when the session is cached", async () => {
-    queryMock.mockImplementation(() => sdkComplete({ text: "nice pic" }));
-    const engine = makeEngine();
-    await engine.complete({
-      model: "claude-x",
-      messages: [{ role: "user", content: [IMAGE, { type: "text", text: "look" }] }],
-    });
-
-    queryMock.mockImplementation(() => sdkComplete({ text: "sure", sessionId: "sess-2" }));
-    await engine.complete({
-      model: "claude-x",
-      messages: [
-        { role: "user", content: [IMAGE, { type: "text", text: "look" }] },
-        { role: "assistant", content: "nice pic" },
-        { role: "user", content: "and now?" },
-      ],
-    });
-    const second = queryMock.mock.calls[1]![0];
-    expect(second.options.resume).toBe("sess-1");
-    expect(second.prompt).toBe("and now?");
+describe("responses", () => {
+  it("includes a thinking block when the provider produced thoughts", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply("42", { thinking: "let me think" }));
+    const engine = makeEngine([p]);
+    const { response } = await engine.complete({ messages: [USER("?")] });
+    expect(response.content).toEqual([
+      { type: "thinking", thinking: "let me think", signature: "" },
+      { type: "text", text: "42" },
+    ]);
+    expect(response.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
   });
 });
 
-describe("YagamiEngine.stream", () => {
-  it("passes raw stream events through", async () => {
-    queryMock.mockImplementation(() => sdkStream());
-    const engine = makeEngine();
-    const { events } = engine.stream({
-      model: "claude-x",
-      messages: [{ role: "user", content: "ping" }],
-      stream: true,
-    });
+describe("streaming", () => {
+  it("synthesizes a complete Anthropic SSE sequence", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply("hello", { chunks: ["hel", "lo"], thinking: "hm" }));
+    const engine = makeEngine([p]);
+    const { events } = engine.stream({ messages: [USER("ping")], stream: true });
     const all = await collect(events);
     expect(all.map((e) => e.event)).toEqual([
       "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
       "content_block_start",
       "content_block_delta",
       "content_block_delta",
@@ -361,51 +267,67 @@ describe("YagamiEngine.stream", () => {
       "message_delta",
       "message_stop",
     ]);
+    const starts = all.filter((e) => e.event === "content_block_start").map((e) => (e.data as { content_block: { type: string } }).content_block.type);
+    expect(starts).toEqual(["thinking", "text"]);
   });
 
   it("rewrites deltas so a repeated prefill never reaches the client", async () => {
-    queryMock.mockImplementation(() => sdkStream({ deltas: ["The answer", " is", " 42."] }));
-    const engine = makeEngine();
-    const { events } = engine.stream({
-      model: "claude-x",
-      messages: [
-        { role: "user", content: "answer?" },
-        { role: "assistant", content: "The answer is" },
-      ],
-      stream: true,
-    });
-    const all = await collect(events);
-    const texts = all
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply("", { chunks: ["The answer", " is", " 42."] }));
+    const engine = makeEngine([p]);
+    const { events } = engine.stream({ messages: [USER("answer?"), ASSISTANT("The answer is")], stream: true });
+    const texts = (await collect(events))
       .filter((e) => e.event === "content_block_delta")
-      .map((e) => (e.data as { delta: { text: string } }).delta.text);
+      .map((e) => (e.data as { delta: { text?: string } }).delta.text ?? "");
     expect(texts.join("")).toBe(" 42.");
   });
 
-  it("reports cost and session via onResult when the stream completes", async () => {
-    queryMock.mockImplementation(() => sdkStream());
-    const engine = makeEngine();
+  it("reports cost and session via onResult", async () => {
+    const p = new FakeProvider("claude");
+    const engine = makeEngine([p]);
     const onResult = vi.fn();
-    const { events } = engine.stream(
-      { model: "claude-x", messages: [{ role: "user", content: "ping" }], stream: true },
-      { onResult },
-    );
-    await collect(events);
-    expect(onResult).toHaveBeenCalledOnce();
+    await collect(engine.stream({ messages: [USER("ping")], stream: true }, { onResult }).events);
     expect(onResult).toHaveBeenCalledWith({ costUsd: 0.01, sessionId: "sess-1" });
   });
 
-  it("emits an error event when the engine fails mid-stream", async () => {
-    queryMock.mockImplementation(async function* () {
-      yield { type: "system", subtype: "init", session_id: "sess-1" };
-      throw new Error("boom");
-    });
-    const engine = makeEngine();
-    const { events } = engine.stream({
-      model: "claude-x",
-      messages: [{ role: "user", content: "ping" }],
-      stream: true,
-    });
-    const all = await collect(events);
+  it("emits an error event when the provider fails", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => new Error("boom"));
+    const engine = makeEngine([p]);
+    const all = await collect(engine.stream({ messages: [USER("ping")], stream: true }).events);
     expect(all[all.length - 1]!.event).toBe("error");
+  });
+
+  it("recovers a resumed stream that dies before emitting text", async () => {
+    const p = new FakeProvider("claude", FULL_CAPS, () => reply("first reply"));
+    const engine = makeEngine([p]);
+    await engine.complete({ messages: [USER("one")] });
+    p.script = (req) => (req.resume ? new Error("No conversation found") : reply("recovered", { sessionId: "sess-2" }));
+    const all = await collect(
+      engine.stream({ messages: [USER("one"), ASSISTANT("first reply"), USER("two")], stream: true }).events,
+    );
+    expect(all.some((e) => e.event === "error")).toBe(false);
+    const texts = all.filter((e) => e.event === "content_block_delta").map((e) => (e.data as { delta: { text: string } }).delta.text);
+    expect(texts.join("")).toBe("recovered");
+  });
+});
+
+describe("listModels", () => {
+  it("aggregates providers, listing the default bare and qualified", async () => {
+    const claude = new FakeProvider("claude");
+    const codex = new FakeProvider("codex");
+    codex.models = [{ id: "gpt-5", display_name: "GPT-5" }];
+    const engine = makeEngine([claude, codex]);
+    const ids = (await engine.listModels()).map((m) => m.id);
+    expect(ids).toEqual(["fake-1", "claude:fake-1", "codex:gpt-5"]);
+  });
+
+  it("skips providers whose probe fails and retries them next time", async () => {
+    const claude = new FakeProvider("claude");
+    const codex = new FakeProvider("codex");
+    codex.modelsError = new Error("down");
+    const engine = makeEngine([claude, codex]);
+    expect((await engine.listModels()).map((m) => m.id)).toEqual(["fake-1", "claude:fake-1"]);
+    codex.modelsError = undefined;
+    codex.models = [{ id: "gpt-5", display_name: "GPT-5" }];
+    expect((await engine.listModels()).map((m) => m.id)).toContain("codex:gpt-5");
   });
 });
