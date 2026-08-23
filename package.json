@@ -1,6 +1,6 @@
 {
-  "name": "yagami",
-  "version": "0.4.0",
+  "name": "@justin06lee/yagami",
+  "version": "0.4.1",
   "description": "Self-hosted Anthropic-compatible API backed by your signed-in Claude Code CLI, plus an embeddable library for driving Claude Code sessions from your own apps.",
   "type": "module",
   "license": "MIT",
@@ -31,7 +31,9 @@
     "test": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
     "live:providers": "tsx scripts/live-providers.ts",
-    "live:session": "tsx scripts/live-session.ts"
+    "live:session": "tsx scripts/live-session.ts",
+    "prepack": "bun run build",
+    "prepublishOnly": "bun run typecheck && bun run test"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.3.0",
@@ -46,5 +48,31 @@
     "tsx": "^4.19.0",
     "typescript": "^5.8.0",
     "vitest": "^3.1.0"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justin06lee/yagami.git"
+  },
+  "homepage": "https://github.com/justin06lee/yagami#readme",
+  "bugs": {
+    "url": "https://github.com/justin06lee/yagami/issues"
+  },
+  "keywords": [
+    "anthropic",
+    "claude",
+    "claude-code",
+    "codex",
+    "opencode",
+    "acp",
+    "agent-client-protocol",
+    "llm",
+    "api",
+    "proxy",
+    "self-hosted",
+    "messages-api",
+    "coding-agent"
+  ]
 }

@@ -24,8 +24,15 @@ yagami start  # first run generates + saves an API key and prints it
 
 `make update` stops any running yagami server, rebuilds, reinstalls, and restarts it.
 
+Or install the published package from npm:
+
+```sh
+bun add -g @justin06lee/yagami   # global `yagami` CLI
+bun add @justin06lee/yagami      # or as a library (see Library mode)
 ```
-yagami v0.4.0
+
+```
+yagami v0.4.1
   listening   http://127.0.0.1:8787
   provider    claude — /Users/you/.local/bin/claude (2.1.238 (Claude Code))
   also        codex, opencode (use model "<provider>:<model>")
@@ -119,7 +126,7 @@ Env overrides: `YAGAMI_HOST`, `YAGAMI_PORT`, `YAGAMI_API_KEY`, `YAGAMI_PROVIDER`
 For apps that want the engine in-process with no HTTP hop (e.g. a desktop app):
 
 ```ts
-import { YagamiEngine, claudeCodeSession, ClaudeProvider, CodexProvider, AcpProvider } from "yagami";
+import { YagamiEngine, claudeCodeSession, ClaudeProvider, CodexProvider, AcpProvider } from "@justin06lee/yagami";
 
 // 1. Anthropic-shaped completions across every installed harness:
 const engine = new YagamiEngine({ defaultModel: "sonnet" });
@@ -150,7 +157,7 @@ Every provider implements one small `Provider` contract (`run(turn)` → normali
 `YagamiEngine` is completions-only by design. To build an actual coding UI — tools, permissions, plan mode, a warm session across turns — use `AgentSession`, which wraps the full Claude Code agent with the lifecycle the interactive terminal gives you for free:
 
 ```ts
-import { AgentSession } from "yagami";
+import { AgentSession } from "@justin06lee/yagami";
 
 const session = new AgentSession({
   cwd: "/path/to/project",
@@ -179,7 +186,7 @@ This resolves the parts of embedding Claude Code that every host would otherwise
 
 For a lower-level handle, `claudeCodeSession(prompt, { options })` returns the raw Agent SDK `Query`.
 
-The server is also embeddable: `import { startYagami } from "yagami/server"`.
+The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
 
 ## How it works
 
