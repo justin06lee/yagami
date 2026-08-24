@@ -1,7 +1,7 @@
 {
   "name": "@justin06lee/yagami",
-  "version": "0.4.1",
-  "description": "Self-hosted Anthropic-compatible API backed by your signed-in Claude Code CLI, plus an embeddable library for driving Claude Code sessions from your own apps.",
+  "version": "0.5.0",
+  "description": "Self-hosted Anthropic- and OpenAI-compatible API backed by your signed-in coding-agent CLIs, plus a zero-config library for driving them from your own apps — no API keys needed.",
   "type": "module",
   "license": "MIT",
   "author": "justin06lee",
