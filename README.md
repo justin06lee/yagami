@@ -4,54 +4,62 @@
 
 # yagami
 
-**Your signed-in coding-agent CLIs as one self-hosted Anthropic-compatible API.**<br>
-*Claude Code, Codex, OpenCode, Gemini CLI and any ACP agent — point any Anthropic client at your own subscriptions, or embed the engine as a library.*
+**Your signed-in coding-agent CLIs as one self-hosted Anthropic- and OpenAI-compatible API.**<br>
+*Claude Code, Codex, OpenCode, Gemini CLI and any ACP agent — point any Anthropic or OpenAI client at your own subscriptions, or embed the engine as a library with zero config.*
 
 </div>
 
 ---
 
-yagami does the T3-Code trick, generalized: it drives the coding-agent CLIs you already installed and logged into — Claude Code through the Agent SDK (`pathToClaudeCodeExecutable`), Codex through `codex exec`, and OpenCode, Gemini CLI, Copilot, Cursor, Qwen Code, Kimi, Goose and the rest of the [ACP registry](https://agentclientprotocol.com) through the Agent Client Protocol. No API keys from any vendor, no separate auth — each spawned engine uses the same login your terminal sessions do. On top it serves `POST /v1/messages` with Anthropic request/response shapes and SSE streaming, so anything that accepts an Anthropic `baseURL` + `apiKey` can use it as a drop-in, and pick a harness per request with `model: "<provider>:<model>"`.
+yagami does the T3-Code trick, generalized: it drives the coding-agent CLIs you already installed and logged into — Claude Code through the Agent SDK (`pathToClaudeCodeExecutable`), Codex through `codex exec`, and OpenCode, Gemini CLI, Copilot, Cursor, Qwen Code, Kimi, Goose and the rest of the [ACP registry](https://agentclientprotocol.com) through the Agent Client Protocol. No API keys from any vendor, no separate auth — each spawned engine uses the same login your terminal sessions do.
+
+There are two doors in, and they're deliberately different:
+
+| | Who it's for | What you get |
+|---|---|---|
+| **Server** — the `yagami` binary | A machine that should hand out an API key (a home server, a box your other apps talk to) | `yagami start` prints a **URL + API key** that works with any app that accepts an Anthropic *or* OpenAI base URL + key |
+| **Library** — `@justin06lee/yagami` | An app running *on* the machine with the signed-in CLIs | `new Yagami()` — **no URL, no API key, nothing to configure**. It finds the CLIs itself and syncs with the binary's config |
 
 > **Personal use only.** This exists so *you* can point *your own tools* at *your own subscriptions*. Offering subscription-backed access to other people is against every one of these vendors' terms. Keep the endpoint private and don't share keys.
 
-## Install
+## Server mode
 
 ```sh
 make          # bun install + build + install `yagami` onto your PATH (~/.local/bin)
 yagami start  # first run generates + saves an API key and prints it
 ```
 
-`make update` stops any running yagami server, rebuilds, reinstalls, and restarts it.
-
-Or install the published package from npm:
-
-```sh
-bun add -g @justin06lee/yagami   # global `yagami` CLI
-bun add @justin06lee/yagami      # or as a library (see Library mode)
-```
+`make update` stops any running yagami server, rebuilds, reinstalls, and restarts it. Or install from npm: `bun add -g @justin06lee/yagami`.
 
 ```
-yagami v0.4.1
+yagami v0.5.0
   listening   http://127.0.0.1:8787
   provider    claude — /Users/you/.local/bin/claude (2.1.238 (Claude Code))
   also        codex, opencode (use model "<provider>:<model>")
   api key     ygm_…
+
+Connect apps — either dialect, same key (`yagami key` prints ready-to-paste env exports):
+  Anthropic apps   baseURL http://127.0.0.1:8787      (ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY)
+  OpenAI apps      baseURL http://127.0.0.1:8787/v1   (OPENAI_BASE_URL / OPENAI_API_KEY)
 ```
 
-Then from any Anthropic client:
+Apps can't be reached by a key alone — they need somewhere to route — so the pair is always **URL + key**. Most apps take them as a "base URL" field or the standard env vars; `yagami key` prints both ready to paste:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787   ANTHROPIC_API_KEY=ygm_...
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1   OPENAI_API_KEY=ygm_...
+```
+
+Anthropic-dialect apps speak to `POST /v1/messages`, OpenAI-dialect apps to `POST /v1/chat/completions` — same engine, same key, streaming included:
 
 ```ts
 import Anthropic from "@anthropic-ai/sdk";
+const anthropic = new Anthropic({ baseURL: "http://127.0.0.1:8787", apiKey: process.env.YAGAMI_KEY });
+await anthropic.messages.create({ model: "sonnet", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] });
 
-const client = new Anthropic({
-  baseURL: "http://127.0.0.1:8787",
-  apiKey: process.env.YAGAMI_KEY, // your ygm_ key
-});
-
-await client.messages.create({ model: "sonnet", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] });
-await client.messages.create({ model: "codex:gpt-5.6-sol", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] });
-await client.messages.create({ model: "opencode:anthropic/claude-sonnet-4", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] });
+import OpenAI from "openai";
+const openai = new OpenAI({ baseURL: "http://127.0.0.1:8787/v1", apiKey: process.env.YAGAMI_KEY });
+await openai.chat.completions.create({ model: "codex:gpt-5.6-sol", messages: [{ role: "user", content: "hello" }] });
 ```
 
 Or raw curl:
@@ -60,7 +68,83 @@ Or raw curl:
 curl http://127.0.0.1:8787/v1/messages \
   -H "x-api-key: ygm_..." -H "content-type: application/json" \
   -d '{"model":"codex","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'
+
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "authorization: Bearer ygm_..." -H "content-type: application/json" \
+  -d '{"model":"codex","messages":[{"role":"user","content":"ping"}]}'
 ```
+
+One caveat for OpenAI-dialect apps: the `model` field still routes through yagami's providers — set it to a model your CLIs actually serve (`sonnet`, `codex:gpt-5.6-sol`, `opencode:…`), not whatever `gpt-*` id the app defaults to.
+
+## Library mode
+
+For apps that run on the machine with the signed-in CLIs — a desktop app, a script, anything embedding the engine in-process. **No server, no URL, no API key**: `new Yagami()` auto-detects the CLIs and reads `~/.config/yagami/config.json` if the binary has one, so library and server stay in sync automatically.
+
+```ts
+import { Yagami } from "@justin06lee/yagami";
+
+const yagami = new Yagami(); // that's it — hooks straight into the host's CLIs
+
+// Anthropic SDK shape:
+const msg = await yagami.messages.create({ messages: [{ role: "user", content: "hello" }] });
+for await (const ev of yagami.messages.create({ messages: [...], stream: true })) { /* Anthropic stream events */ }
+
+// OpenAI SDK shape, same engine:
+const completion = await yagami.chat.completions.create({ messages: [{ role: "user", content: "hello" }] });
+for await (const chunk of yagami.chat.completions.create({ messages: [...], stream: true })) { /* chat chunks */ }
+
+// Models across every installed harness:
+const { data } = await yagami.models.list();
+```
+
+Options are for overrides only (`new Yagami({ defaultModel: "sonnet" })`, `{ defaultProvider: "codex" }`, `{ syncHostConfig: false }`, …); the zero-argument form is the intended use. For lower-level control the engine underneath is `yagami.engine` (a `YagamiEngine` — `complete()` returns cost/session/provider metadata, `stream()` returns raw SSE events), and you can hand-pick providers instead of auto-detecting:
+
+```ts
+import { YagamiEngine, ClaudeProvider, AcpProvider } from "@justin06lee/yagami";
+
+const engine = new YagamiEngine({
+  providers: [new ClaudeProvider(), new AcpProvider({ id: "gemini", label: "Gemini", command: "gemini", args: ["--acp"] })],
+});
+const { response, costUsd } = await engine.complete({ messages: [{ role: "user", content: "hello" }] });
+```
+
+Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `ProviderError`.
+
+### Building a UI on Claude Code
+
+`Yagami`/`YagamiEngine` are completions-only by design. To build an actual coding UI — tools, permissions, plan mode, a warm session across turns — use `AgentSession`, which wraps the full Claude Code agent with the lifecycle the interactive terminal gives you for free:
+
+```ts
+import { AgentSession } from "@justin06lee/yagami";
+
+const session = new AgentSession({
+  cwd: "/path/to/project",
+  parity: "terminal",          // load your CLAUDE.md, skills, hooks, .mcp.json — like the CLI
+  appName: "my-app",           // reported to Claude as the client
+  onPermission: async (req) => {
+    // Your approve/deny UI. Policy stays here; yagami owns the state machine.
+    const ok = await showDialog(req.toolName, req.input);
+    return ok ? { behavior: "allow" } : { behavior: "deny", message: "user declined" };
+  },
+});
+
+session.send("fix the failing test");     // process starts here and stays warm
+for await (const msg of session) {        // raw SDKMessages — render however you like
+  render(msg);
+  if (msg.type === "result") break;
+}
+session.send("now add a test for the edge case");   // next turn resumes the same session
+await session.interrupt();                // the CLI's Esc
+await session.setModel("opus");           // the CLI's /model
+await session.setPermissionMode("plan");  // shift+tab
+session.close();
+```
+
+This resolves the parts of embedding Claude Code that every host would otherwise reimplement identically — process lifecycle, session resume, interrupt, settings parity, and the permission state machine. What stays yours are the genuinely app-specific choices: rendering the `SDKMessage` stream, deciding what to auto-approve, and picking the working directory. `parity` is `"terminal"` (load user+project+local settings, matching your CLI), `"project"` (project+local only), or `"isolated"` (load nothing — reproducible, no personal config). The permission `fallback` defaults to `"deny"`, so a session is safe before the UI is wired up; `autoAllow`/`autoDeny` skip the handler for named tools.
+
+For a lower-level handle, `claudeCodeSession(prompt, { options })` returns the raw Agent SDK `Query`.
+
+The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
 
 ## Providers
 
@@ -97,6 +181,7 @@ Any other ACP agent works too — add it to config with its launch command:
 | `yagami start` | Start the server (`-p` port, `-H` host, `--provider <id>` default provider, `--claude <path>`, `--cors`). Add `--daemon` to run it in the background (`--log <file>` overrides the default log at `~/.config/yagami/yagami.log`) |
 | `yagami stop` | Stop the running server |
 | `yagami status` | Show whether it's running, plus uptime, request count, and cumulative would-be API cost |
+| `yagami key` | Print the URL + API key, plus ready-to-paste `ANTHROPIC_*`/`OPENAI_*` env exports for client apps |
 | `yagami models` | List models across every installed provider (`--provider <id>` to filter) |
 | `yagami keygen` | Generate another API key and save it to the config |
 | `yagami doctor` | Check every harness CLI; `--live` sends one tiny real completion (`--provider <id>` to pick which) |
@@ -119,80 +204,14 @@ Every request is logged as one line (time, status, model, duration, cost, sessio
 }
 ```
 
-Env overrides: `YAGAMI_HOST`, `YAGAMI_PORT`, `YAGAMI_API_KEY`, `YAGAMI_PROVIDER`, `YAGAMI_DEFAULT_MODEL`, `YAGAMI_CLAUDE_PATH`, `YAGAMI_CODEX_PATH`. The older `claudePath` / `claudeConfigDir` keys still work as shorthands for `providers.claude`.
-
-## Library mode
-
-For apps that want the engine in-process with no HTTP hop (e.g. a desktop app):
-
-```ts
-import { YagamiEngine, claudeCodeSession, ClaudeProvider, CodexProvider, AcpProvider } from "@justin06lee/yagami";
-
-// 1. Anthropic-shaped completions across every installed harness:
-const engine = new YagamiEngine({ defaultModel: "sonnet" });
-const { response } = await engine.complete({ messages: [{ role: "user", content: "hello" }] });
-const codex = await engine.complete({ model: "codex", messages: [{ role: "user", content: "hello" }] });
-
-// streaming (Anthropic SSE event objects):
-const { events } = engine.stream({ model: "opencode", messages: [...], stream: true });
-for await (const ev of events) { /* ev.event, ev.data */ }
-
-// hand-pick providers instead of auto-detecting:
-const custom = new YagamiEngine({
-  providers: [new ClaudeProvider(), new AcpProvider({ id: "gemini", label: "Gemini", command: "gemini", args: ["--acp"] })],
-});
-
-// 2. Full agentic Claude Code sessions — tools, permissions, the works.
-for await (const msg of claudeCodeSession("fix the failing test", {
-  options: { cwd: "/path/to/project", permissionMode: "acceptEdits" },
-})) {
-  // render SDK messages however you like
-}
-```
-
-Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `ProviderError`.
-
-### Building a UI on Claude Code
-
-`YagamiEngine` is completions-only by design. To build an actual coding UI — tools, permissions, plan mode, a warm session across turns — use `AgentSession`, which wraps the full Claude Code agent with the lifecycle the interactive terminal gives you for free:
-
-```ts
-import { AgentSession } from "@justin06lee/yagami";
-
-const session = new AgentSession({
-  cwd: "/path/to/project",
-  parity: "terminal",          // load your CLAUDE.md, skills, hooks, .mcp.json — like the CLI
-  appName: "my-app",           // reported to Claude as the client
-  onPermission: async (req) => {
-    // Your approve/deny UI. Policy stays here; yagami owns the state machine.
-    const ok = await showDialog(req.toolName, req.input);
-    return ok ? { behavior: "allow" } : { behavior: "deny", message: "user declined" };
-  },
-});
-
-session.send("fix the failing test");     // process starts here and stays warm
-for await (const msg of session) {        // raw SDKMessages — render however you like
-  render(msg);
-  if (msg.type === "result") break;
-}
-session.send("now add a test for the edge case");   // next turn resumes the same session
-await session.interrupt();                // the CLI's Esc
-await session.setModel("opus");           // the CLI's /model
-await session.setPermissionMode("plan");  // shift+tab
-session.close();
-```
-
-This resolves the parts of embedding Claude Code that every host would otherwise reimplement identically — process lifecycle, session resume, interrupt, settings parity, and the permission state machine. What stays yours are the genuinely app-specific choices: rendering the `SDKMessage` stream, deciding what to auto-approve, and picking the working directory. `parity` is `"terminal"` (load user+project+local settings, matching your CLI), `"project"` (project+local only), or `"isolated"` (load nothing — reproducible, no personal config). The permission `fallback` defaults to `"deny"`, so a session is safe before the UI is wired up; `autoAllow`/`autoDeny` skip the handler for named tools.
-
-For a lower-level handle, `claudeCodeSession(prompt, { options })` returns the raw Agent SDK `Query`.
-
-The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
+Env overrides: `YAGAMI_HOST`, `YAGAMI_PORT`, `YAGAMI_API_KEY`, `YAGAMI_PROVIDER`, `YAGAMI_DEFAULT_MODEL`, `YAGAMI_CLAUDE_PATH`, `YAGAMI_CODEX_PATH`. The older `claudePath` / `claudeConfigDir` keys still work as shorthands for `providers.claude`. Library mode reads the same file (minus the server-only fields — host, port, keys), which is what keeps an embedded `Yagami` and the binary in agreement.
 
 ## How it works
 
-- **Engine**: each `/v1/messages` request becomes one sandboxed turn on the chosen harness. Claude runs with `tools: []`, `settingSources: []` (your CLAUDE.md/skills never leak into API completions), `maxTurns: 1` and a deny-all permission callback; Codex runs in its read-only sandbox with no approvals; ACP agents are moved to a plan/read-only mode when they offer one and every permission request is refused. All of them work in a throwaway directory. The API is text-in/text-out; a leaked key can burn tokens but never edit anything on the host — though note that agents other than Claude keep their own read-only tools, so they can still *look* at that empty directory.
+- **Engine**: each request becomes one sandboxed turn on the chosen harness. Claude runs with `tools: []`, `settingSources: []` (your CLAUDE.md/skills never leak into API completions), `maxTurns: 1` and a deny-all permission callback; Codex runs in its read-only sandbox with no approvals; ACP agents are moved to a plan/read-only mode when they offer one and every permission request is refused. All of them work in a throwaway directory. The API is text-in/text-out; a leaked key can burn tokens but never edit anything on the host — though note that agents other than Claude keep their own read-only tools, so they can still *look* at that empty directory.
+- **Dialects**: `POST /v1/messages` is native. `POST /v1/chat/completions` translates OpenAI shapes at the edge — system/developer messages fold into `system`, `image_url` parts become image blocks, streams are re-emitted as `chat.completion.chunk` events ending in `[DONE]`, and thinking output rides along as `reasoning_content`. Errors on that path come back OpenAI-shaped too. `GET /v1/models` serves one merged shape both SDKs parse.
 - **Multi-turn**: the Messages API is stateless but harness sessions aren't. yagami hashes each conversation prefix (per provider) and remembers which session produced it; a follow-up request resumes that session and sends only the new user message. Unmatched histories fall back to replaying the transcript in a single prompt, and if a cached session turns out to be gone, the stale mapping is dropped and the request transparently retries via replay. The cache persists across restarts at `~/.config/yagami/sessions.json`.
-- **Streaming**: every harness's output is normalized into deltas and re-emitted as a proper Anthropic SSE sequence — `message_start` → thinking/text content blocks → `message_delta` → `message_stop`. Claude and ACP agents stream tokens; Codex streams per message part.
+- **Streaming**: every harness's output is normalized into deltas and re-emitted as a proper Anthropic SSE sequence — `message_start` → thinking/text content blocks → `message_delta` → `message_stop` (or the OpenAI chunk sequence on the chat-completions path). Claude and ACP agents stream tokens; Codex streams per message part.
 - **Models**: `GET /v1/models` asks each installed CLI what it supports (Claude via the SDK, Codex via its app-server protocol, ACP agents via their session config) — probed once per process, then cached. Failed probes are skipped and retried next time; a static fallback list is served only if nothing answers (`x-yagami-models-source` says which).
 - **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else.
 
@@ -200,11 +219,11 @@ Extra response headers: `x-yagami-provider`, `x-yagami-cost-usd` (what the turn 
 
 ## Limitations
 
-- No `tools` / `tool_choice` (rejected with 400 — by design, see above). `tool_use`/`tool_result` content blocks are rejected too.
+- No `tools` / `tool_choice` / function calling (rejected with 400 — by design, see above). `tool_use`/`tool_result` content blocks and OpenAI `tool`/`function` messages are rejected too.
 - User messages may contain `text`, `image`, and `document` blocks (documents: Claude only; images: base64 sources only outside Claude); `system` and assistant messages are text-only. Thinking blocks echoed back in assistant history are dropped, not rejected. A conversation whose *history* contains images/documents can only be continued while the server that produced it still has that session cached.
 - Assistant prefill (a trailing `assistant` message) is emulated: the engine is instructed to continue from the prefill text, and the response carries only the continuation, like the real API. An accidentally repeated prefill is stripped from the reply, including mid-stream.
-- `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` are accepted but ignored (reported via `x-yagami-ignored`) — none of the CLI engines expose them.
-- `thinking` and a yagami-extension `effort` ("low"…"max") are passed through where the harness supports them (see the provider table) and reported as ignored elsewhere.
+- `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` (and their OpenAI counterparts, plus `presence_penalty`, `seed`, `response_format`, …) are accepted but ignored (reported via `x-yagami-ignored`) — none of the CLI engines expose them. OpenAI `n` must be 1.
+- `thinking` and a yagami-extension `effort` ("low"…"max") are passed through where the harness supports them (see the provider table) and reported as ignored elsewhere. OpenAI `reasoning_effort` maps onto `effort`.
 - Cost is reported only by harnesses that price their own turns (Claude, OpenCode); Codex reports token usage without cost.
 
 ## Development

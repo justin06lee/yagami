@@ -6,6 +6,14 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError, type MessagesRequest } from "../core/types.js";
 import { toApiError } from "../core/errors.js";
 import type { CompleteResult, EngineModel, StreamOptions, StreamStart } from "../core/engine.js";
+import {
+  ChatChunkTranslator,
+  chatToMessagesRequest,
+  modelListBody,
+  openAiErrorBody,
+  toChatCompletion,
+  type ChatCompletionsRequest,
+} from "../core/openai.js";
 
 /** What the app needs from an engine — lets tests inject a fake. */
 export interface EngineLike {
@@ -46,6 +54,7 @@ function errorBody(type: ApiError["type"], message: string) {
 }
 
 function requestLine(
+  path: string,
   status: number,
   model: string,
   startedAt: number,
@@ -53,7 +62,7 @@ function requestLine(
 ): string {
   const parts = [
     new Date().toISOString(),
-    `POST /v1/messages ${status}`,
+    `POST ${path} ${status}`,
     `model=${model}`,
     `${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
   ];
@@ -94,11 +103,17 @@ export function createApp(options: AppOptions): Hono {
     const header = c.req.header("x-api-key") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
     const ok = header != null && apiKeys.some((key) => safeEqual(key, header));
     if (!ok) {
-      return c.json(errorBody("authentication_error", "invalid x-api-key"), 401);
+      const err = new ApiError(401, "authentication_error", "invalid API key (x-api-key or Authorization: Bearer)");
+      // The chat-completions path answers in the OpenAI error shape.
+      return c.req.path.startsWith("/v1/chat")
+        ? c.json(openAiErrorBody(err), 401)
+        : c.json(err.toBody(), 401);
     }
     await next();
   });
 
+  // Served in a merged shape: Anthropic fields + OpenAI fields per model, so
+  // both SDKs' models.list() parse it.
   app.get("/v1/models", async (c) => {
     let models = FALLBACK_MODELS;
     let source = "fallback";
@@ -112,12 +127,7 @@ export function createApp(options: AppOptions): Hono {
       // engine unavailable or slow — the static list keeps clients working
     }
     c.header("x-yagami-models-source", source);
-    return c.json({
-      data: models.map((m) => ({ type: "model", ...m })),
-      has_more: false,
-      first_id: models[0]?.id,
-      last_id: models[models.length - 1]?.id,
-    });
+    return c.json(modelListBody(models));
   });
 
   app.post("/v1/messages", async (c) => {
@@ -140,7 +150,7 @@ export function createApp(options: AppOptions): Hono {
           onResult: (info) => {
             if (info.costUsd !== undefined) stats.totalCostUsd += info.costUsd;
             log?.(
-              requestLine(200, model, startedAt, {
+              requestLine("/v1/messages", 200, model, startedAt, {
                 stream: true,
                 ...(info.costUsd !== undefined ? { cost: info.costUsd } : {}),
                 ...(info.sessionId ? { session: info.sessionId } : {}),
@@ -161,7 +171,7 @@ export function createApp(options: AppOptions): Hono {
       const result = await engine.complete(req);
       if (result.costUsd !== undefined) stats.totalCostUsd += result.costUsd;
       log?.(
-        requestLine(200, model, startedAt, {
+        requestLine("/v1/messages", 200, model, startedAt, {
           ...(result.costUsd !== undefined ? { cost: result.costUsd } : {}),
           ...(result.sessionId ? { session: result.sessionId } : {}),
         }),
@@ -173,8 +183,76 @@ export function createApp(options: AppOptions): Hono {
       return c.json(result.response);
     } catch (err) {
       const apiErr = toApiError(err);
-      log?.(requestLine(apiErr.status, model, startedAt, { error: apiErr.type }));
+      log?.(requestLine("/v1/messages", apiErr.status, model, startedAt, { error: apiErr.type }));
       return c.json(apiErr.toBody(), apiErr.status as ContentfulStatusCode);
+    }
+  });
+
+  // OpenAI dialect: the same engine behind Chat Completions shapes, so apps
+  // that expect an OpenAI base URL + API key work against the same key.
+  app.post("/v1/chat/completions", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json(openAiErrorBody(new ApiError(400, "invalid_request_error", "request body must be valid JSON")), 400);
+    }
+    const startedAt = Date.now();
+    const chatReq = body as ChatCompletionsRequest;
+    const model = typeof chatReq?.model === "string" ? chatReq.model : "(default)";
+    stats.requests += 1;
+
+    try {
+      const { req, extraIgnored, includeUsage } = chatToMessagesRequest(chatReq);
+
+      if (req.stream === true) {
+        const abortController = new AbortController();
+        const { ignored, provider, events } = engine.stream(req, {
+          signal: abortController.signal,
+          onResult: (info) => {
+            if (info.costUsd !== undefined) stats.totalCostUsd += info.costUsd;
+            log?.(
+              requestLine("/v1/chat/completions", 200, model, startedAt, {
+                stream: true,
+                ...(info.costUsd !== undefined ? { cost: info.costUsd } : {}),
+                ...(info.sessionId ? { session: info.sessionId } : {}),
+              }),
+            );
+          },
+        });
+        c.header("x-yagami-provider", provider);
+        const allIgnored = [...ignored, ...extraIgnored];
+        if (allIgnored.length > 0) c.header("x-yagami-ignored", allIgnored.join(","));
+        const translator = new ChatChunkTranslator(includeUsage);
+        return streamSSE(c, async (stream) => {
+          stream.onAbort(() => abortController.abort());
+          for await (const ev of events) {
+            for (const chunk of translator.push(ev)) {
+              await stream.writeSSE({ data: JSON.stringify(chunk) });
+            }
+          }
+          if (!translator.errored) await stream.writeSSE({ data: "[DONE]" });
+        });
+      }
+
+      const result = await engine.complete(req);
+      if (result.costUsd !== undefined) stats.totalCostUsd += result.costUsd;
+      log?.(
+        requestLine("/v1/chat/completions", 200, model, startedAt, {
+          ...(result.costUsd !== undefined ? { cost: result.costUsd } : {}),
+          ...(result.sessionId ? { session: result.sessionId } : {}),
+        }),
+      );
+      c.header("x-yagami-provider", result.provider);
+      const allIgnored = [...result.ignored, ...extraIgnored];
+      if (allIgnored.length > 0) c.header("x-yagami-ignored", allIgnored.join(","));
+      if (result.costUsd !== undefined) c.header("x-yagami-cost-usd", result.costUsd.toFixed(6));
+      if (result.sessionId) c.header("x-yagami-session", result.sessionId);
+      return c.json(toChatCompletion(result.response));
+    } catch (err) {
+      const apiErr = toApiError(err);
+      log?.(requestLine("/v1/chat/completions", apiErr.status, model, startedAt, { error: apiErr.type }));
+      return c.json(openAiErrorBody(apiErr), apiErr.status as ContentfulStatusCode);
     }
   });
 

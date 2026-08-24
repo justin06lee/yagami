@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { yagamiConfigDir } from "../core/hostConfig.js";
 import type { ProviderConfigEntry } from "../core/providers/registry.js";
+
+export { yagamiConfigDir } from "../core/hostConfig.js";
 
 export interface YagamiConfig {
   host: string;
@@ -25,10 +27,6 @@ export const DEFAULT_CONFIG: YagamiConfig = {
   port: 8787,
   apiKeys: [],
 };
-
-export function yagamiConfigDir(): string {
-  return process.env["YAGAMI_CONFIG_DIR"] ?? path.join(os.homedir(), ".config", "yagami");
-}
 
 export function configFilePath(): string {
   return path.join(yagamiConfigDir(), "config.json");

@@ -1,14 +1,39 @@
 /**
- * yagami — your signed-in Claude Code CLI as an Anthropic-compatible backend.
+ * yagami — your signed-in coding-agent CLIs as an Anthropic/OpenAI-compatible
+ * backend.
  *
- * Library mode (embed in your own app, no HTTP server):
- *   - `YagamiEngine` — Anthropic Messages API in/out, Claude Code underneath.
- *   - `claudeCodeSession` — full agentic Claude Code sessions (tools and all)
- *     for building UIs on top of Claude Code.
+ * Library mode (embed in your own app — no HTTP server, no URL, no API key):
+ *   - `Yagami` — zero-config client mirroring the Anthropic and OpenAI SDK
+ *     surfaces (`messages.create`, `chat.completions.create`, `models.list`),
+ *     synced with the host machine's yagami config.
+ *   - `YagamiEngine` — the engine underneath, for explicit programmatic use.
+ *   - `claudeCodeSession` / `AgentSession` — full agentic Claude Code
+ *     sessions (tools and all) for building UIs on top of Claude Code.
  *
  * Server mode lives in `yagami/server` (or the `yagami` CLI).
  */
 
+export {
+  Yagami,
+  type YagamiOptions,
+  type YagamiMessages,
+  type YagamiChatCompletions,
+  type MessageStreamEvent,
+} from "./core/client.js";
+export {
+  chatToMessagesRequest,
+  toChatCompletion,
+  ChatChunkTranslator,
+  modelListBody,
+  openAiErrorBody,
+  type ChatCompletionsRequest,
+  type ChatCompletion,
+  type ChatCompletionChunk,
+  type ChatMessageParam,
+  type OpenAiUsage,
+  type TranslatedChatRequest,
+} from "./core/openai.js";
+export { loadHostEngineConfig, yagamiConfigDir, type HostEngineConfig } from "./core/hostConfig.js";
 export {
   YagamiEngine,
   type EngineOptions,
