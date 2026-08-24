@@ -185,10 +185,18 @@ describe("misc routes", () => {
     const res = await app.request("/v1/models", { headers: { "x-api-key": KEY } });
     expect(res.status).toBe(200);
     expect(res.headers.get("x-yagami-models-source")).toBe("engine");
-    const body = (await res.json()) as { data: Array<Record<string, unknown>> };
-    expect(body.data).toEqual([
-      { type: "model", id: "sonnet", display_name: "Sonnet", resolved_model: "claude-sonnet-5" },
-    ]);
+    const body = (await res.json()) as { object: string; data: Array<Record<string, unknown>> };
+    expect(body.object).toBe("list");
+    expect(body.data).toHaveLength(1);
+    // Merged shape: Anthropic fields plus OpenAI fields on the same object.
+    expect(body.data[0]).toMatchObject({
+      type: "model",
+      object: "model",
+      owned_by: "yagami",
+      id: "sonnet",
+      display_name: "Sonnet",
+      resolved_model: "claude-sonnet-5",
+    });
   });
 
   it("falls back to the static model list when probing fails", async () => {
