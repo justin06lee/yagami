@@ -29,7 +29,7 @@ const program = new Command();
 
 program
   .name("yagami")
-  .description("Anthropic-compatible API served by your signed-in Claude Code CLI")
+  .description("Anthropic- and OpenAI-compatible API served by your signed-in coding-agent CLIs")
   .version(VERSION);
 
 interface StartFlags {
@@ -107,17 +107,18 @@ program
       console.log(`  config      ${configFilePath()}`);
       if (freshKey) {
         console.log(`  api key     ${freshKey}`);
-        console.log("              (newly generated and saved — copy it now, it is shown in full only once)");
+        console.log("              (newly generated and saved — `yagami key` prints it again)");
       } else {
-        console.log(`  api keys    ${running.config.apiKeys.map(maskKey).join(", ")}`);
+        console.log(`  api keys    ${running.config.apiKeys.map(maskKey).join(", ")} (\`yagami key\` prints them in full)`);
       }
       if (!["127.0.0.1", "localhost", "::1"].includes(running.config.host)) {
         console.log(
           `  ⚠ bound to ${running.config.host} — reachable beyond this machine. Only do this on a network you trust.`,
         );
       }
-      console.log("\nPoint any Anthropic SDK at it:");
-      console.log(`  baseURL: "${running.url}"   apiKey: <your yagami key>`);
+      console.log("\nConnect apps — either dialect, same key (`yagami key` prints ready-to-paste env exports):");
+      console.log(`  Anthropic apps   baseURL ${running.url}      (ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY)`);
+      console.log(`  OpenAI apps      baseURL ${running.url}/v1   (OPENAI_BASE_URL / OPENAI_API_KEY)`);
     } catch (err) {
       console.error(`yagami: ${err instanceof Error ? err.message : String(err)}`);
       process.exitCode = 1;
@@ -165,8 +166,9 @@ async function startDaemon(opts: StartFlags, freshKey: string | undefined): Prom
       console.log(`  log   ${logPath}`);
       if (freshKey) {
         console.log(`  key   ${freshKey}`);
-        console.log("        (newly generated and saved — copy it now, it is shown in full only once)");
+        console.log("        (newly generated and saved — `yagami key` prints it again)");
       }
+      console.log("        `yagami key` prints the URL, key, and env exports for client apps");
       return;
     }
     await sleep(200);
@@ -245,6 +247,33 @@ program
     const file = saveConfig(cfg);
     console.log(key);
     console.error(`saved to ${file} (${cfg.apiKeys.length} key${cfg.apiKeys.length === 1 ? "" : "s"} total)`);
+  });
+
+program
+  .command("key")
+  .description("print the server URL, API key, and ready-to-paste env exports for client apps")
+  .action(() => {
+    const cfg = loadConfig();
+    const state = readServerState();
+    const live = state !== undefined && isProcessAlive(state.pid);
+    const url = live ? state.url : `http://${cfg.host}:${cfg.port}`;
+    if (cfg.apiKeys.length === 0) {
+      console.error("no API keys configured — run `yagami start` (generates one) or `yagami keygen`");
+      process.exitCode = 1;
+      return;
+    }
+    const key = cfg.apiKeys[cfg.apiKeys.length - 1]!;
+    console.log(`url   ${url}${live ? "" : "   (server not running — this is where `yagami start` will listen)"}`);
+    console.log(`key   ${key}`);
+    if (cfg.apiKeys.length > 1) {
+      console.log(`      (newest of ${cfg.apiKeys.length} keys in ${configFilePath()})`);
+    }
+    console.log("\nAnthropic-dialect apps:");
+    console.log(`  export ANTHROPIC_BASE_URL=${url}`);
+    console.log(`  export ANTHROPIC_API_KEY=${key}`);
+    console.log("\nOpenAI-dialect apps:");
+    console.log(`  export OPENAI_BASE_URL=${url}/v1`);
+    console.log(`  export OPENAI_API_KEY=${key}`);
   });
 
 program
