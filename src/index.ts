@@ -54,7 +54,17 @@ export {
 } from "./core/permission.js";
 export { settingSourcesFor, type Parity } from "./core/parity.js";
 export type { Provider, ProviderCapabilities, TurnRequest, TurnEvent, ModelRef } from "./core/provider.js";
-export { parseModelRef, qualifiedModel } from "./core/provider.js";
+export { parseModelRef, qualifiedModel, isSessionProvider } from "./core/provider.js";
+// the harness-generic agentic session contract (Codex app-server, ACP agents)
+export type {
+  AgentEvent,
+  ProviderSession,
+  ProviderSessionOptions,
+  SessionProvider,
+  SessionPermissionDecision,
+  SessionPermissionRequest,
+  SessionPermissionHandler,
+} from "./core/provider.js";
 export { ClaudeProvider, type ClaudeProviderOptions } from "./core/providers/claude.js";
 export { CodexProvider, type CodexProviderOptions, type CodexSandboxMode } from "./core/providers/codex.js";
 export { AcpProvider, type AcpProviderOptions, type AcpConnection } from "./core/providers/acp.js";

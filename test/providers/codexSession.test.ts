@@ -1,0 +1,77 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { describe, expect, it } from "vitest";
+import { CodexAgentSession } from "../../src/core/providers/codexSession.js";
+import { isSessionProvider } from "../../src/core/provider.js";
+import { CodexProvider } from "../../src/core/providers/codex.js";
+import type { AgentEvent, SessionPermissionDecision } from "../../src/core/provider.js";
+import { collect } from "../helpers/fakeProvider.js";
+
+const FAKE = path.join(import.meta.dirname, "..", "helpers", "fake-app-server.cjs");
+fs.chmodSync(FAKE, 0o755);
+
+function session(decision: SessionPermissionDecision, resume?: string) {
+  return new CodexAgentSession({
+    executable: FAKE,
+    env: process.env,
+    loginCommand: "codex login",
+    options: {
+      cwd: "/tmp",
+      permissions: { decide: async () => decision },
+      ...(resume ? { resume } : {}),
+    },
+  });
+}
+
+describe("CodexAgentSession", () => {
+  it("is detected by isSessionProvider on CodexProvider", () => {
+    expect(isSessionProvider(new CodexProvider({ path: process.execPath, workDir: "/tmp/yagami-test-ws" }))).toBe(true);
+  });
+
+  it("streams a full turn: deltas, tool events, approval round-trip, gap fill, usage", async () => {
+    const s = session("allow");
+    const events = await collect(s.send("run it"));
+    await s.close();
+    expect(s.id).toBe("th-fake-1");
+    expect(events[0]).toEqual({ type: "session", sessionId: "th-fake-1" });
+    expect(events.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { text: string }).text)).toEqual([
+      "hel",
+      "lo",
+      " there", // item/completed fills what the deltas didn't cover
+    ]);
+    const tools = events.filter((e: AgentEvent) => e.type === "tool_call") as Array<Record<string, unknown>>;
+    expect(tools[0]).toMatchObject({ name: "shell", status: "started", title: "echo hi" });
+    expect(tools[1]).toMatchObject({ name: "shell", status: "completed" });
+    expect((tools[1]!["output"] as { output: string }).output).toBe('decision="accept"');
+    const perm = events.find((e: AgentEvent) => e.type === "permission") as Record<string, unknown>;
+    expect(perm).toMatchObject({ decision: "allow" });
+    expect(events.at(-1)).toEqual({
+      type: "done",
+      usage: { input_tokens: 30, output_tokens: 20, cache_read_input_tokens: 8, cache_creation_input_tokens: 2 },
+      stopReason: "end_turn",
+    });
+  });
+
+  it("maps allow_always to acceptForSession and deny to a declined execution", async () => {
+    const always = session("allow_always");
+    const alwaysEvents = await collect(always.send("go"));
+    await always.close();
+    const alwaysTool = alwaysEvents.filter((e) => e.type === "tool_call").at(-1) as Record<string, unknown>;
+    expect((alwaysTool["output"] as { output: string }).output).toBe('decision="acceptForSession"');
+
+    const denied = session("deny");
+    const deniedEvents = await collect(denied.send("go"));
+    await denied.close();
+    const deniedTool = deniedEvents.filter((e) => e.type === "tool_call").at(-1) as Record<string, unknown>;
+    expect(deniedTool).toMatchObject({ status: "failed" });
+    expect((deniedTool["output"] as { output: string }).output).toBe('decision="decline"');
+  });
+
+  it("resumes an existing thread by id", async () => {
+    const s = session("allow", "th-old-7");
+    const events = await collect(s.send("hi"));
+    await s.close();
+    expect(s.id).toBe("th-old-7");
+    expect(events[0]).toEqual({ type: "session", sessionId: "th-old-7" });
+  });
+});
