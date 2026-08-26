@@ -150,3 +150,110 @@ describe("rejectOption", () => {
     expect(rejectOption(req([]))).toEqual({ outcome: { outcome: "cancelled" } });
   });
 });
+
+// ── the agentic session layer ──────────────────────────────────────────
+
+import { isSessionProvider, type SessionPermissionDecision } from "../../src/core/provider.js";
+
+function sessionFake(opts: { permissionDecision?: SessionPermissionDecision } = {}) {
+  let handlers: AcpHandlers = {};
+  const calls: Record<string, unknown[]> = { setSessionMode: [], cancel: [], newSession: [], resumeSession: [] };
+  const agent = {
+    newSession: async (p: unknown) => {
+      calls["newSession"]!.push(p);
+      return { sessionId: "ses-9", configOptions: [], modes: { currentModeId: "build", availableModes: [{ id: "build" }, { id: "plan" }] } };
+    },
+    resumeSession: async (p: unknown) => {
+      calls["resumeSession"]!.push(p);
+      return { configOptions: [], modes: null };
+    },
+    setSessionMode: async (p: unknown) => {
+      calls["setSessionMode"]!.push(p);
+      return {};
+    },
+    cancel: async (p: unknown) => {
+      calls["cancel"]!.push(p);
+    },
+    prompt: async () => {
+      const push = (update: unknown) => handlers.onUpdate?.({ sessionId: "ses-9", update } as never);
+      push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "wor" } });
+      push({ sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Read README.md", kind: "read", rawInput: { path: "README.md" } });
+      const answer = await (handlers.onPermission
+        ? handlers.onPermission({
+            sessionId: "ses-9",
+            toolCall: { toolCallId: "tc-1", title: "Read README.md", kind: "read", rawInput: { path: "README.md" } },
+            options: [
+              { optionId: "y", name: "Yes", kind: "allow_once" },
+              { optionId: "ya", name: "Always", kind: "allow_always" },
+              { optionId: "n", name: "No", kind: "reject_once" },
+            ],
+          } as never)
+        : Promise.resolve({ outcome: { outcome: "cancelled" } } as never));
+      push({ sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed", rawOutput: { picked: (answer as { outcome: { optionId?: string } }).outcome.optionId ?? "none" } });
+      push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "king" } });
+      return { stopReason: "end_turn", usage: { inputTokens: 5, outputTokens: 2 } };
+    },
+  };
+  const closed = vi.fn();
+  const conn: AcpConnection = {
+    agent: agent as never,
+    init: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {} } }, agentInfo: { name: "FakeAgent" } } as never,
+    setHandlers: (h) => {
+      handlers = h;
+    },
+    close: closed,
+  };
+  return { conn, calls, closed };
+}
+
+describe("AcpProvider.openSession", () => {
+  it("is a SessionProvider", () => {
+    const fake = sessionFake();
+    expect(isSessionProvider(provider(fake))).toBe(true);
+  });
+
+  it("runs verbatim: no mode forcing, tool events streamed, approvals answered via the handler", async () => {
+    const fake = sessionFake();
+    const decisions: unknown[] = [];
+    const s = provider(fake).openSession({
+      cwd: "/tmp/proj",
+      permissions: {
+        decide: async (req) => {
+          decisions.push(req.tool);
+          return "allow_always";
+        },
+      },
+    });
+    const events = await collect(s.send("work"));
+    await s.close();
+    expect(s.id).toBe("ses-9");
+    // verbatim: the agent keeps its own default mode
+    expect(fake.calls["setSessionMode"]).toEqual([]);
+    expect(fake.calls["newSession"]).toEqual([{ cwd: "/tmp/proj", mcpServers: [] }]);
+    expect(decisions).toEqual(["Read README.md"]);
+    const tools = events.filter((e) => e.type === "tool_call") as Array<Record<string, unknown>>;
+    expect(tools[0]).toMatchObject({ id: "tc-1", status: "started", kind: "read", title: "Read README.md" });
+    // allow_always picked the agent's allow_always option
+    expect(tools[1]).toMatchObject({ status: "completed", output: { picked: "ya" } });
+    expect(events.filter((e) => e.type === "text").map((e) => (e as { text: string }).text)).toEqual(["wor", "king"]);
+    expect(events.find((e) => e.type === "permission")).toMatchObject({ decision: "allow_always" });
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "end_turn" });
+    expect(fake.closed).toHaveBeenCalled();
+  });
+
+  it("honors native.mode, resume, and interrupt", async () => {
+    const fake = sessionFake();
+    const s = provider(fake).openSession({
+      cwd: "/tmp/proj",
+      resume: "ses-old",
+      native: { mode: "plan" },
+      permissions: { decide: async () => "deny" },
+    });
+    await collect(s.send("hi"));
+    expect(fake.calls["resumeSession"]).toEqual([{ sessionId: "ses-old", cwd: "/tmp/proj" }]);
+    expect(fake.calls["setSessionMode"]).toEqual([{ sessionId: "ses-old", modeId: "plan" }]);
+    await s.interrupt();
+    expect(fake.calls["cancel"]).toEqual([{ sessionId: "ses-old" }]);
+    await s.close();
+  });
+});

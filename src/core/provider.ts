@@ -99,10 +99,10 @@ export function qualifiedModel(providerId: string, model: string): string {
 // Agentic sessions (library mode): tools, permissions, the works.
 // ---------------------------------------------------------------------------
 
-export type PermissionDecision = "allow" | "allow_always" | "deny" | "deny_always";
+export type SessionPermissionDecision = "allow" | "allow_always" | "deny" | "deny_always";
 
 /** A harness asking the host whether a tool may run. */
-export interface PermissionRequest {
+export interface SessionPermissionRequest {
   provider: string;
   sessionId?: string;
   /** Tool name as the harness calls it (e.g. "Bash", "Edit", or an ACP title). */
@@ -115,8 +115,8 @@ export interface PermissionRequest {
   raw?: unknown;
 }
 
-export interface PermissionHandler {
-  decide(req: PermissionRequest, signal?: AbortSignal): Promise<PermissionDecision>;
+export interface SessionPermissionHandler {
+  decide(req: SessionPermissionRequest, signal?: AbortSignal): Promise<SessionPermissionDecision>;
 }
 
 export type AgentEvent =
@@ -133,12 +133,12 @@ export type AgentEvent =
       input?: unknown;
       output?: unknown;
     }
-  | { type: "permission"; request: PermissionRequest; decision: PermissionDecision }
+  | { type: "permission"; request: SessionPermissionRequest; decision: SessionPermissionDecision }
   | { type: "done"; usage?: Usage; costUsd?: number; stopReason?: string }
   /** Anything the harness said that has no normalized shape. */
   | { type: "raw"; provider: string; payload: unknown };
 
-export interface AgentSessionOptions {
+export interface ProviderSessionOptions {
   /** Project directory the agent works in. */
   cwd: string;
   model?: string;
@@ -150,7 +150,7 @@ export interface AgentSessionOptions {
    * none of it. Default "terminal", because that is the promise.
    */
   parity?: "terminal" | "isolated";
-  permissions: PermissionHandler;
+  permissions: SessionPermissionHandler;
   appName?: string;
   effort?: string;
   thinking?: ThinkingParam;
@@ -161,7 +161,7 @@ export interface AgentSessionOptions {
 }
 
 /** One live conversation with a harness: send turns, get normalized events. */
-export interface AgentSession {
+export interface ProviderSession {
   readonly provider: string;
   /** Provider session id once known (use it to resume later). */
   readonly id: string | undefined;
@@ -172,7 +172,7 @@ export interface AgentSession {
 
 /** Providers that can host agentic sessions implement this too. */
 export interface SessionProvider extends Provider {
-  openSession(options: AgentSessionOptions): AgentSession;
+  openSession(options: ProviderSessionOptions): ProviderSession;
 }
 
 export function isSessionProvider(p: Provider): p is SessionProvider {

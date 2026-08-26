@@ -18,7 +18,18 @@ import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, looksLikeAuthFailure, AuthRequiredError, ProviderError } from "../errors.js";
 import type { EngineModel } from "../models.js";
-import type { Provider, ProviderCapabilities, TurnEvent, TurnRequest } from "../provider.js";
+import type {
+  AgentEvent,
+  Provider,
+  ProviderCapabilities,
+  ProviderSession,
+  ProviderSessionOptions,
+  SessionPermissionDecision,
+  SessionPermissionRequest,
+  SessionProvider,
+  TurnEvent,
+  TurnRequest,
+} from "../provider.js";
 import type { ContentBlockParam, Usage } from "../types.js";
 import { AsyncQueue } from "./queue.js";
 import { VERSION } from "../../version.js";
@@ -70,7 +81,7 @@ export function rejectOption(p: RequestPermissionRequest): RequestPermissionResp
  * Gemini CLI, Copilot, Cursor, Qwen Code, Kimi, Goose, and anything in the
  * ACP registry. One adapter, many harnesses.
  */
-export class AcpProvider implements Provider {
+export class AcpProvider implements SessionProvider {
   readonly id: string;
   readonly label: string;
   readonly executable: string;
@@ -266,6 +277,23 @@ export class AcpProvider implements Provider {
     }
   }
 
+  /**
+   * A live, interactive ACP session: the agent runs warm in the project
+   * directory with ITS OWN defaults — no plan-mode hardening, no forced
+   * config. Tool calls stream as normalized events and permission requests
+   * go to the host's handler, exactly as the agent's own client would ask.
+   */
+  openSession(options: ProviderSessionOptions): ProviderSession {
+    return new AcpAgentSession({
+      id: this.id,
+      modelConfigId: this.modelConfigId,
+      connect: (cwd) => this.connectImpl(cwd),
+      classify: (err, ctx) => this.classify(err, ctx),
+      selectModel: (conn, sessionId, configOptions, model) => this.selectModel(conn, sessionId, configOptions, model),
+      options,
+    });
+  }
+
   private async selectModel(
     conn: AcpConnection,
     sessionId: string,
@@ -330,6 +358,205 @@ export class AcpProvider implements Provider {
       plain = undefined;
     }
     return `${plain ?? "unknown version"} ⚠ no ACP handshake (${handshakeError ?? "unknown error"}) — too old, or a different program with the same name?`;
+  }
+}
+
+interface AcpSessionConfig {
+  id: string;
+  modelConfigId: string;
+  connect: (cwd: string) => Promise<AcpConnection>;
+  classify: (err: unknown, context?: string) => Error;
+  selectModel: (
+    conn: AcpConnection,
+    sessionId: string,
+    configOptions: SessionConfigOption[] | null | undefined,
+    model: string,
+  ) => Promise<void>;
+  options: ProviderSessionOptions;
+}
+
+/** One warm ACP agent process, verbatim, across turns. */
+class AcpAgentSession implements ProviderSession {
+  readonly provider: string;
+
+  private conn: AcpConnection | undefined;
+  private sessionId: string | undefined;
+  private queue: AsyncQueue<AgentEvent> | null = null;
+  private opening: Promise<void> | undefined;
+  private closed = false;
+  private costUsd: number | undefined;
+  /** Updates often omit title/kind — remember them from the start event. */
+  private readonly toolMeta = new Map<string, { name: string; title?: string; kind?: string }>();
+
+  constructor(private readonly cfg: AcpSessionConfig) {
+    this.provider = cfg.id;
+  }
+
+  get id(): string | undefined {
+    return this.sessionId;
+  }
+
+  private ensureOpen(): Promise<void> {
+    this.opening ??= this.open();
+    return this.opening;
+  }
+
+  private async open(): Promise<void> {
+    const { options } = this.cfg;
+    const conn = await this.cfg.connect(options.cwd);
+    this.conn = conn;
+    let configOptions: SessionConfigOption[] | null | undefined;
+    if (options.resume && supportsResume(conn.init)) {
+      const resumed = await conn.agent
+        .resumeSession({ sessionId: options.resume, cwd: options.cwd })
+        .catch((err) => {
+          throw this.cfg.classify(err);
+        });
+      this.sessionId = options.resume;
+      configOptions = resumed.configOptions;
+    } else {
+      const created = await conn.agent.newSession({ cwd: options.cwd, mcpServers: [] }).catch((err) => {
+        throw this.cfg.classify(err);
+      });
+      this.sessionId = created.sessionId;
+      configOptions = created.configOptions;
+    }
+    const sessionId = this.sessionId;
+    // verbatim by default: only an explicit native.mode changes the agent's mode
+    const mode = (options.native as { mode?: string } | undefined)?.mode;
+    if (mode) await conn.agent.setSessionMode({ sessionId, modeId: mode }).catch(() => {});
+    if (options.model) await this.cfg.selectModel(conn, sessionId, configOptions, options.model);
+    conn.setHandlers({
+      onPermission: (p) => this.onPermission(p),
+      onUpdate: (n) => this.onUpdate(n),
+    });
+  }
+
+  private async onPermission(p: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    const toolCall = p.toolCall as { title?: string; kind?: string; rawInput?: unknown } | undefined;
+    const request: SessionPermissionRequest = {
+      provider: this.provider,
+      ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+      tool: toolCall?.title ?? "tool",
+      ...(toolCall?.kind ? { kind: toolCall.kind } : {}),
+      ...(toolCall?.title ? { title: toolCall.title } : {}),
+      input: toolCall?.rawInput,
+      raw: p,
+    };
+    let decision: SessionPermissionDecision = "deny";
+    try {
+      decision = await this.cfg.options.permissions.decide(request);
+    } catch {
+      // an unanswerable ask is a denied ask
+    }
+    this.queue?.push({ type: "permission", request, decision });
+    const preferred: Record<SessionPermissionDecision, string[]> = {
+      allow: ["allow_once", "allow_always"],
+      allow_always: ["allow_always", "allow_once"],
+      deny: ["reject_once", "reject_always"],
+      deny_always: ["reject_always", "reject_once"],
+    };
+    for (const kind of preferred[decision]) {
+      const option = p.options.find((o) => o.kind === kind);
+      if (option) return { outcome: { outcome: "selected", optionId: option.optionId } };
+    }
+    return rejectOption(p);
+  }
+
+  private onUpdate(n: SessionNotification): void {
+    if (n.sessionId !== this.sessionId) return;
+    const u = n.update;
+    switch (u.sessionUpdate) {
+      case "agent_message_chunk":
+        if (u.content.type === "text") this.queue?.push({ type: "text", text: u.content.text });
+        break;
+      case "agent_thought_chunk":
+        if (u.content.type === "text") this.queue?.push({ type: "thinking", text: u.content.text });
+        break;
+      case "tool_call": {
+        const t = u as { toolCallId: string; title?: string; kind?: string; rawInput?: unknown };
+        const meta = { name: t.kind ?? "tool", ...(t.title ? { title: t.title } : {}), ...(t.kind ? { kind: t.kind } : {}) };
+        this.toolMeta.set(t.toolCallId, meta);
+        this.queue?.push({
+          type: "tool_call",
+          id: t.toolCallId,
+          status: "started",
+          ...meta,
+          ...(t.rawInput !== undefined ? { input: t.rawInput } : {}),
+        });
+        break;
+      }
+      case "tool_call_update": {
+        const t = u as { toolCallId: string; status?: string; title?: string; kind?: string; rawOutput?: unknown };
+        const known = this.toolMeta.get(t.toolCallId);
+        const meta = {
+          name: t.kind ?? known?.name ?? "tool",
+          ...(t.title ?? known?.title ? { title: t.title ?? known?.title } : {}),
+          ...(t.kind ?? known?.kind ? { kind: t.kind ?? known?.kind } : {}),
+        };
+        this.queue?.push({
+          type: "tool_call",
+          id: t.toolCallId,
+          status: t.status === "completed" ? "completed" : t.status === "failed" ? "failed" : "updated",
+          ...meta,
+          ...(t.rawOutput !== undefined ? { output: t.rawOutput } : {}),
+        });
+        break;
+      }
+      case "usage_update": {
+        const cost = (u as { cost?: { amount?: number; currency?: string } | null }).cost;
+        if (cost && typeof cost.amount === "number" && (cost.currency ?? "USD") === "USD") this.costUsd = cost.amount;
+        break;
+      }
+      default:
+        this.queue?.push({ type: "raw", provider: this.provider, payload: u });
+        break;
+    }
+  }
+
+  async *send(input: string | ContentBlockParam[]): AsyncGenerator<AgentEvent, void, undefined> {
+    if (this.closed) throw new ProviderError(this.provider, "session is closed");
+    if (this.queue) throw new ProviderError(this.provider, "a turn is already running");
+    await this.ensureOpen();
+    const sessionId = this.sessionId!;
+    const text = typeof input === "string" ? input : input.filter((b) => b.type === "text").map((b) => (b as { text?: string }).text ?? "").join("\n");
+    const media = typeof input === "string" ? [] : input.filter((b) => b.type === "image");
+
+    const queue = new AsyncQueue<AgentEvent>();
+    this.queue = queue;
+    this.costUsd = undefined;
+    this.conn!.agent
+      .prompt({ sessionId, prompt: toAcpBlocks(text, media, this.provider) })
+      .then((res) => {
+        queue.push({
+          type: "done",
+          usage: mapAcpUsage((res.usage ?? undefined) as Record<string, unknown> | undefined),
+          ...(this.costUsd !== undefined ? { costUsd: this.costUsd } : {}),
+          stopReason: mapStopReason(res.stopReason),
+        });
+        queue.end();
+      })
+      .catch((err) => queue.fail(this.cfg.classify(err)));
+    try {
+      yield { type: "session", sessionId };
+      for await (const event of queue) yield event;
+    } finally {
+      if (this.queue === queue) this.queue = null;
+    }
+  }
+
+  async interrupt(): Promise<void> {
+    if (!this.sessionId || !this.conn) return;
+    await this.conn.agent.cancel({ sessionId: this.sessionId }).catch(() => {});
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.queue?.fail(new ProviderError(this.provider, "session closed"));
+    this.queue = null;
+    this.conn?.close();
+    this.conn = undefined;
   }
 }
 

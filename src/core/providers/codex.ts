@@ -6,8 +6,17 @@ import * as readline from "node:readline";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, ProviderError } from "../errors.js";
 import type { EngineModel } from "../models.js";
-import type { Provider, ProviderCapabilities, TurnEvent, TurnRequest } from "../provider.js";
+import type {
+  Provider,
+  ProviderCapabilities,
+  ProviderSession,
+  ProviderSessionOptions,
+  SessionProvider,
+  TurnEvent,
+  TurnRequest,
+} from "../provider.js";
 import type { ContentBlockParam, Usage } from "../types.js";
+import { CodexAgentSession } from "./codexSession.js";
 import { spawnJsonl } from "./jsonl.js";
 import { VERSION } from "../../version.js";
 
@@ -33,7 +42,7 @@ interface CodexItem {
 }
 
 /** OpenAI Codex CLI via `codex exec --json`, signed in with the user's ChatGPT account. */
-export class CodexProvider implements Provider {
+export class CodexProvider implements SessionProvider {
   readonly id = "codex";
   readonly label = "Codex CLI";
   readonly executable: string;
@@ -125,6 +134,21 @@ export class CodexProvider implements Provider {
     }
     if (req.signal?.aborted) return;
     if (!done) throw new ProviderError(this.id, "codex exited without completing the turn");
+  }
+
+  /**
+   * A live, interactive Codex session (`codex app-server` — the TUI's own
+   * engine): streamed tool events, the user's config.toml verbatim, and
+   * approval requests forwarded to the host's permission handler. The
+   * completion-turn `run()` path above stays for API-style callers.
+   */
+  openSession(options: ProviderSessionOptions): ProviderSession {
+    return new CodexAgentSession({
+      executable: this.executable,
+      env: this.env,
+      loginCommand: this.loginCommand,
+      options,
+    });
   }
 
   /** Ask the app-server protocol for the model catalog (no tokens spent). */

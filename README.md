@@ -144,6 +144,33 @@ This resolves the parts of embedding Claude Code that every host would otherwise
 
 For a lower-level handle, `claudeCodeSession(prompt, { options })` returns the raw Agent SDK `Query`.
 
+### Building a UI on any other harness
+
+The same idea works for the non-Claude harnesses — verbatim. Codex and every ACP agent implement `SessionProvider.openSession()`: a live, warm session on the harness's own engine (`codex app-server` — what the Codex TUI runs on; a persistent ACP connection for OpenCode, Gemini, and friends), with the harness's own config, sandbox, and approval flow. Nothing is overridden unless you pass `native` overrides; approval requests are forwarded to your handler exactly as the harness's own UI would prompt.
+
+```ts
+import { createProvider, isSessionProvider } from "@justin06lee/yagami";
+
+const codex = createProvider("codex", {}, { appName: "my-app" });
+if (isSessionProvider(codex)) {
+  const session = codex.openSession({
+    cwd: "/path/to/project",
+    permissions: {
+      decide: async (req) => (await showDialog(req.tool, req.input)) ? "allow" : "deny",
+    },                                    // "allow_always" answers like the TUI's "don't ask again"
+  });
+  for await (const ev of session.send("fix the failing test")) {
+    // normalized AgentEvents: text / thinking / tool_call (started→completed,
+    // with inputs and outputs) / permission / done (usage, stop reason)
+  }
+  session.send("now add a test");         // same warm thread, context carries
+  await session.interrupt();
+  await session.close();                  // session.id resumes it later via { resume }
+}
+```
+
+`ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
+
 The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
 
 ## Providers
