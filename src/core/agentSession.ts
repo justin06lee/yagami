@@ -2,6 +2,7 @@ import {
   query,
   type Options,
   type Query,
+  type RewindFilesResult,
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -143,6 +144,22 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
     this.ensureStarted();
     const models = await this.query!.supportedModels();
     return models.map((m) => ({ value: m.value, displayName: m.displayName }));
+  }
+
+  /**
+   * Rewind tracked files to their state at a user message (the CLI's
+   * /rewind). Needs `enableFileCheckpointing: true` in the session options —
+   * without it the CLI answers `canRewind: false`. Pass `dryRun` to preview
+   * the change counts without touching the worktree. Starts the process if
+   * no turn has run yet (checkpoints ride the resumed session's history).
+   */
+  async rewindFiles(
+    userMessageId: string,
+    options?: { dryRun?: boolean },
+  ): Promise<RewindFilesResult> {
+    if (this.closed) throw new Error("session is closed");
+    this.ensureStarted();
+    return this.query!.rewindFiles(userMessageId, options);
   }
 
   /** End the session and tear down the process. */

@@ -137,6 +137,9 @@ session.send("now add a test for the edge case");   // next turn resumes the sam
 await session.interrupt();                // the CLI's Esc
 await session.setModel("opus");           // the CLI's /model
 await session.setPermissionMode("plan");  // shift+tab
+// the CLI's /rewind: restore tracked files to their state at a user
+// message's uuid (needs options: { enableFileCheckpointing: true })
+await session.rewindFiles(userMessageUuid);
 session.close();
 ```
 
