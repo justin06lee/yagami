@@ -91,6 +91,7 @@ export {
 export type {
   AgentOptions,
   Query,
+  RewindFilesResult,
   SDKMessage,
   SDKUserMessage,
   PermissionMode,

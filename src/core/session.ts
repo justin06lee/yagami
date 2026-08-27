@@ -42,6 +42,7 @@ export function claudeCodeSession(
 export type {
   Options as AgentOptions,
   Query,
+  RewindFilesResult,
   SDKMessage,
   SDKUserMessage,
   PermissionMode,
