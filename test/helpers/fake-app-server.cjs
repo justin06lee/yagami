@@ -16,6 +16,54 @@ let THREAD = "th-fake-1";
 let turnSeq = 0;
 let interactive = false;
 let interactiveAnswers;
+let currentTimeOk = false;
+
+function startTools() {
+  const turnId = `turn-${turnSeq}`;
+  notify("item/started", {
+    threadId: THREAD,
+    turnId,
+    item: {
+      type: "collabAgentToolCall",
+      id: "agent-1",
+      tool: "spawnAgent",
+      status: "inProgress",
+      senderThreadId: THREAD,
+      receiverThreadIds: ["sub-1"],
+      prompt: "Check the tests",
+      model: "gpt-test",
+      reasoningEffort: "high",
+      agentsStates: {},
+    },
+  });
+  notify("item/completed", {
+    threadId: THREAD,
+    turnId,
+    item: {
+      type: "collabAgentToolCall",
+      id: "agent-1",
+      tool: "spawnAgent",
+      status: "completed",
+      senderThreadId: THREAD,
+      receiverThreadIds: ["sub-1"],
+      prompt: "Check the tests",
+      model: "gpt-test",
+      reasoningEffort: "high",
+      agentsStates: { "sub-1": { status: "completed" } },
+    },
+  });
+  notify("item/started", {
+    threadId: THREAD,
+    turnId,
+    item: { type: "commandExecution", id: "exec-1", command: "echo hi", cwd: "/tmp", status: "inProgress" },
+  });
+  send({
+    jsonrpc: "2.0",
+    id: 900,
+    method: "item/commandExecution/requestApproval",
+    params: { threadId: THREAD, turnId, itemId: "exec-1", command: "echo hi", cwd: "/tmp" },
+  });
+}
 
 rl.on("line", (line) => {
   let msg;
@@ -26,6 +74,11 @@ rl.on("line", (line) => {
   }
   // responses to OUR server requests (input, elicitation, and approval)
   if (msg.method === undefined && msg.id !== undefined) {
+    if (msg.id === 899) {
+      currentTimeOk = Number.isInteger(msg.result?.currentTimeAt);
+      startTools();
+      return;
+    }
     if (msg.id === 901) {
       interactiveAnswers = msg.result;
       send({
@@ -64,7 +117,7 @@ rl.on("line", (line) => {
         command: "echo hi",
         cwd: "/tmp",
         status: decision === "accept" || decision === "acceptForSession" ? "completed" : "declined",
-        aggregatedOutput: `decision=${JSON.stringify(decision)}`,
+        aggregatedOutput: `decision=${JSON.stringify(decision)} currentTime=${currentTimeOk}`,
         exitCode: decision === "accept" || decision === "acceptForSession" ? 0 : 1,
       },
     });
@@ -166,17 +219,11 @@ rl.on("line", (line) => {
       }
       notify("item/agentMessage/delta", { threadId: THREAD, turnId, itemId: "msg-1", delta: "hel" });
       notify("item/agentMessage/delta", { threadId: THREAD, turnId, itemId: "msg-1", delta: "lo" });
-      notify("item/started", {
-        threadId: THREAD,
-        turnId,
-        item: { type: "commandExecution", id: "exec-1", command: "echo hi", cwd: "/tmp", status: "inProgress" },
-      });
-      // approval round-trip: our own server->client request, id 900
       send({
         jsonrpc: "2.0",
-        id: 900,
-        method: "item/commandExecution/requestApproval",
-        params: { threadId: THREAD, turnId, itemId: "exec-1", command: "echo hi", cwd: "/tmp" },
+        id: 899,
+        method: "currentTime/read",
+        params: {},
       });
       break;
     }

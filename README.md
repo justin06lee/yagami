@@ -169,7 +169,8 @@ if (isSessionProvider(codex)) {
   });
   for await (const ev of session.send("fix the failing test")) {
     // normalized AgentEvents: session / turn / text / thinking / tool_call
-    // (started→completed, with inputs and outputs) / permission / plan / done
+    // (started→completed, including Codex multi-agent operations) / permission
+    // / plan / done
   }
   session.send("now add a test");         // same warm thread, context carries
   await session.interrupt();

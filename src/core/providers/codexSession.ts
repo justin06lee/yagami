@@ -350,6 +350,53 @@ export class CodexAgentSession implements ProviderSession {
         });
         break;
       }
+      case "dynamicToolCall": {
+        const failed = item["status"] === "failed" || item["success"] === false;
+        const namespace = typeof item["namespace"] === "string" ? `${item["namespace"]}.` : "";
+        this.push({
+          type: "tool_call",
+          id,
+          name: `${namespace}${String(item["tool"] ?? "tool")}`,
+          status: completed ? (failed ? "failed" : "completed") : "started",
+          kind: "other",
+          input: item["arguments"],
+          ...(completed ? { output: item["contentItems"] } : {}),
+        });
+        break;
+      }
+      case "collabAgentToolCall": {
+        const status = item["status"];
+        const failed = status === "failed" || status === "interrupted";
+        const tool = collabToolName(item["tool"]);
+        this.push({
+          type: "tool_call",
+          id,
+          name: tool,
+          status: completed ? (failed ? "failed" : "completed") : "started",
+          title: typeof item["prompt"] === "string" && item["prompt"] ? item["prompt"] : tool,
+          kind: "other",
+          input: {
+            prompt: item["prompt"],
+            model: item["model"],
+            effort: item["reasoningEffort"],
+            receiverThreadIds: item["receiverThreadIds"],
+          },
+          ...(completed ? { output: item["agentsStates"] } : {}),
+        });
+        break;
+      }
+      case "imageView": {
+        this.push({
+          type: "tool_call",
+          id,
+          name: "read_file",
+          status: completed ? "completed" : "started",
+          title: String(item["path"] ?? "image"),
+          kind: "read",
+          input: { path: item["path"] },
+        });
+        break;
+      }
       case "userMessage":
       case "plan":
         break;
@@ -461,6 +508,10 @@ export class CodexAgentSession implements ProviderSession {
         this.respond(id, { ...elicitationResponse(response), _meta: null });
         break;
       }
+      case "currentTime/read": {
+        this.respond(id, { currentTimeAt: Math.floor(Date.now() / 1000) });
+        break;
+      }
       default: {
         // unknown server request — decline rather than hang the turn
         this.child?.stdin?.write(
@@ -530,6 +581,20 @@ export class CodexAgentSession implements ProviderSession {
     this.child?.kill("SIGTERM");
     this.child = undefined;
   }
+}
+
+function collabToolName(value: unknown): string {
+  const names: Record<string, string> = {
+    spawnAgent: "spawn_agent",
+    sendInput: "send_input",
+    resumeAgent: "resume_agent",
+    closeAgent: "close_agent",
+    sendMessage: "send_message",
+    followupTask: "followup_task",
+    interruptAgent: "interrupt_agent",
+    listAgents: "list_agents",
+  };
+  return names[String(value)] ?? String(value ?? "agent");
 }
 
 function codexPlanStatus(value: unknown): SessionPlanStatus {

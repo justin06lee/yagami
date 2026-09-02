@@ -42,9 +42,11 @@ describe("CodexAgentSession", () => {
       " there", // item/completed fills what the deltas didn't cover
     ]);
     const tools = events.filter((e: AgentEvent) => e.type === "tool_call") as Array<Record<string, unknown>>;
-    expect(tools[0]).toMatchObject({ name: "shell", status: "started", title: "echo hi" });
-    expect(tools[1]).toMatchObject({ name: "shell", status: "completed" });
-    expect((tools[1]!["output"] as { output: string }).output).toBe('decision="accept"');
+    expect(tools[0]).toMatchObject({ name: "spawn_agent", status: "started", title: "Check the tests" });
+    expect(tools[1]).toMatchObject({ name: "spawn_agent", status: "completed" });
+    expect(tools[2]).toMatchObject({ name: "shell", status: "started", title: "echo hi" });
+    expect(tools[3]).toMatchObject({ name: "shell", status: "completed" });
+    expect((tools[3]!["output"] as { output: string }).output).toBe('decision="accept" currentTime=true');
     const perm = events.find((e: AgentEvent) => e.type === "permission") as Record<string, unknown>;
     expect(perm).toMatchObject({ decision: "allow" });
     expect(events.at(-1)).toEqual({
@@ -59,14 +61,14 @@ describe("CodexAgentSession", () => {
     const alwaysEvents = await collect(always.send("go"));
     await always.close();
     const alwaysTool = alwaysEvents.filter((e) => e.type === "tool_call").at(-1) as Record<string, unknown>;
-    expect((alwaysTool["output"] as { output: string }).output).toBe('decision="acceptForSession"');
+    expect((alwaysTool["output"] as { output: string }).output).toBe('decision="acceptForSession" currentTime=true');
 
     const denied = session("deny");
     const deniedEvents = await collect(denied.send("go"));
     await denied.close();
     const deniedTool = deniedEvents.filter((e) => e.type === "tool_call").at(-1) as Record<string, unknown>;
     expect(deniedTool).toMatchObject({ status: "failed" });
-    expect((deniedTool["output"] as { output: string }).output).toBe('decision="decline"');
+    expect((deniedTool["output"] as { output: string }).output).toBe('decision="decline" currentTime=true');
   });
 
   it("resumes an existing thread by id", async () => {
