@@ -84,6 +84,14 @@ rl.on("line", (line) => {
       THREAD = msg.params.threadId;
       send({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: THREAD, resumed: true } } });
       break;
+    case "thread/fork":
+      THREAD = `${msg.params.threadId}-fork-${msg.params.lastTurnId ?? "tip"}`;
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { thread: { id: THREAD, forkedFromId: msg.params.threadId }, forkParams: msg.params },
+      });
+      break;
     case "model/list":
       send({
         jsonrpc: "2.0",

@@ -65,6 +65,7 @@ export type {
   AgentEvent,
   ProviderSession,
   ProviderSessionOptions,
+  ProviderSessionCapabilities,
   SessionProvider,
   SessionPermissionDecision,
   SessionPermissionRequest,

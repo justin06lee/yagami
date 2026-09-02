@@ -102,6 +102,7 @@ export class AcpProvider implements SessionProvider {
     effort: false,
     streaming: "tokens",
   };
+  readonly sessionCapabilities = { fork: false } as const;
 
   private readonly args: string[];
   private readonly env: NodeJS.ProcessEnv;

@@ -10,7 +10,7 @@ import { collect } from "../helpers/fakeProvider.js";
 const FAKE = path.join(import.meta.dirname, "..", "helpers", "fake-app-server.cjs");
 fs.chmodSync(FAKE, 0o755);
 
-function session(decision: SessionPermissionDecision, resume?: string, input?: unknown) {
+function session(decision: SessionPermissionDecision, resume?: string, input?: unknown, forkAt?: string) {
   return new CodexAgentSession({
     executable: FAKE,
     env: process.env,
@@ -20,6 +20,7 @@ function session(decision: SessionPermissionDecision, resume?: string, input?: u
       permissions: { decide: async () => decision },
       ...(input ? { input } : {}),
       ...(resume ? { resume } : {}),
+      ...(forkAt ? { forkAt } : {}),
     } as never,
   });
 }
@@ -74,6 +75,15 @@ describe("CodexAgentSession", () => {
     await s.close();
     expect(s.id).toBe("th-old-7");
     expect(events[0]).toEqual({ type: "session", sessionId: "th-old-7" });
+  });
+
+  it("forks a resumed thread through an exact turn and reports turn ids", async () => {
+    const s = session("allow", "th-old-7", undefined, "turn-41");
+    const events = await collect(s.send("continue here"));
+    await s.close();
+    expect(s.id).toBe("th-old-7-fork-turn-41");
+    expect(events[0]).toEqual({ type: "session", sessionId: "th-old-7-fork-turn-41" });
+    expect(events[1]).toEqual({ type: "turn", id: "turn-1" });
   });
 
   it("forwards questions and MCP elicitations and streams live plans", async () => {

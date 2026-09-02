@@ -185,6 +185,8 @@ export interface SessionPermissionHandler {
 
 export type AgentEvent =
   | { type: "session"; sessionId: string }
+  /** Provider-native turn id, used by hosts to fork an exact exchange. */
+  | { type: "turn"; id: string }
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
   | {
@@ -209,6 +211,10 @@ export interface ProviderSessionOptions {
   model?: string;
   /** Provider session id to continue. */
   resume?: string;
+  /** Fork the resumed session instead of continuing it in place. */
+  fork?: boolean;
+  /** Fork the resumed session through this provider-native turn, inclusive. */
+  forkAt?: string;
   /**
    * "terminal" loads the same settings the interactive CLI would — user and
    * project config, CLAUDE.md, skills, hooks, MCP servers. "isolated" loads
@@ -227,6 +233,11 @@ export interface ProviderSessionOptions {
   native?: Record<string, unknown>;
 }
 
+export interface ProviderSessionCapabilities {
+  /** Can fork a resumed conversation, optionally at an exact reported turn. */
+  fork: boolean;
+}
+
 /** One live conversation with a harness: send turns, get normalized events. */
 export interface ProviderSession {
   readonly provider: string;
@@ -239,6 +250,7 @@ export interface ProviderSession {
 
 /** Providers that can host agentic sessions implement this too. */
 export interface SessionProvider extends Provider {
+  readonly sessionCapabilities: ProviderSessionCapabilities;
   openSession(options: ProviderSessionOptions): ProviderSession;
 }
 

@@ -157,6 +157,16 @@ export class CodexAgentSession implements ProviderSession {
       ...(native.config ? { config: native.config } : {}),
       ...(options.systemPrompt ? { developerInstructions: options.systemPrompt } : {}),
     };
+    if (options.resume && (options.fork || options.forkAt)) {
+      const forked = await this.request("thread/fork", {
+        threadId: options.resume,
+        ...(options.forkAt ? { lastTurnId: options.forkAt } : {}),
+        ...overrides,
+      });
+      this.threadId = (forked["thread"] as { id?: string } | undefined)?.id;
+      if (!this.threadId) throw new ProviderError("codex", "thread/fork returned no thread id");
+      return;
+    }
     if (options.resume) {
       try {
         const resumed = await this.request("thread/resume", { threadId: options.resume, ...overrides });
@@ -500,6 +510,7 @@ export class CodexAgentSession implements ProviderSession {
       });
       this.currentTurnId = (result["turn"] as { id?: string } | undefined)?.id;
       yield { type: "session", sessionId: this.threadId! };
+      if (this.currentTurnId) yield { type: "turn", id: this.currentTurnId };
       for await (const event of queue) yield event;
     } finally {
       cleanup();

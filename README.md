@@ -168,8 +168,8 @@ if (isSessionProvider(codex)) {
     },
   });
   for await (const ev of session.send("fix the failing test")) {
-    // normalized AgentEvents: text / thinking / tool_call (started→completed,
-    // with inputs and outputs) / permission / plan / done (usage, stop reason)
+    // normalized AgentEvents: session / turn / text / thinking / tool_call
+    // (started→completed, with inputs and outputs) / permission / plan / done
   }
   session.send("now add a test");         // same warm thread, context carries
   await session.interrupt();
@@ -177,7 +177,7 @@ if (isSessionProvider(codex)) {
 }
 ```
 
-`ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), `permissions`, optional `input`, and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). Input fields preserve labels, options, required/secret flags, primitive constraints, and URLs; omitting the handler declines safely instead of hanging a turn. ACP sessions also map `effort` onto the agent's `thought_level` option when it exposes one. The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
+`ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), `permissions`, optional `input`, and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). A session provider reports `sessionCapabilities.fork`; when true, `{ resume, fork: true }` branches at the tip and `{ resume, forkAt: turnId }` branches through an exact `turn` event without mutating the source conversation. Input fields preserve labels, options, required/secret flags, primitive constraints, and URLs; omitting the handler declines safely instead of hanging a turn. ACP sessions also map `effort` onto the agent's `thought_level` option when it exposes one. The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
 
 The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
 
