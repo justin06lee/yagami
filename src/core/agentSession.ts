@@ -3,6 +3,7 @@ import {
   type Options,
   type Query,
   type RewindFilesResult,
+  type ModelInfo,
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -140,10 +141,9 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
   }
 
   /** Models the CLI reports as available (for a picker). */
-  async supportedModels(): Promise<Array<{ value: string; displayName: string }>> {
+  async supportedModels(): Promise<ModelInfo[]> {
     this.ensureStarted();
-    const models = await this.query!.supportedModels();
-    return models.map((m) => ({ value: m.value, displayName: m.displayName }));
+    return this.query!.supportedModels();
   }
 
   /**

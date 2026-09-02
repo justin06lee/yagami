@@ -188,6 +188,12 @@ export class ClaudeProvider implements Provider {
         display_name: m.displayName,
         ...(m.description ? { description: m.description } : {}),
         ...(m.resolvedModel ? { resolved_model: m.resolvedModel } : {}),
+        ...(m.supportedEffortLevels?.length
+          ? { reasoning_efforts: m.supportedEffortLevels.map((id) => ({ id })) }
+          : {}),
+        ...(m.supportsAdaptiveThinking ? { supports_adaptive_thinking: true } : {}),
+        ...(m.supportsFastMode ? { supports_fast_mode: true } : {}),
+        ...(m.supportsAutoMode ? { supports_auto_mode: true } : {}),
       }));
     } catch (err) {
       throw classifyProviderFailure(this.id, this.loginCommand, err);

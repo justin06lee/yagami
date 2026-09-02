@@ -32,7 +32,7 @@ yagami start  # first run generates + saves an API key and prints it
 `make update` stops any running yagami server, rebuilds, reinstalls, and restarts it. Or install from npm: `bun add -g @justin06lee/yagami`.
 
 ```
-yagami v0.5.0
+yagami v0.7.0
   listening   http://127.0.0.1:8787
   provider    claude — /Users/you/.local/bin/claude (2.1.238 (Claude Code))
   also        codex, opencode (use model "<provider>:<model>")
@@ -161,10 +161,15 @@ if (isSessionProvider(codex)) {
     permissions: {
       decide: async (req) => (await showDialog(req.tool, req.input)) ? "allow" : "deny",
     },                                    // "allow_always" answers like the TUI's "don't ask again"
+    input: {
+      // Codex request_user_input and MCP/ACP form or URL elicitations all
+      // arrive in this provider-neutral shape. Throwing safely cancels it.
+      respond: async (request) => renderInput(request),
+    },
   });
   for await (const ev of session.send("fix the failing test")) {
     // normalized AgentEvents: text / thinking / tool_call (started→completed,
-    // with inputs and outputs) / permission / done (usage, stop reason)
+    // with inputs and outputs) / permission / plan / done (usage, stop reason)
   }
   session.send("now add a test");         // same warm thread, context carries
   await session.interrupt();
@@ -172,7 +177,7 @@ if (isSessionProvider(codex)) {
 }
 ```
 
-`ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
+`ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), `permissions`, optional `input`, and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). Input fields preserve labels, options, required/secret flags, primitive constraints, and URLs; omitting the handler declines safely instead of hanging a turn. ACP sessions also map `effort` onto the agent's `thought_level` option when it exposes one. The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
 
 The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
 
@@ -184,7 +189,7 @@ A bare model id goes to the **default provider** (Claude Code unless you change 
 |---|---|---|---|---|---|
 | `claude` — Claude Code | Agent SDK → your `claude` binary | yes, forking | yes (+ documents) | native | native |
 | `codex` — Codex CLI | `codex exec --json` (read-only sandbox) | yes | yes | emulated | effort only |
-| `opencode`, `gemini`, `copilot`, `cursor`, `qwen`, `goose`, `kimi`, `kilo`, `cline`, `auggie`, `amp`, `grok`, `droid`, `codex-acp`, `claude-acp` | Agent Client Protocol over stdio | if the agent supports it | if the agent supports it | emulated | — |
+| `opencode`, `gemini`, `copilot`, `cursor`, `qwen`, `goose`, `kimi`, `kilo`, `cline`, `auggie`, `amp`, `grok`, `droid`, `codex-acp`, `claude-acp` | Agent Client Protocol over stdio | if the agent supports it | if the agent supports it | emulated | `thought_level` when exposed |
 
 "Emulated" means the system prompt is folded into the user turn as a `<system>` block; unsupported `thinking`/`effort` are accepted and reported in `x-yagami-ignored` rather than rejected. Without native forking, a resumed session is single-use: a sibling branch of the same conversation falls back to transcript replay instead of corrupting the shared session.
 
@@ -242,7 +247,7 @@ Env overrides: `YAGAMI_HOST`, `YAGAMI_PORT`, `YAGAMI_API_KEY`, `YAGAMI_PROVIDER`
 - **Dialects**: `POST /v1/messages` is native. `POST /v1/chat/completions` translates OpenAI shapes at the edge — system/developer messages fold into `system`, `image_url` parts become image blocks, streams are re-emitted as `chat.completion.chunk` events ending in `[DONE]`, and thinking output rides along as `reasoning_content`. Errors on that path come back OpenAI-shaped too. `GET /v1/models` serves one merged shape both SDKs parse.
 - **Multi-turn**: the Messages API is stateless but harness sessions aren't. yagami hashes each conversation prefix (per provider) and remembers which session produced it; a follow-up request resumes that session and sends only the new user message. Unmatched histories fall back to replaying the transcript in a single prompt, and if a cached session turns out to be gone, the stale mapping is dropped and the request transparently retries via replay. The cache persists across restarts at `~/.config/yagami/sessions.json`.
 - **Streaming**: every harness's output is normalized into deltas and re-emitted as a proper Anthropic SSE sequence — `message_start` → thinking/text content blocks → `message_delta` → `message_stop` (or the OpenAI chunk sequence on the chat-completions path). Claude and ACP agents stream tokens; Codex streams per message part.
-- **Models**: `GET /v1/models` asks each installed CLI what it supports (Claude via the SDK, Codex via its app-server protocol, ACP agents via their session config) — probed once per process, then cached. Failed probes are skipped and retried next time; a static fallback list is served only if nothing answers (`x-yagami-models-source` says which).
+- **Models**: `GET /v1/models` asks each installed CLI what it supports (Claude via the SDK, Codex via its app-server protocol, ACP agents via their session config) — probed once per process, then cached. Library callers also receive native model metadata when reported: reasoning levels/default, input modalities, fast/auto/adaptive-thinking flags, personality and multi-agent support, service tiers, and the provider's default model. Failed probes are skipped and retried next time; a static fallback list is served only if nothing answers (`x-yagami-models-source` says which).
 - **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else.
 
 Extra response headers: `x-yagami-provider`, `x-yagami-cost-usd` (what the turn would have cost at API prices, when the harness reports it), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params). `/healthz` (unauthenticated) reports the default provider, installed providers, uptime, request count, and the cumulative would-be cost — `yagami status` shows the same.

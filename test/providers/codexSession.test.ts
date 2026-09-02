@@ -10,7 +10,7 @@ import { collect } from "../helpers/fakeProvider.js";
 const FAKE = path.join(import.meta.dirname, "..", "helpers", "fake-app-server.cjs");
 fs.chmodSync(FAKE, 0o755);
 
-function session(decision: SessionPermissionDecision, resume?: string) {
+function session(decision: SessionPermissionDecision, resume?: string, input?: unknown) {
   return new CodexAgentSession({
     executable: FAKE,
     env: process.env,
@@ -18,8 +18,9 @@ function session(decision: SessionPermissionDecision, resume?: string) {
     options: {
       cwd: "/tmp",
       permissions: { decide: async () => decision },
+      ...(input ? { input } : {}),
       ...(resume ? { resume } : {}),
-    },
+    } as never,
   });
 }
 
@@ -73,5 +74,79 @@ describe("CodexAgentSession", () => {
     await s.close();
     expect(s.id).toBe("th-old-7");
     expect(events[0]).toEqual({ type: "session", sessionId: "th-old-7" });
+  });
+
+  it("forwards questions and MCP elicitations and streams live plans", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const s = session("allow", undefined, {
+      respond: async (request: Record<string, unknown>) => {
+        requests.push(request);
+        return request.kind === "questions"
+          ? { action: "accept", values: { destination: ["Tokyo"] } }
+          : { action: "accept", values: { name: "Ruri" } };
+      },
+    });
+    const events = await collect(s.send("[interactive] ask me first"));
+    await s.close();
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({
+      provider: "codex",
+      kind: "questions",
+      message: "Where should we go?",
+      fields: [
+        {
+          id: "destination",
+          label: "Where should we go?",
+          type: "select",
+          required: true,
+          allowOther: true,
+          secret: false,
+        },
+      ],
+    });
+    expect(requests[1]).toMatchObject({
+      provider: "codex",
+      kind: "form",
+      source: "demo",
+      message: "Name this workspace",
+      fields: [{ id: "name", label: "Workspace name", type: "string", required: true }],
+    });
+    expect(events.find((event) => event.type === "plan")).toEqual({
+      type: "plan",
+      plan: {
+        explanation: "Answer before continuing",
+        entries: [
+          { content: "Collect preferences", status: "in_progress" },
+          { content: "Finish the task", status: "pending" },
+        ],
+      },
+    });
+    expect(events.filter((event) => event.type === "text").map((event) => (event as { text: string }).text).join(""))
+      .toContain('"destination":{"answers":["Tokyo"]}');
+    expect(events.filter((event) => event.type === "text").map((event) => (event as { text: string }).text).join(""))
+      .toContain('"content":{"name":"Ruri"}');
+  });
+
+  it("preserves the Codex model catalog's capability metadata", async () => {
+    const p = new CodexProvider({ path: FAKE, workDir: "/tmp/yagami-test-ws" });
+    await expect(p.listModels()).resolves.toEqual([
+      {
+        id: "gpt-test",
+        display_name: "GPT Test",
+        description: "A test model",
+        reasoning_efforts: [
+          { id: "medium", description: "Balanced" },
+          { id: "high", description: "Deeper" },
+        ],
+        default_reasoning_effort: "medium",
+        input_modalities: ["text", "image"],
+        supports_personality: true,
+        multi_agent: "v2",
+        service_tiers: [{ id: "priority", display_name: "Priority", description: "Lower latency" }],
+        default_service_tier: "priority",
+        is_default: true,
+      },
+    ]);
   });
 });

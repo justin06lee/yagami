@@ -1,12 +1,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
 import { AuthRequiredError, classifyProviderFailure, looksLikeAuthFailure, ProviderError } from "../errors.js";
+import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
 import type {
   AgentEvent,
   ProviderSession,
   ProviderSessionOptions,
   SessionPermissionDecision,
   SessionPermissionRequest,
+  SessionInputField,
+  SessionInputRequest,
+  SessionInputResponse,
+  SessionPlanStatus,
 } from "../provider.js";
 import type { ContentBlockParam, Usage } from "../types.js";
 import { writeTempImages } from "./codex.js";
@@ -219,6 +224,24 @@ export class CodexAgentSession implements ProviderSession {
         }
         break;
       }
+      case "turn/plan/updated": {
+        const steps = Array.isArray(params["plan"]) ? params["plan"] : [];
+        this.push({
+          type: "plan",
+          plan: {
+            ...(typeof params["explanation"] === "string" ? { explanation: params["explanation"] } : {}),
+            entries: steps.flatMap((value) => {
+              const step = value as Record<string, unknown>;
+              if (typeof step["step"] !== "string") return [];
+              return [{
+                content: step["step"],
+                status: codexPlanStatus(step["status"]),
+              }];
+            }),
+          },
+        });
+        break;
+      }
       case "turn/completed": {
         const turn = params["turn"] as { status?: string; error?: { message?: string } | null };
         const queue = this.queue;
@@ -411,11 +434,21 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "item/tool/requestUserInput": {
-        this.respond(id, { answers: {} });
+        const response = await this.input(codexQuestionRequest(this.threadId, params));
+        const values = response.action === "accept" ? response.values ?? {} : {};
+        this.respond(id, {
+          answers: Object.fromEntries(
+            Object.entries(values).map(([key, value]) => [
+              key,
+              { answers: (Array.isArray(value) ? value : [value]).map(String) },
+            ]),
+          ),
+        });
         break;
       }
       case "mcpServer/elicitation/request": {
-        this.respond(id, { action: "decline", content: null, _meta: null });
+        const response = await this.input(elicitationRequest("codex", this.threadId, params));
+        this.respond(id, { ...elicitationResponse(response), _meta: null });
         break;
       }
       default: {
@@ -425,6 +458,16 @@ export class CodexAgentSession implements ProviderSession {
         );
         break;
       }
+    }
+  }
+
+  private async input(request: SessionInputRequest): Promise<SessionInputResponse> {
+    const handler = this.config.options.input;
+    if (!handler) return declineInput();
+    try {
+      return await handler.respond(request);
+    } catch {
+      return { action: "cancel" };
     }
   }
 
@@ -476,4 +519,46 @@ export class CodexAgentSession implements ProviderSession {
     this.child?.kill("SIGTERM");
     this.child = undefined;
   }
+}
+
+function codexPlanStatus(value: unknown): SessionPlanStatus {
+  return value === "completed" ? "completed" : value === "inProgress" || value === "in_progress" ? "in_progress" : "pending";
+}
+
+function codexQuestionRequest(sessionId: string | undefined, raw: Record<string, unknown>): SessionInputRequest {
+  const questions = Array.isArray(raw["questions"]) ? raw["questions"] : [];
+  const fields: SessionInputField[] = questions.flatMap((value) => {
+    const question = value as Record<string, unknown>;
+    if (typeof question["id"] !== "string" || typeof question["question"] !== "string") return [];
+    const choices = Array.isArray(question["options"])
+      ? question["options"].flatMap((option) => {
+          const item = option as Record<string, unknown>;
+          if (typeof item["label"] !== "string") return [];
+          return [{
+            value: item["label"],
+            label: item["label"],
+            ...(typeof item["description"] === "string" ? { description: item["description"] } : {}),
+          }];
+        })
+      : [];
+    return [{
+      id: question["id"],
+      label: question["question"],
+      ...(typeof question["header"] === "string" ? { description: question["header"] } : {}),
+      type: choices.length > 0 ? "select" : "string",
+      required: true,
+      secret: question["isSecret"] === true,
+      allowOther: question["isOther"] === true,
+      ...(choices.length > 0 ? { options: choices } : {}),
+    }];
+  });
+  return {
+    provider: "codex",
+    ...(sessionId ? { sessionId } : {}),
+    kind: "questions",
+    message: fields.length === 1 ? fields[0]!.label : "Input requested",
+    fields,
+    blocking: raw["isBlocking"] !== false,
+    raw,
+  };
 }
