@@ -10,6 +10,7 @@ export const FULL_CAPS: ProviderCapabilities = {
   thinking: true,
   effort: true,
   streaming: "tokens",
+  serverTools: true,
 };
 
 export interface ReplyOptions {

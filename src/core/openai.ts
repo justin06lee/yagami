@@ -158,9 +158,10 @@ function messageText(content: ChatMessageParam["content"], role: string): string
 
 /**
  * Translate an OpenAI Chat Completions request into the Anthropic Messages
- * request the engine runs. Tool calling is rejected (yagami is
- * completions-only by design); knobs no CLI engine exposes are collected
- * into `extraIgnored` instead of failing the request.
+ * request the engine runs. Function calling is rejected — nothing here ever
+ * hands a tool call back to the caller. (Anthropic server tools, which run
+ * inside the engine, are available on the Anthropic dialect.) Knobs no CLI
+ * engine exposes are collected into `extraIgnored` instead of failing.
  */
 export function chatToMessagesRequest(body: ChatCompletionsRequest): TranslatedChatRequest {
   if (body == null || typeof body !== "object") {
@@ -170,7 +171,7 @@ export function chatToMessagesRequest(body: ChatCompletionsRequest): TranslatedC
     throw new ApiError(
       400,
       "invalid_request_error",
-      "yagami does not support `tools`/function calling: the backing engine runs as a pure completions endpoint and never executes or emits tool calls.",
+      "yagami does not support OpenAI function calling: the backing engine never emits tool calls for you to execute. Anthropic **server** tools (web_search, web_fetch) do run — request them through the Anthropic dialect at /v1/messages.",
     );
   }
   if (body.n != null && body.n !== 1) {

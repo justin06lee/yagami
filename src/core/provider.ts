@@ -14,6 +14,12 @@ export interface ProviderCapabilities {
   effort: boolean;
   /** Token-level deltas or whole chunks per message part. */
   streaming: "tokens" | "chunks";
+  /**
+   * Can run Anthropic server tools (web search/fetch) inside the turn. Still
+   * completions-only: results are folded into the reply, never emitted as
+   * `tool_use` blocks for the caller to execute.
+   */
+  serverTools: boolean;
 }
 
 /** One completion turn, already normalized by the engine. */
@@ -29,6 +35,8 @@ export interface TurnRequest {
   resume?: string;
   thinking?: ThinkingParam;
   effort?: string;
+  /** CLI tool names to enable for this turn (see `core/serverTools.ts`). */
+  serverTools?: string[];
   signal?: AbortSignal;
 }
 

@@ -74,6 +74,20 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"codex","messages":[{"role":"user","content":"ping"}]}'
 ```
 
+### Web search and fetch
+
+`/v1/messages` accepts Anthropic's **server tools**, so a client can ask the engine to go look something up before it answers:
+
+```sh
+curl http://127.0.0.1:8787/v1/messages \
+  -H "x-api-key: ygm_..." -H "content-type: application/json" \
+  -d '{"model":"sonnet","max_tokens":600,
+       "tools":[{"type":"web_search_20260209","name":"web_search"}],
+       "messages":[{"role":"user","content":"What is the current stable Rust version?"}]}'
+```
+
+Server tools run *inside* the engine — they map onto the CLI's own `WebSearch` and `WebFetch`, and the results are folded into the reply. Nothing changes about the endpoint's contract: it still never emits a `tool_use` block for you to execute. Every dated variant of a type works (`web_search_20250305`, `web_search_20260209`, …), `tool_choice` may be `auto` or `none`, and any other tool in the array is rejected — a custom tool would have to run on your side, and there is no round trip here to run it on. Only the claude provider serves them; asking codex or an ACP agent for them fails loudly rather than quietly answering without the lookup.
+
 One caveat for OpenAI-dialect apps: the `model` field still routes through yagami's providers — set it to a model your CLIs actually serve (`sonnet`, `codex:gpt-5.6-sol`, `opencode:…`), not whatever `gpt-*` id the app defaults to.
 
 ## Library mode
@@ -112,7 +126,7 @@ Every provider implements one small `Provider` contract (`run(turn)` → normali
 
 ### Building a UI on Claude Code
 
-`Yagami`/`YagamiEngine` are completions-only by design. To build an actual coding UI — tools, permissions, plan mode, a warm session across turns — use `AgentSession`, which wraps the full Claude Code agent with the lifecycle the interactive terminal gives you for free:
+`Yagami`/`YagamiEngine` are completions-only by design (server tools aside, they never hand you a tool call to run). To build an actual coding UI — tools, permissions, plan mode, a warm session across turns — use `AgentSession`, which wraps the full Claude Code agent with the lifecycle the interactive terminal gives you for free:
 
 ```ts
 import { AgentSession } from "@justin06lee/yagami";

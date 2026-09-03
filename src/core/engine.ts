@@ -247,6 +247,16 @@ export class YagamiEngine {
       promptText = `<system>\n${norm.system}\n</system>\n\n${promptText}`;
     }
 
+    if (norm.serverTools && !caps.serverTools) {
+      throw new ApiError(
+        400,
+        "invalid_request_error",
+        `provider "${provider.id}" cannot run server tools (${norm.serverTools.join(", ")}). ` +
+          `Answering without them would silently drop the lookup you asked for, so the ` +
+          `request is refused instead. Use the claude provider, or drop \`tools\`.`,
+      );
+    }
+
     const turn: TurnRequest = {
       prompt: promptText,
       ...(lastMedia.length > 0 ? { media: lastMedia } : {}),
@@ -255,6 +265,7 @@ export class YagamiEngine {
       ...(resume ? { resume } : {}),
       ...(req.thinking != null && caps.thinking ? { thinking: req.thinking } : {}),
       ...(typeof req.effort === "string" && caps.effort ? { effort: req.effort } : {}),
+      ...(norm.serverTools ? { serverTools: norm.serverTools } : {}),
     };
     const requestedModel = model
       ? provider.id === this.defaultProviderId
