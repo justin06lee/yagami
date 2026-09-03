@@ -331,3 +331,30 @@ describe("listModels", () => {
     expect((await engine.listModels()).map((m) => m.id)).toContain("codex:gpt-5");
   });
 });
+
+describe("server tools", () => {
+  const WEB_SEARCH = [{ type: "web_search_20260209", name: "web_search" }];
+
+  it("passes resolved server tools to a provider that supports them", async () => {
+    const claude = new FakeProvider("claude");
+    const engine = makeEngine([claude]);
+    await engine.complete({ model: "sonnet", messages: [USER("who won?")], tools: WEB_SEARCH });
+    expect(claude.calls[0]!.serverTools).toEqual(["WebSearch"]);
+  });
+
+  it("leaves serverTools unset when none were requested", async () => {
+    const claude = new FakeProvider("claude");
+    const engine = makeEngine([claude]);
+    await engine.complete({ model: "sonnet", messages: [USER("ping")] });
+    expect(claude.calls[0]!.serverTools).toBeUndefined();
+  });
+
+  it("refuses rather than silently answering without the lookup", async () => {
+    const codex = new FakeProvider("codex", { ...FULL_CAPS, serverTools: false });
+    const engine = makeEngine([codex]);
+    await expect(
+      engine.complete({ model: "codex", messages: [USER("who won?")], tools: WEB_SEARCH }),
+    ).rejects.toThrow(/cannot run server tools/);
+    expect(codex.calls).toHaveLength(0);
+  });
+});

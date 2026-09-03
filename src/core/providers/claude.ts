@@ -27,6 +27,30 @@ const DENY_ALL_TOOLS: CanUseTool = async (toolName) => ({
   interrupt: true,
 });
 
+/**
+ * Allow exactly the server tools this turn enabled, deny everything else.
+ * Belt and braces: `options.tools` already restricts what exists, but a
+ * completions endpoint should not depend on one gate.
+ */
+const allowOnly = (enabled: string[]): CanUseTool => {
+  const allowed = new Set(enabled);
+  return async (toolName, input) =>
+    allowed.has(toolName)
+      ? { behavior: "allow", updatedInput: input }
+      : {
+          behavior: "deny",
+          message: `yagami is a completions-only endpoint; tool "${toolName}" is disabled.`,
+          interrupt: true,
+        };
+};
+
+/**
+ * Turn cap once server tools are in play. A search-and-answer turn needs
+ * several round trips, but an unbounded loop on a completions endpoint is a
+ * cost bug, so it stays bounded.
+ */
+const SERVER_TOOL_MAX_TURNS = 24;
+
 export interface ClaudeProviderOptions {
   /** Path to the `claude` binary. Auto-resolved when omitted. */
   path?: string;
@@ -58,6 +82,7 @@ export class ClaudeProvider implements Provider {
     thinking: true,
     effort: true,
     streaming: "tokens",
+    serverTools: true,
   };
 
   private readonly configDir: string | undefined;
@@ -97,6 +122,11 @@ export class ClaudeProvider implements Provider {
     req.signal?.addEventListener("abort", onAbort, { once: true });
 
     const options: Options = { ...this.baseOptions(), abortController, includePartialMessages: true };
+    if (req.serverTools && req.serverTools.length > 0) {
+      options.tools = [...req.serverTools];
+      options.canUseTool = allowOnly(req.serverTools);
+      options.maxTurns = SERVER_TOOL_MAX_TURNS;
+    }
     if (req.model) options.model = req.model;
     if (req.system !== undefined) options.systemPrompt = req.system;
     if (req.resume) {
