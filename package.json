@@ -1,7 +1,7 @@
 {
   "name": "@justin06lee/yagami",
-  "version": "0.7.0",
-  "description": "Self-hosted Anthropic- and OpenAI-compatible API backed by your signed-in coding-agent CLIs, plus a zero-config library for driving them from your own apps — no API keys needed.",
+  "version": "0.8.0",
+  "description": "Self-hosted Anthropic- and OpenAI-compatible API backed by your signed-in coding-agent CLIs, plus a zero-config library for driving them from your own apps \u2014 no API keys needed.",
   "type": "module",
   "license": "MIT",
   "author": "justin06lee",
