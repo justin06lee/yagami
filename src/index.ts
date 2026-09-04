@@ -43,6 +43,11 @@ export {
   type StreamResultInfo,
   type EngineModel,
 } from "./core/engine.js";
+export type {
+  EngineReasoningEffort,
+  EngineServiceTier,
+  EngineInputModality,
+} from "./core/models.js";
 export { claudeCodeSession, type ClaudeSessionOptions } from "./core/session.js";
 export { AgentSession, startAgentSession, type AgentSessionOptions } from "./core/agentSession.js";
 export {
@@ -60,10 +65,20 @@ export type {
   AgentEvent,
   ProviderSession,
   ProviderSessionOptions,
+  ProviderSessionCapabilities,
   SessionProvider,
   SessionPermissionDecision,
   SessionPermissionRequest,
   SessionPermissionHandler,
+  SessionInputValue,
+  SessionInputOption,
+  SessionInputField,
+  SessionInputRequest,
+  SessionInputResponse,
+  SessionInputHandler,
+  SessionPlanStatus,
+  SessionPlanEntry,
+  SessionPlan,
 } from "./core/provider.js";
 export { ClaudeProvider, type ClaudeProviderOptions } from "./core/providers/claude.js";
 export { CodexProvider, type CodexProviderOptions, type CodexSandboxMode } from "./core/providers/codex.js";

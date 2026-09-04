@@ -116,11 +116,30 @@ describe("ClaudeProvider.run", () => {
 describe("ClaudeProvider.listModels", () => {
   it("maps supportedModels", async () => {
     queryMock.mockImplementation(() => ({
-      supportedModels: async () => [{ value: "sonnet", displayName: "Sonnet", description: "fast", resolvedModel: "claude-sonnet-5" }],
+      supportedModels: async () => [{
+        value: "sonnet",
+        displayName: "Sonnet",
+        description: "fast",
+        resolvedModel: "claude-sonnet-5",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "high"],
+        supportsAdaptiveThinking: true,
+        supportsFastMode: true,
+        supportsAutoMode: true,
+      }],
     }));
     const p = new ClaudeProvider({ path: FAKE_CLAUDE });
     expect(await p.listModels()).toEqual([
-      { id: "sonnet", display_name: "Sonnet", description: "fast", resolved_model: "claude-sonnet-5" },
+      {
+        id: "sonnet",
+        display_name: "Sonnet",
+        description: "fast",
+        resolved_model: "claude-sonnet-5",
+        reasoning_efforts: [{ id: "low" }, { id: "high" }],
+        supports_adaptive_thinking: true,
+        supports_fast_mode: true,
+        supports_auto_mode: true,
+      },
     ]);
   });
 });

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { resolveServerTools } from "./serverTools.js";
 import {
   ApiError,
   type MessagesRequest,
@@ -22,6 +23,8 @@ export interface NormalizedRequest {
   prefill?: string;
   /** Accepted-but-ignored request params, surfaced via a response header. */
   ignored: string[];
+  /** Anthropic server tools the caller enabled, as CLI tool names. */
+  serverTools?: string[];
 }
 
 /** Params the engine cannot honor but that shouldn't fail the request. */
@@ -98,13 +101,7 @@ export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
   if (req == null || typeof req !== "object") {
     throw new ApiError(400, "invalid_request_error", "request body must be a JSON object");
   }
-  if (req.tools != null || req.tool_choice != null) {
-    throw new ApiError(
-      400,
-      "invalid_request_error",
-      "yagami does not support `tools`/`tool_choice`: the backing engine runs as a pure completions endpoint and never executes or emits tool calls.",
-    );
-  }
+  const serverTools = resolveServerTools(req.tools, req.tool_choice);
   if (!Array.isArray(req.messages) || req.messages.length === 0) {
     throw new ApiError(400, "invalid_request_error", "`messages` must be a non-empty array");
   }
@@ -147,6 +144,7 @@ export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
     lastUserText: last.text,
     ...(prefill !== undefined ? { prefill } : {}),
     ignored: [...ignored],
+    ...(serverTools ? { serverTools } : {}),
   };
 }
 

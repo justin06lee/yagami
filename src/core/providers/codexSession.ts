@@ -1,12 +1,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
 import { AuthRequiredError, classifyProviderFailure, looksLikeAuthFailure, ProviderError } from "../errors.js";
+import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
 import type {
   AgentEvent,
   ProviderSession,
   ProviderSessionOptions,
   SessionPermissionDecision,
   SessionPermissionRequest,
+  SessionInputField,
+  SessionInputRequest,
+  SessionInputResponse,
+  SessionPlanStatus,
 } from "../provider.js";
 import type { ContentBlockParam, Usage } from "../types.js";
 import { writeTempImages } from "./codex.js";
@@ -152,6 +157,16 @@ export class CodexAgentSession implements ProviderSession {
       ...(native.config ? { config: native.config } : {}),
       ...(options.systemPrompt ? { developerInstructions: options.systemPrompt } : {}),
     };
+    if (options.resume && (options.fork || options.forkAt)) {
+      const forked = await this.request("thread/fork", {
+        threadId: options.resume,
+        ...(options.forkAt ? { lastTurnId: options.forkAt } : {}),
+        ...overrides,
+      });
+      this.threadId = (forked["thread"] as { id?: string } | undefined)?.id;
+      if (!this.threadId) throw new ProviderError("codex", "thread/fork returned no thread id");
+      return;
+    }
     if (options.resume) {
       try {
         const resumed = await this.request("thread/resume", { threadId: options.resume, ...overrides });
@@ -217,6 +232,24 @@ export class CodexAgentSession implements ProviderSession {
             cache_creation_input_tokens: last["cacheWriteInputTokens"] ?? 0,
           };
         }
+        break;
+      }
+      case "turn/plan/updated": {
+        const steps = Array.isArray(params["plan"]) ? params["plan"] : [];
+        this.push({
+          type: "plan",
+          plan: {
+            ...(typeof params["explanation"] === "string" ? { explanation: params["explanation"] } : {}),
+            entries: steps.flatMap((value) => {
+              const step = value as Record<string, unknown>;
+              if (typeof step["step"] !== "string") return [];
+              return [{
+                content: step["step"],
+                status: codexPlanStatus(step["status"]),
+              }];
+            }),
+          },
+        });
         break;
       }
       case "turn/completed": {
@@ -317,6 +350,53 @@ export class CodexAgentSession implements ProviderSession {
         });
         break;
       }
+      case "dynamicToolCall": {
+        const failed = item["status"] === "failed" || item["success"] === false;
+        const namespace = typeof item["namespace"] === "string" ? `${item["namespace"]}.` : "";
+        this.push({
+          type: "tool_call",
+          id,
+          name: `${namespace}${String(item["tool"] ?? "tool")}`,
+          status: completed ? (failed ? "failed" : "completed") : "started",
+          kind: "other",
+          input: item["arguments"],
+          ...(completed ? { output: item["contentItems"] } : {}),
+        });
+        break;
+      }
+      case "collabAgentToolCall": {
+        const status = item["status"];
+        const failed = status === "failed" || status === "interrupted";
+        const tool = collabToolName(item["tool"]);
+        this.push({
+          type: "tool_call",
+          id,
+          name: tool,
+          status: completed ? (failed ? "failed" : "completed") : "started",
+          title: typeof item["prompt"] === "string" && item["prompt"] ? item["prompt"] : tool,
+          kind: "other",
+          input: {
+            prompt: item["prompt"],
+            model: item["model"],
+            effort: item["reasoningEffort"],
+            receiverThreadIds: item["receiverThreadIds"],
+          },
+          ...(completed ? { output: item["agentsStates"] } : {}),
+        });
+        break;
+      }
+      case "imageView": {
+        this.push({
+          type: "tool_call",
+          id,
+          name: "read_file",
+          status: completed ? "completed" : "started",
+          title: String(item["path"] ?? "image"),
+          kind: "read",
+          input: { path: item["path"] },
+        });
+        break;
+      }
       case "userMessage":
       case "plan":
         break;
@@ -411,11 +491,25 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "item/tool/requestUserInput": {
-        this.respond(id, { answers: {} });
+        const response = await this.input(codexQuestionRequest(this.threadId, params));
+        const values = response.action === "accept" ? response.values ?? {} : {};
+        this.respond(id, {
+          answers: Object.fromEntries(
+            Object.entries(values).map(([key, value]) => [
+              key,
+              { answers: (Array.isArray(value) ? value : [value]).map(String) },
+            ]),
+          ),
+        });
         break;
       }
       case "mcpServer/elicitation/request": {
-        this.respond(id, { action: "decline", content: null, _meta: null });
+        const response = await this.input(elicitationRequest("codex", this.threadId, params));
+        this.respond(id, { ...elicitationResponse(response), _meta: null });
+        break;
+      }
+      case "currentTime/read": {
+        this.respond(id, { currentTimeAt: Math.floor(Date.now() / 1000) });
         break;
       }
       default: {
@@ -425,6 +519,16 @@ export class CodexAgentSession implements ProviderSession {
         );
         break;
       }
+    }
+  }
+
+  private async input(request: SessionInputRequest): Promise<SessionInputResponse> {
+    const handler = this.config.options.input;
+    if (!handler) return declineInput();
+    try {
+      return await handler.respond(request);
+    } catch {
+      return { action: "cancel" };
     }
   }
 
@@ -457,6 +561,7 @@ export class CodexAgentSession implements ProviderSession {
       });
       this.currentTurnId = (result["turn"] as { id?: string } | undefined)?.id;
       yield { type: "session", sessionId: this.threadId! };
+      if (this.currentTurnId) yield { type: "turn", id: this.currentTurnId };
       for await (const event of queue) yield event;
     } finally {
       cleanup();
@@ -476,4 +581,60 @@ export class CodexAgentSession implements ProviderSession {
     this.child?.kill("SIGTERM");
     this.child = undefined;
   }
+}
+
+function collabToolName(value: unknown): string {
+  const names: Record<string, string> = {
+    spawnAgent: "spawn_agent",
+    sendInput: "send_input",
+    resumeAgent: "resume_agent",
+    closeAgent: "close_agent",
+    sendMessage: "send_message",
+    followupTask: "followup_task",
+    interruptAgent: "interrupt_agent",
+    listAgents: "list_agents",
+  };
+  return names[String(value)] ?? String(value ?? "agent");
+}
+
+function codexPlanStatus(value: unknown): SessionPlanStatus {
+  return value === "completed" ? "completed" : value === "inProgress" || value === "in_progress" ? "in_progress" : "pending";
+}
+
+function codexQuestionRequest(sessionId: string | undefined, raw: Record<string, unknown>): SessionInputRequest {
+  const questions = Array.isArray(raw["questions"]) ? raw["questions"] : [];
+  const fields: SessionInputField[] = questions.flatMap((value) => {
+    const question = value as Record<string, unknown>;
+    if (typeof question["id"] !== "string" || typeof question["question"] !== "string") return [];
+    const choices = Array.isArray(question["options"])
+      ? question["options"].flatMap((option) => {
+          const item = option as Record<string, unknown>;
+          if (typeof item["label"] !== "string") return [];
+          return [{
+            value: item["label"],
+            label: item["label"],
+            ...(typeof item["description"] === "string" ? { description: item["description"] } : {}),
+          }];
+        })
+      : [];
+    return [{
+      id: question["id"],
+      label: question["question"],
+      ...(typeof question["header"] === "string" ? { description: question["header"] } : {}),
+      type: choices.length > 0 ? "select" : "string",
+      required: true,
+      secret: question["isSecret"] === true,
+      allowOther: question["isOther"] === true,
+      ...(choices.length > 0 ? { options: choices } : {}),
+    }];
+  });
+  return {
+    provider: "codex",
+    ...(sessionId ? { sessionId } : {}),
+    kind: "questions",
+    message: fields.length === 1 ? fields[0]!.label : "Input requested",
+    fields,
+    blocking: raw["isBlocking"] !== false,
+    raw,
+  };
 }

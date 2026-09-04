@@ -14,6 +14,12 @@ export interface ProviderCapabilities {
   effort: boolean;
   /** Token-level deltas or whole chunks per message part. */
   streaming: "tokens" | "chunks";
+  /**
+   * Can run Anthropic server tools (web search/fetch) inside the turn. Still
+   * completions-only: results are folded into the reply, never emitted as
+   * `tool_use` blocks for the caller to execute.
+   */
+  serverTools: boolean;
 }
 
 /** One completion turn, already normalized by the engine. */
@@ -29,6 +35,8 @@ export interface TurnRequest {
   resume?: string;
   thinking?: ThinkingParam;
   effort?: string;
+  /** CLI tool names to enable for this turn (see `core/serverTools.ts`). */
+  serverTools?: string[];
   signal?: AbortSignal;
 }
 
@@ -101,6 +109,70 @@ export function qualifiedModel(providerId: string, model: string): string {
 
 export type SessionPermissionDecision = "allow" | "allow_always" | "deny" | "deny_always";
 
+export type SessionInputValue = string | number | boolean | string[];
+
+export interface SessionInputOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+/** One renderable field from a harness question or MCP elicitation. */
+export interface SessionInputField {
+  id: string;
+  label: string;
+  description?: string;
+  type: "string" | "number" | "integer" | "boolean" | "select" | "multiselect";
+  required: boolean;
+  secret?: boolean;
+  allowOther?: boolean;
+  options?: SessionInputOption[];
+  format?: string;
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  default?: SessionInputValue;
+}
+
+/** A provider-neutral blocking request for human input. */
+export interface SessionInputRequest {
+  provider: string;
+  sessionId?: string;
+  kind: "questions" | "form" | "url";
+  message: string;
+  source?: string;
+  fields?: SessionInputField[];
+  url?: string;
+  blocking?: boolean;
+  raw?: unknown;
+}
+
+export type SessionInputResponse =
+  | { action: "accept"; values?: Record<string, SessionInputValue> }
+  | { action: "decline" | "cancel" };
+
+export interface SessionInputHandler {
+  respond(req: SessionInputRequest, signal?: AbortSignal): Promise<SessionInputResponse>;
+}
+
+export type SessionPlanStatus = "pending" | "in_progress" | "completed";
+
+export interface SessionPlanEntry {
+  content: string;
+  status: SessionPlanStatus;
+  priority?: "high" | "medium" | "low";
+}
+
+export interface SessionPlan {
+  id?: string;
+  explanation?: string;
+  entries?: SessionPlanEntry[];
+  markdown?: string;
+  uri?: string;
+  removed?: boolean;
+}
+
 /** A harness asking the host whether a tool may run. */
 export interface SessionPermissionRequest {
   provider: string;
@@ -121,6 +193,8 @@ export interface SessionPermissionHandler {
 
 export type AgentEvent =
   | { type: "session"; sessionId: string }
+  /** Provider-native turn id, used by hosts to fork an exact exchange. */
+  | { type: "turn"; id: string }
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
   | {
@@ -134,6 +208,7 @@ export type AgentEvent =
       output?: unknown;
     }
   | { type: "permission"; request: SessionPermissionRequest; decision: SessionPermissionDecision }
+  | { type: "plan"; plan: SessionPlan }
   | { type: "done"; usage?: Usage; costUsd?: number; stopReason?: string }
   /** Anything the harness said that has no normalized shape. */
   | { type: "raw"; provider: string; payload: unknown };
@@ -144,6 +219,10 @@ export interface ProviderSessionOptions {
   model?: string;
   /** Provider session id to continue. */
   resume?: string;
+  /** Fork the resumed session instead of continuing it in place. */
+  fork?: boolean;
+  /** Fork the resumed session through this provider-native turn, inclusive. */
+  forkAt?: string;
   /**
    * "terminal" loads the same settings the interactive CLI would — user and
    * project config, CLAUDE.md, skills, hooks, MCP servers. "isolated" loads
@@ -151,6 +230,8 @@ export interface ProviderSessionOptions {
    */
   parity?: "terminal" | "isolated";
   permissions: SessionPermissionHandler;
+  /** Blocking questions and MCP/ACP elicitations. Omitted means decline safely. */
+  input?: SessionInputHandler;
   appName?: string;
   effort?: string;
   thinking?: ThinkingParam;
@@ -158,6 +239,11 @@ export interface ProviderSessionOptions {
   systemPrompt?: string;
   /** Provider-specific escape hatch (Claude: Agent SDK Options; Codex: { sandbox }; ACP: { mode }). */
   native?: Record<string, unknown>;
+}
+
+export interface ProviderSessionCapabilities {
+  /** Can fork a resumed conversation, optionally at an exact reported turn. */
+  fork: boolean;
 }
 
 /** One live conversation with a harness: send turns, get normalized events. */
@@ -172,6 +258,7 @@ export interface ProviderSession {
 
 /** Providers that can host agentic sessions implement this too. */
 export interface SessionProvider extends Provider {
+  readonly sessionCapabilities: ProviderSessionCapabilities;
   openSession(options: ProviderSessionOptions): ProviderSession;
 }
 

@@ -8,6 +8,8 @@ import {
   ClientSideConnection,
   ndJsonStream,
   PROTOCOL_VERSION,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type InitializeResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
@@ -17,6 +19,7 @@ import {
 import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, looksLikeAuthFailure, AuthRequiredError, ProviderError } from "../errors.js";
+import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
 import type { EngineModel } from "../models.js";
 import type {
   AgentEvent,
@@ -26,6 +29,8 @@ import type {
   ProviderSessionOptions,
   SessionPermissionDecision,
   SessionPermissionRequest,
+  SessionPlan,
+  SessionPlanEntry,
   SessionProvider,
   TurnEvent,
   TurnRequest,
@@ -37,6 +42,7 @@ import { VERSION } from "../../version.js";
 export interface AcpHandlers {
   onUpdate?: (n: SessionNotification) => void;
   onPermission?: (p: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
+  onInput?: (p: CreateElicitationRequest) => Promise<CreateElicitationResponse>;
 }
 
 /** A live ACP agent process plus its negotiated connection. */
@@ -95,7 +101,9 @@ export class AcpProvider implements SessionProvider {
     thinking: false,
     effort: false,
     streaming: "tokens",
+    serverTools: false,
   };
+  readonly sessionCapabilities = { fork: false } as const;
 
   private readonly args: string[];
   private readonly env: NodeJS.ProcessEnv;
@@ -145,6 +153,9 @@ export class AcpProvider implements SessionProvider {
       const agent = new ClientSideConnection(
         () => ({
           requestPermission: (p) => (handlers.onPermission ? handlers.onPermission(p) : rejectOption(p)),
+          unstable_createElicitation: (p) =>
+            handlers.onInput ? handlers.onInput(p) : Promise.resolve({ action: "decline" }),
+          unstable_completeElicitation: () => {},
           sessionUpdate: (n) => {
             handlers.onUpdate?.(n);
           },
@@ -166,7 +177,13 @@ export class AcpProvider implements SessionProvider {
         .initialize({
           protocolVersion: PROTOCOL_VERSION,
           clientInfo: { name: this.appName, version: VERSION },
-          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+            session: { configOptions: { boolean: {} } },
+            plan: {},
+            elicitation: { form: {}, url: {} },
+          },
         })
         .then((init) => {
           if (settled) return;
@@ -238,6 +255,7 @@ export class AcpProvider implements SessionProvider {
         await conn.agent.setSessionMode({ sessionId, modeId: plan.id }).catch(() => {});
       }
       if (req.model) await this.selectModel(conn, sessionId, configOptions, req.model);
+      if (req.effort) await this.selectEffort(conn, sessionId, configOptions, req.effort);
 
       const sid = sessionId;
       conn.setHandlers({
@@ -290,6 +308,7 @@ export class AcpProvider implements SessionProvider {
       connect: (cwd) => this.connectImpl(cwd),
       classify: (err, ctx) => this.classify(err, ctx),
       selectModel: (conn, sessionId, configOptions, model) => this.selectModel(conn, sessionId, configOptions, model),
+      selectEffort: (conn, sessionId, configOptions, effort) => this.selectEffort(conn, sessionId, configOptions, effort),
       options,
     });
   }
@@ -311,6 +330,24 @@ export class AcpProvider implements SessionProvider {
     });
   }
 
+  private async selectEffort(
+    conn: AcpConnection,
+    sessionId: string,
+    configOptions: SessionConfigOption[] | null | undefined,
+    effort: string,
+  ): Promise<void> {
+    const option = configOptions?.find(
+      (candidate) =>
+        candidate.category === "thought_level" ||
+        /^(?:thought[_-]?level|reasoning[_-]?effort|effort)$/i.test(candidate.id),
+    );
+    if (!option || option.type !== "select" || option.currentValue === effort) return;
+    if (!flattenSelectOptions(option).some((candidate) => candidate.value === effort)) return;
+    await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value: effort }).catch((err) => {
+      throw this.classify(err);
+    });
+  }
+
   async listModels(): Promise<EngineModel[]> {
     const conn = await this.connectImpl(this.workDir);
     try {
@@ -321,10 +358,24 @@ export class AcpProvider implements SessionProvider {
         created.configOptions?.find((o) => o.id === this.modelConfigId) ??
         created.configOptions?.find((o) => o.category === "model");
       if (!option || option.type !== "select") return [];
+      const effortOption = created.configOptions?.find(
+        (candidate) =>
+          candidate.type === "select" &&
+          (candidate.category === "thought_level" ||
+            /^(?:thought[_-]?level|reasoning[_-]?effort|effort)$/i.test(candidate.id)),
+      );
+      const efforts = effortOption?.type === "select"
+        ? flattenSelectOptions(effortOption).map((entry) => ({
+            id: entry.value,
+            ...(entry.description ? { description: entry.description } : {}),
+          }))
+        : [];
       return flattenSelectOptions(option).map((o) => ({
         id: o.value,
         display_name: o.name,
         ...(o.description ? { description: o.description } : {}),
+        ...(efforts.length > 0 ? { reasoning_efforts: efforts } : {}),
+        ...(effortOption?.type === "select" ? { default_reasoning_effort: effortOption.currentValue } : {}),
       }));
     } finally {
       conn.close();
@@ -371,6 +422,12 @@ interface AcpSessionConfig {
     sessionId: string,
     configOptions: SessionConfigOption[] | null | undefined,
     model: string,
+  ) => Promise<void>;
+  selectEffort: (
+    conn: AcpConnection,
+    sessionId: string,
+    configOptions: SessionConfigOption[] | null | undefined,
+    effort: string,
   ) => Promise<void>;
   options: ProviderSessionOptions;
 }
@@ -426,8 +483,10 @@ class AcpAgentSession implements ProviderSession {
     const mode = (options.native as { mode?: string } | undefined)?.mode;
     if (mode) await conn.agent.setSessionMode({ sessionId, modeId: mode }).catch(() => {});
     if (options.model) await this.cfg.selectModel(conn, sessionId, configOptions, options.model);
+    if (options.effort) await this.cfg.selectEffort(conn, sessionId, configOptions, options.effort);
     conn.setHandlers({
       onPermission: (p) => this.onPermission(p),
+      onInput: (p) => this.onInput(p),
       onUpdate: (n) => this.onUpdate(n),
     });
   }
@@ -463,6 +522,24 @@ class AcpAgentSession implements ProviderSession {
     return rejectOption(p);
   }
 
+  private async onInput(p: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+    const request = elicitationRequest(
+      this.provider,
+      this.sessionId,
+      p as unknown as Record<string, unknown>,
+    );
+    const handler = this.cfg.options.input;
+    let response = declineInput();
+    if (handler) {
+      try {
+        response = await handler.respond(request);
+      } catch {
+        response = { action: "cancel" };
+      }
+    }
+    return elicitationResponse(response) as CreateElicitationResponse;
+  }
+
   private onUpdate(n: SessionNotification): void {
     if (n.sessionId !== this.sessionId) return;
     const u = n.update;
@@ -472,6 +549,23 @@ class AcpAgentSession implements ProviderSession {
         break;
       case "agent_thought_chunk":
         if (u.content.type === "text") this.queue?.push({ type: "thinking", text: u.content.text });
+        break;
+      case "plan":
+        this.queue?.push({ type: "plan", plan: acpPlan(u as unknown as Record<string, unknown>) });
+        break;
+      case "plan_update":
+        this.queue?.push({ type: "plan", plan: acpPlan((u as unknown as { plan?: Record<string, unknown> }).plan ?? {}) });
+        break;
+      case "plan_removed":
+        this.queue?.push({
+          type: "plan",
+          plan: {
+            ...(typeof (u as unknown as { planId?: unknown }).planId === "string"
+              ? { id: (u as unknown as { planId: string }).planId }
+              : {}),
+            removed: true,
+          },
+        });
         break;
       case "tool_call": {
         const t = u as { toolCallId: string; title?: string; kind?: string; rawInput?: unknown };
@@ -558,6 +652,34 @@ class AcpAgentSession implements ProviderSession {
     this.conn?.close();
     this.conn = undefined;
   }
+}
+
+function acpPlan(raw: Record<string, unknown>): SessionPlan {
+  const entries = Array.isArray(raw["entries"])
+    ? raw["entries"].flatMap((value) => {
+        const entry = value as Record<string, unknown>;
+        if (typeof entry["content"] !== "string") return [];
+        const item: SessionPlanEntry = {
+          content: entry["content"],
+          status:
+            entry["status"] === "completed"
+              ? "completed"
+              : entry["status"] === "in_progress"
+                ? "in_progress"
+                : "pending",
+          ...(["high", "medium", "low"].includes(String(entry["priority"]))
+            ? { priority: entry["priority"] as SessionPlanEntry["priority"] }
+            : {}),
+        };
+        return [item];
+      })
+    : undefined;
+  return {
+    ...(typeof raw["planId"] === "string" ? { id: raw["planId"] } : {}),
+    ...(entries ? { entries } : {}),
+    ...(typeof raw["content"] === "string" ? { markdown: raw["content"] } : {}),
+    ...(typeof raw["uri"] === "string" ? { uri: raw["uri"] } : {}),
+  };
 }
 
 function supportsResume(init: InitializeResponse): boolean {

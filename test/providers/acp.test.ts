@@ -27,6 +27,17 @@ function fakeConnection(opts: FakeOptions = {}) {
         { value: "b", name: "Model B" },
       ],
     },
+    {
+      id: "thought_level",
+      name: "Reasoning",
+      category: "thought_level",
+      type: "select",
+      currentValue: "medium",
+      options: [
+        { value: "medium", name: "Medium", description: "Balanced" },
+        { value: "high", name: "High", description: "Deeper" },
+      ],
+    },
   ];
   const modes = opts.modes === false ? null : { currentModeId: "build", availableModes: [{ id: "build" }, { id: "plan" }] };
   const agent = {
@@ -129,8 +140,24 @@ describe("AcpProvider.run", () => {
   it("lists models from the session's model option", async () => {
     const fake = fakeConnection();
     expect(await provider(fake).listModels()).toEqual([
-      { id: "a", display_name: "Model A" },
-      { id: "b", display_name: "Model B" },
+      {
+        id: "a",
+        display_name: "Model A",
+        reasoning_efforts: [
+          { id: "medium", description: "Balanced" },
+          { id: "high", description: "Deeper" },
+        ],
+        default_reasoning_effort: "medium",
+      },
+      {
+        id: "b",
+        display_name: "Model B",
+        reasoning_efforts: [
+          { id: "medium", description: "Balanced" },
+          { id: "high", description: "Deeper" },
+        ],
+        default_reasoning_effort: "medium",
+      },
     ]);
     expect(fake.closed).toHaveBeenCalled();
   });
@@ -155,7 +182,7 @@ describe("rejectOption", () => {
 
 import { isSessionProvider, type SessionPermissionDecision } from "../../src/core/provider.js";
 
-function sessionFake(opts: { permissionDecision?: SessionPermissionDecision } = {}) {
+function sessionFake(opts: { permissionDecision?: SessionPermissionDecision; interactive?: boolean } = {}) {
   let handlers: AcpHandlers = {};
   const calls: Record<string, unknown[]> = { setSessionMode: [], cancel: [], newSession: [], resumeSession: [] };
   const agent = {
@@ -176,6 +203,28 @@ function sessionFake(opts: { permissionDecision?: SessionPermissionDecision } = 
     },
     prompt: async () => {
       const push = (update: unknown) => handlers.onUpdate?.({ sessionId: "ses-9", update } as never);
+      if (opts.interactive) {
+        push({
+          sessionUpdate: "plan",
+          entries: [
+            { content: "Ask for a name", priority: "high", status: "in_progress" },
+            { content: "Continue", priority: "medium", status: "pending" },
+          ],
+        });
+        const answer = await (handlers as AcpHandlers & {
+          onInput?: (request: unknown) => Promise<unknown>;
+        }).onInput?.({
+          sessionId: "ses-9",
+          mode: "form",
+          message: "Name the workspace",
+          requestedSchema: {
+            type: "object",
+            properties: { name: { type: "string", title: "Workspace name" } },
+            required: ["name"],
+          },
+        });
+        push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(answer) } });
+      }
       push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "wor" } });
       push({ sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Read README.md", kind: "read", rawInput: { path: "README.md" } });
       const answer = await (handlers.onPermission
@@ -255,5 +304,40 @@ describe("AcpProvider.openSession", () => {
     await s.interrupt();
     expect(fake.calls["cancel"]).toEqual([{ sessionId: "ses-old" }]);
     await s.close();
+  });
+
+  it("forwards ACP elicitations and plan updates through the generic session contract", async () => {
+    const fake = sessionFake({ interactive: true });
+    const requests: Array<Record<string, unknown>> = [];
+    const s = provider(fake).openSession({
+      cwd: "/tmp/proj",
+      permissions: { decide: async () => "allow" },
+      input: {
+        respond: async (request: Record<string, unknown>) => {
+          requests.push(request);
+          return { action: "accept", values: { name: "Ruri" } };
+        },
+      },
+    } as never);
+    const events = await collect(s.send("work"));
+    await s.close();
+
+    expect(requests[0]).toMatchObject({
+      provider: "fake",
+      kind: "form",
+      message: "Name the workspace",
+      fields: [{ id: "name", label: "Workspace name", type: "string", required: true }],
+    });
+    expect(events.find((event) => event.type === "plan")).toEqual({
+      type: "plan",
+      plan: {
+        entries: [
+          { content: "Ask for a name", priority: "high", status: "in_progress" },
+          { content: "Continue", priority: "medium", status: "pending" },
+        ],
+      },
+    });
+    expect(events.filter((event) => event.type === "text").map((event) => (event as { text: string }).text).join(""))
+      .toContain('"content":{"name":"Ruri"}');
   });
 });

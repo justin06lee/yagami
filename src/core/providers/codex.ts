@@ -56,7 +56,9 @@ export class CodexProvider implements SessionProvider {
     thinking: false,
     effort: true,
     streaming: "chunks",
+    serverTools: false,
   };
+  readonly sessionCapabilities = { fork: true } as const;
 
   private readonly workDir: string;
   private readonly sandbox: CodexSandboxMode;
@@ -189,11 +191,48 @@ export class CodexProvider implements SessionProvider {
           }
           const models = (msg.result?.data ?? [])
             .filter((m) => m["hidden"] !== true)
-            .map((m) => ({
-              id: String(m["id"] ?? m["model"]),
-              display_name: String(m["displayName"] ?? m["id"] ?? m["model"]),
-              ...(typeof m["description"] === "string" ? { description: m["description"] as string } : {}),
-            }));
+            .map((m) => {
+              const efforts = Array.isArray(m["supportedReasoningEfforts"])
+                ? (m["supportedReasoningEfforts"] as Array<Record<string, unknown>>).flatMap((entry) =>
+                    typeof entry["reasoningEffort"] === "string"
+                      ? [{
+                          id: entry["reasoningEffort"],
+                          ...(typeof entry["description"] === "string" ? { description: entry["description"] } : {}),
+                        }]
+                      : [],
+                  )
+                : [];
+              const tiers = Array.isArray(m["serviceTiers"])
+                ? (m["serviceTiers"] as Array<Record<string, unknown>>).flatMap((entry) =>
+                    typeof entry["id"] === "string"
+                      ? [{
+                          id: entry["id"],
+                          display_name: typeof entry["name"] === "string" ? entry["name"] : entry["id"],
+                          ...(typeof entry["description"] === "string" ? { description: entry["description"] } : {}),
+                        }]
+                      : [],
+                  )
+                : [];
+              return {
+                id: String(m["id"] ?? m["model"]),
+                display_name: String(m["displayName"] ?? m["id"] ?? m["model"]),
+                ...(typeof m["description"] === "string" ? { description: m["description"] as string } : {}),
+                ...(efforts.length > 0 ? { reasoning_efforts: efforts } : {}),
+                ...(typeof m["defaultReasoningEffort"] === "string"
+                  ? { default_reasoning_effort: m["defaultReasoningEffort"] }
+                  : {}),
+                ...(Array.isArray(m["inputModalities"])
+                  ? { input_modalities: m["inputModalities"].filter((value): value is string => typeof value === "string") }
+                  : {}),
+                ...(m["supportsPersonality"] === true ? { supports_personality: true } : {}),
+                ...(typeof m["multiAgentVersion"] === "string" ? { multi_agent: m["multiAgentVersion"] } : {}),
+                ...(tiers.length > 0 ? { service_tiers: tiers } : {}),
+                ...(typeof m["defaultServiceTier"] === "string"
+                  ? { default_service_tier: m["defaultServiceTier"] }
+                  : {}),
+                ...(m["isDefault"] === true ? { is_default: true } : {}),
+              };
+            });
           finish(() => resolve(models));
         }
       });
