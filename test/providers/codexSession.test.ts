@@ -161,4 +161,76 @@ describe("CodexAgentSession", () => {
       },
     ]);
   });
+  it("streams reasoning deltas without repeating the completed summary", async () => {
+    const s = session("allow");
+    try {
+      const events = await collect(s.send("[reasoning] inspect the files"));
+      expect(events.filter((event) => event.type === "thinking").map((event) => event.text))
+        .toEqual(["Checking ", "the files", " carefully"]);
+    } finally { await s.close(); }
+  });
+
+  it("does not silently replace an unavailable resumed conversation", async () => {
+    const s = session("allow", "th-unavailable");
+    try {
+      await expect(collect(s.send("continue"))).rejects.toThrow("service unavailable");
+      expect(s.id).toBeUndefined();
+    } finally { await s.close(); }
+  });
+
+  it("rejects concurrent sends even while the thread is opening", async () => {
+    const s = session("allow");
+    try {
+      const first = collect(s.send("first"));
+      await expect(collect(s.send("second"))).rejects.toThrow("already running");
+      expect((await first).at(-1)?.type).toBe("done");
+    } finally { await s.close(); }
+  });
+
+  it("cancels an input handler when the turn is interrupted", async () => {
+    let inputSignal: AbortSignal | undefined;
+    let ready!: () => void;
+    const asked = new Promise<void>((resolve) => { ready = resolve; });
+    const s = session("allow", undefined, {
+      respond: (_request: unknown, signal?: AbortSignal) => {
+        inputSignal = signal;
+        ready();
+        return new Promise((resolve) => signal?.addEventListener("abort", () => resolve({ action: "cancel" }), { once: true }));
+      },
+    });
+    try {
+      const running = collect(s.send("[interactive] wait for me"));
+      await asked;
+      await s.interrupt();
+      expect(inputSignal?.aborted).toBe(true);
+      expect((await running).at(-1)).toMatchObject({ type: "done", stopReason: "interrupted" });
+    } finally { await s.close(); }
+  });
+
+  it("surfaces the authoritative proposed plan item", async () => {
+    const s = session("allow");
+    try {
+      const events = await collect(s.send("[plan] plan the change"));
+      expect(events.find((event) => event.type === "plan"))
+        .toEqual({ type: "plan", plan: { id: "plan-1", markdown: "Inspect, implement, verify." } });
+    } finally { await s.close(); }
+  });
+
+  it("dismisses an input request resolved by the server", async () => {
+    let cancelled = false;
+    const s = session("allow", undefined, {
+      respond: (_request: unknown, signal?: AbortSignal) => new Promise((resolve) => {
+        signal?.addEventListener("abort", () => {
+          cancelled = true;
+          resolve({ action: "cancel" });
+        }, { once: true });
+      }),
+    });
+    try {
+      const events = await collect(s.send("[interactive] [resolved]"));
+      expect(cancelled).toBe(true);
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "end_turn" });
+    } finally { await s.close(); }
+  });
+
 });

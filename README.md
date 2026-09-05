@@ -284,3 +284,5 @@ bun run smoke                       # live end-to-end through your real Claude C
 bun run live:providers              # live check across every installed harness (tiny token cost each)
 make build                          # build dist/ only
 ```
+
+Codex sessions preserve proposed plan documents and stream reasoning summaries as they arrive, and completed items only fill missing text. A failed resume is reported as an error; it never silently opens an empty conversation. Only one send can run at a time, including during startup. Input and permission handlers receive an abort signal when the server resolves their request, their turn stops, or the session closes; hosts should dismiss the corresponding prompt. Close and reopen a failed session with its last ID to retry.

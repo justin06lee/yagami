@@ -134,6 +134,10 @@ rl.on("line", (line) => {
       send({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: THREAD, startedFresh: true } } });
       break;
     case "thread/resume":
+      if (msg.params.threadId === "th-unavailable") {
+        send({ id: msg.id, error: { code: -32000, message: "thread resume failed: service unavailable" } });
+        break;
+      }
       THREAD = msg.params.threadId;
       send({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: THREAD, resumed: true } } });
       break;
@@ -179,6 +183,14 @@ rl.on("line", (line) => {
       const turnId = `turn-${turnSeq}`;
       send({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: turnId, status: "inProgress" } } });
       const prompt = msg.params?.input?.find?.((item) => item.type === "text")?.text ?? "";
+      if (prompt.includes("[plan]")) {
+        notify("item/completed", { threadId: THREAD, turnId, item: { type: "plan", id: "plan-1", text: "Inspect, implement, verify." } });
+      }
+      if (prompt.includes("[reasoning]")) {
+        notify("item/reasoning/summaryTextDelta", { threadId: THREAD, turnId, itemId: "reason-1", summaryIndex: 0, delta: "Checking " });
+        notify("item/reasoning/summaryTextDelta", { threadId: THREAD, turnId, itemId: "reason-1", summaryIndex: 0, delta: "the files" });
+        notify("item/completed", { threadId: THREAD, turnId, item: { type: "reasoning", id: "reason-1", summary: ["Checking the files carefully"] } });
+      }
       interactive = prompt.includes("[interactive]");
       if (interactive) {
         notify("turn/plan/updated", {
@@ -215,6 +227,10 @@ rl.on("line", (line) => {
             ],
           },
         });
+        if (prompt.includes("[resolved]")) {
+          notify("serverRequest/resolved", { threadId: THREAD, requestId: 901 });
+          finishTurn("The question expired.");
+        }
         break;
       }
       notify("item/agentMessage/delta", { threadId: THREAD, turnId, itemId: "msg-1", delta: "hel" });

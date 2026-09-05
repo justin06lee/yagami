@@ -65,6 +65,10 @@ export class CodexAgentSession implements ProviderSession {
   private lastUsage: Usage | undefined;
   private opening: Promise<void> | undefined;
   private closed = false;
+  private sending = false;
+  private turnAbort: AbortController | undefined;
+  private readonly reasoningEmitted = new Map<string, number>();
+  private readonly incoming = new Map<number | string, AbortController>();
   /** Item text already emitted as deltas, so item/completed only fills gaps. */
   private readonly emitted = new Map<string, number>();
 
@@ -75,6 +79,7 @@ export class CodexAgentSession implements ProviderSession {
   }
 
   private fail(err: Error): void {
+    this.turnAbort?.abort();
     for (const [, p] of this.pending) p.reject(err);
     this.pending.clear();
     this.queue?.fail(err);
@@ -101,6 +106,7 @@ export class CodexAgentSession implements ProviderSession {
   }
 
   private respond(id: number | string, result: unknown): void {
+    if (this.incoming.get(id)?.signal.aborted) return;
     this.child?.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
   }
 
@@ -168,13 +174,11 @@ export class CodexAgentSession implements ProviderSession {
       return;
     }
     if (options.resume) {
-      try {
-        const resumed = await this.request("thread/resume", { threadId: options.resume, ...overrides });
-        this.threadId = (resumed["thread"] as { id?: string } | undefined)?.id ?? options.resume;
-        return;
-      } catch {
-        // the thread is gone (deleted, another machine) — start fresh below
-      }
+      // A failed resume must never erase the caller's conversation by
+      // quietly starting an empty thread (network and auth errors included).
+      const resumed = await this.request("thread/resume", { threadId: options.resume, ...overrides });
+      this.threadId = (resumed["thread"] as { id?: string } | undefined)?.id ?? options.resume;
+      return;
     }
     const started = await this.request("thread/start", overrides);
     this.threadId = (started["thread"] as { id?: string } | undefined)?.id;
@@ -196,7 +200,17 @@ export class CodexAgentSession implements ProviderSession {
     if (!msg.method) return;
     // server-initiated requests (approvals and friends) carry an id
     if (msg.id !== undefined) {
-      void this.handleServerRequest(msg.method, msg.id, msg.params ?? {});
+      const id = msg.id;
+      const controller = new AbortController();
+      const parent = this.turnAbort?.signal;
+      const cancel = () => controller.abort();
+      if (parent?.aborted) controller.abort();
+      else parent?.addEventListener("abort", cancel, { once: true });
+      this.incoming.set(id, controller);
+      void this.handleServerRequest(msg.method, id, msg.params ?? {}, controller.signal).finally(() => {
+        parent?.removeEventListener("abort", cancel);
+        this.incoming.delete(id);
+      });
       return;
     }
     this.handleNotification(msg.method, msg.params ?? {});
@@ -208,12 +222,26 @@ export class CodexAgentSession implements ProviderSession {
 
   private handleNotification(method: string, params: Record<string, unknown>): void {
     if (params["threadId"] !== undefined && params["threadId"] !== this.threadId) return;
+    if (this.currentTurnId && typeof params["turnId"] === "string" && params["turnId"] !== this.currentTurnId) return;
     switch (method) {
+      case "serverRequest/resolved": {
+        const requestId = params["requestId"];
+        if (typeof requestId === "string" || typeof requestId === "number") this.incoming.get(requestId)?.abort();
+        break;
+      }
       case "item/agentMessage/delta": {
         const itemId = params["itemId"] as string;
         const delta = params["delta"] as string;
         this.emitted.set(itemId, (this.emitted.get(itemId) ?? 0) + delta.length);
         this.push({ type: "text", text: delta });
+        break;
+      }
+      case "item/reasoning/summaryTextDelta": {
+        const delta = params["delta"];
+        if (typeof delta !== "string") break;
+        const key = `${String(params["itemId"])}:${String(params["summaryIndex"] ?? 0)}`;
+        this.reasoningEmitted.set(key, (this.reasoningEmitted.get(key) ?? 0) + delta.length);
+        this.push({ type: "thinking", text: delta });
         break;
       }
       case "item/started":
@@ -254,9 +282,12 @@ export class CodexAgentSession implements ProviderSession {
       }
       case "turn/completed": {
         const turn = params["turn"] as { status?: string; error?: { message?: string } | null };
+        const turnId = (params["turn"] as { id?: string } | undefined)?.id;
+        if (this.currentTurnId && turnId && turnId !== this.currentTurnId) break;
         const queue = this.queue;
         this.queue = null;
         this.currentTurnId = undefined;
+        this.turnAbort?.abort();
         if (!queue) break;
         if (turn.status === "failed") {
           queue.fail(this.classify(new Error(turn.error?.message ?? "turn failed")));
@@ -296,8 +327,13 @@ export class CodexAgentSession implements ProviderSession {
       }
       case "reasoning": {
         if (!completed) break;
-        const summary = (item["summary"] as string[] | undefined)?.join("\n") ?? "";
-        if (summary) this.push({ type: "thinking", text: summary });
+        const summaries = (item["summary"] as string[] | undefined) ?? [];
+        summaries.forEach((summary, index) => {
+          const key = `${id}:${index}`;
+          const seen = this.reasoningEmitted.get(key) ?? 0;
+          if (summary.length > seen) this.push({ type: "thinking", text: summary.slice(seen) });
+          this.reasoningEmitted.delete(key);
+        });
         break;
       }
       case "commandExecution": {
@@ -397,8 +433,12 @@ export class CodexAgentSession implements ProviderSession {
         });
         break;
       }
-      case "userMessage":
       case "plan":
+        if (completed && typeof item["text"] === "string") {
+          this.push({ type: "plan", plan: { id, markdown: item["text"] } });
+        }
+        break;
+      case "userMessage":
         break;
       default:
         this.push({ type: "raw", provider: "codex", payload: item });
@@ -408,9 +448,10 @@ export class CodexAgentSession implements ProviderSession {
 
   // ── approvals: forwarded to the host, answered like the TUI would ──
 
-  private async decide(request: SessionPermissionRequest): Promise<SessionPermissionDecision> {
+  private async decide(request: SessionPermissionRequest, signal?: AbortSignal): Promise<SessionPermissionDecision> {
+    if (signal?.aborted) return "deny";
     try {
-      const decision = await this.config.options.permissions.decide(request);
+      const decision = await this.config.options.permissions.decide(request, signal);
       this.push({ type: "permission", request, decision });
       return decision;
     } catch {
@@ -418,7 +459,7 @@ export class CodexAgentSession implements ProviderSession {
     }
   }
 
-  private async handleServerRequest(method: string, id: number | string, params: Record<string, unknown>): Promise<void> {
+  private async handleServerRequest(method: string, id: number | string, params: Record<string, unknown>, signal: AbortSignal): Promise<void> {
     switch (method) {
       case "item/commandExecution/requestApproval": {
         const decision = await this.decide({
@@ -429,7 +470,7 @@ export class CodexAgentSession implements ProviderSession {
           title: String(params["command"] ?? "command"),
           input: { command: params["command"], cwd: params["cwd"], reason: params["reason"] },
           raw: params,
-        });
+        }, signal);
         this.respond(id, {
           decision: decision === "allow" ? "accept" : decision === "allow_always" ? "acceptForSession" : "decline",
         });
@@ -444,7 +485,7 @@ export class CodexAgentSession implements ProviderSession {
           title: String(params["reason"] ?? "apply file changes"),
           input: { reason: params["reason"], grantRoot: params["grantRoot"] },
           raw: params,
-        });
+        }, signal);
         this.respond(id, {
           decision: decision === "allow" ? "accept" : decision === "allow_always" ? "acceptForSession" : "decline",
         });
@@ -460,7 +501,7 @@ export class CodexAgentSession implements ProviderSession {
           title: String(params["reason"] ?? "extra permissions"),
           input: requested,
           raw: params,
-        });
+        }, signal);
         const granted = decision === "allow" || decision === "allow_always";
         this.respond(id, {
           permissions: granted ? { network: requested?.["network"] ?? undefined, fileSystem: requested?.["fileSystem"] ?? undefined } : {},
@@ -479,7 +520,7 @@ export class CodexAgentSession implements ProviderSession {
           title: String(params["command"] ?? params["reason"] ?? "approval"),
           input: params,
           raw: params,
-        });
+        }, signal);
         this.respond(id, {
           decision:
             decision === "allow"
@@ -491,7 +532,7 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "item/tool/requestUserInput": {
-        const response = await this.input(codexQuestionRequest(this.threadId, params));
+        const response = await this.input(codexQuestionRequest(this.threadId, params), signal);
         const values = response.action === "accept" ? response.values ?? {} : {};
         this.respond(id, {
           answers: Object.fromEntries(
@@ -504,7 +545,7 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "mcpServer/elicitation/request": {
-        const response = await this.input(elicitationRequest("codex", this.threadId, params));
+        const response = await this.input(elicitationRequest("codex", this.threadId, params), signal);
         this.respond(id, { ...elicitationResponse(response), _meta: null });
         break;
       }
@@ -522,11 +563,12 @@ export class CodexAgentSession implements ProviderSession {
     }
   }
 
-  private async input(request: SessionInputRequest): Promise<SessionInputResponse> {
+  private async input(request: SessionInputRequest, signal?: AbortSignal): Promise<SessionInputResponse> {
     const handler = this.config.options.input;
     if (!handler) return declineInput();
     try {
-      return await handler.respond(request);
+      if (signal?.aborted) return { action: "cancel" };
+      return await handler.respond(request, signal);
     } catch {
       return { action: "cancel" };
     }
@@ -536,42 +578,68 @@ export class CodexAgentSession implements ProviderSession {
 
   async *send(input: string | ContentBlockParam[]): AsyncGenerator<AgentEvent, void, undefined> {
     if (this.closed) throw new ProviderError("codex", "session is closed");
-    if (this.queue) throw new ProviderError("codex", "a turn is already running");
-    await this.ensureOpen();
-
-    const blocks = typeof input === "string" ? [{ type: "text", text: input } as ContentBlockParam] : input;
-    const { paths, cleanup } = writeTempImages(blocks);
-    const items: Array<Record<string, unknown>> = [];
-    for (const block of blocks) {
-      if (block.type === "text" && typeof block.text === "string") {
-        items.push({ type: "text", text: block.text, text_elements: [] });
-      }
-    }
-    for (const p of paths) items.push({ type: "localImage", path: p });
-    if (items.length === 0) items.push({ type: "text", text: "", text_elements: [] });
-
+    if (this.sending) throw new ProviderError("codex", "a turn is already running");
+    // Claim the turn before the first await: two cold sends otherwise both
+    // pass the guard and replace each other's event queue after initialize.
+    this.sending = true;
+    const controller = new AbortController();
+    this.turnAbort = controller;
+    let cleanup = () => {};
     const queue = new AsyncQueue<AgentEvent>();
-    this.queue = queue;
-    this.lastUsage = undefined;
     try {
+      await this.ensureOpen();
+      if (controller.signal.aborted) {
+        yield { type: "done", stopReason: "interrupted" };
+        return;
+      }
+      const blocks = typeof input === "string" ? [{ type: "text", text: input } as ContentBlockParam] : input;
+      const images = writeTempImages(blocks);
+      cleanup = images.cleanup;
+      const items: Array<Record<string, unknown>> = [];
+      for (const block of blocks) {
+        if (block.type === "text" && typeof block.text === "string") {
+          items.push({ type: "text", text: block.text, text_elements: [] });
+        }
+      }
+      for (const p of images.paths) items.push({ type: "localImage", path: p });
+      if (items.length === 0) items.push({ type: "text", text: "", text_elements: [] });
+
+      this.queue = queue;
+      this.lastUsage = undefined;
+      this.emitted.clear();
+      this.reasoningEmitted.clear();
       const result = await this.request("turn/start", {
         threadId: this.threadId,
         input: items,
         ...(this.config.options.effort ? { effort: this.config.options.effort } : {}),
       });
-      this.currentTurnId = (result["turn"] as { id?: string } | undefined)?.id;
+      const turnId = (result["turn"] as { id?: string } | undefined)?.id;
+      // A short turn may finish before the RPC continuation runs.
+      if (this.queue === queue) this.currentTurnId = turnId;
+      if (controller.signal.aborted && this.currentTurnId) await this.interrupt();
       yield { type: "session", sessionId: this.threadId! };
-      if (this.currentTurnId) yield { type: "turn", id: this.currentTurnId };
+      if (turnId) yield { type: "turn", id: turnId };
       for await (const event of queue) yield event;
     } finally {
       cleanup();
+      controller.abort();
+      // A caller that stops reading the generator also stops the model.
+      if (this.queue === queue) await this.interrupt();
       if (this.queue === queue) this.queue = null;
+      this.currentTurnId = undefined;
+      this.turnAbort = undefined;
+      this.sending = false;
     }
   }
 
   async interrupt(): Promise<void> {
-    if (!this.threadId || !this.currentTurnId) return;
-    await this.request("turn/interrupt", { threadId: this.threadId, turnId: this.currentTurnId }).catch(() => {});
+    // Send cancellation before releasing waiting host handlers, so a late
+    // answer cannot complete the turn ahead of the interruption.
+    const request = this.threadId && this.currentTurnId
+      ? this.request("turn/interrupt", { threadId: this.threadId, turnId: this.currentTurnId }).catch(() => {})
+      : Promise.resolve();
+    this.turnAbort?.abort();
+    await request;
   }
 
   async close(): Promise<void> {
