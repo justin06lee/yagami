@@ -122,7 +122,7 @@ const engine = new YagamiEngine({
 const { response, costUsd } = await engine.complete({ messages: [{ role: "user", content: "hello" }] });
 ```
 
-Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `ProviderError`.
+Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `ProviderError`. Every CLI yagami starts is ended with everything it started in turn — a launcher that re-executes itself, an npm shim, an agent's MCP servers — and nothing is left waiting on an agent that never answers: an ACP handshake has 30 seconds, a model-list or version probe 20, and a turn aborted before its session exists closes the agent. A consumer that stops reading a turn early ends its process too.
 
 ### Building a UI on Claude Code
 
