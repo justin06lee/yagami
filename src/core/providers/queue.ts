@@ -8,6 +8,9 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   private waiting: { resolve: (r: IteratorResult<T>) => void; reject: (e: unknown) => void } | null = null;
   private ended = false;
   private error: unknown = undefined;
+  /** Called once if the consumer stops iterating before the queue ends —
+   *  the producer's cue to stop whatever is feeding it. */
+  onReturn: (() => void) | undefined;
 
   push(value: T): void {
     if (this.ended) return;
@@ -60,7 +63,10 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
         });
       },
       return: () => {
+        const stop = this.ended ? undefined : this.onReturn;
+        this.onReturn = undefined;
         this.ended = true;
+        stop?.();
         return Promise.resolve({ value: undefined as never, done: true });
       },
     };

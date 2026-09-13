@@ -36,6 +36,7 @@ import type {
   TurnRequest,
 } from "../provider.js";
 import type { ContentBlockParam, Usage } from "../types.js";
+import { killTree } from "./process.js";
 import { AsyncQueue } from "./queue.js";
 import { VERSION } from "../../version.js";
 
@@ -70,7 +71,16 @@ export interface AcpProviderOptions {
   installHint?: string;
   /** Test seam: replaces process spawning. */
   connect?: (cwd: string) => Promise<AcpConnection>;
+  /** How long a spawned agent gets to finish the ACP handshake before it is
+   *  killed (default 30 s). */
+  handshakeTimeoutMs?: number;
+  /** How long a model-list or version probe may take end to end before the
+   *  agent is closed and the probe fails (default 20 s). */
+  probeTimeoutMs?: number;
 }
+
+const HANDSHAKE_TIMEOUT_MS = 30_000;
+const PROBE_TIMEOUT_MS = 20_000;
 
 /** Pick the most conservative option an agent offers for a permission ask. */
 export function rejectOption(p: RequestPermissionRequest): RequestPermissionResponse {
@@ -111,6 +121,8 @@ export class AcpProvider implements SessionProvider {
   private readonly appName: string;
   private readonly modelConfigId: string;
   private readonly connectImpl: (cwd: string) => Promise<AcpConnection>;
+  private readonly handshakeTimeoutMs: number;
+  private readonly probeTimeoutMs: number;
 
   constructor(options: AcpProviderOptions) {
     this.id = options.id;
@@ -127,6 +139,8 @@ export class AcpProvider implements SessionProvider {
     this.appName = options.appName ?? "yagami";
     this.modelConfigId = options.modelConfigId ?? "model";
     this.connectImpl = options.connect ?? ((cwd) => this.spawnConnection(cwd));
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
+    this.probeTimeoutMs = options.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
     fs.mkdirSync(this.workDir, { recursive: true });
   }
 
@@ -163,14 +177,25 @@ export class AcpProvider implements SessionProvider {
         stream,
       );
       let settled = false;
+      // An agent that never answers the handshake used to be left running
+      // for good, with nobody holding it and nothing to close it with.
+      const handshake = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        killTree(child);
+        reject(new ProviderError(this.id, `${this.label} did not finish the ACP handshake within ${Math.round(this.handshakeTimeoutMs / 1000)}s`));
+      }, this.handshakeTimeoutMs);
+      handshake.unref?.();
       child.on("error", (err) => {
         if (settled) return;
         settled = true;
+        clearTimeout(handshake);
         reject(classifyProviderFailure(this.id, this.loginCommand, err));
       });
       child.on("exit", (code) => {
         if (settled) return;
         settled = true;
+        clearTimeout(handshake);
         reject(classifyProviderFailure(this.id, this.loginCommand, new Error(`${this.executable} exited with code ${code}${stderr ? `: ${stderr.trim().slice(-400)}` : ""}`)));
       });
       agent
@@ -188,21 +213,21 @@ export class AcpProvider implements SessionProvider {
         .then((init) => {
           if (settled) return;
           settled = true;
+          clearTimeout(handshake);
           resolve({
             agent,
             init,
             setHandlers: (h) => {
               handlers = h;
             },
-            close: () => {
-              child.kill("SIGTERM");
-            },
+            close: () => killTree(child),
           });
         })
         .catch((err) => {
           if (settled) return;
           settled = true;
-          child.kill("SIGTERM");
+          clearTimeout(handshake);
+          killTree(child);
           reject(this.classify(err, stderr));
         });
     });
@@ -225,7 +250,14 @@ export class AcpProvider implements SessionProvider {
     let costUsd: number | undefined;
     const onAbort = () => {
       if (sessionId) void conn.agent.cancel({ sessionId }).catch(() => {});
+      // no session to cancel yet: the only way to stop is to close the agent
+      else conn.close();
     };
+    if (req.signal?.aborted) {
+      conn.close();
+      return;
+    }
+    req.signal?.addEventListener("abort", onAbort, { once: true });
     try {
       let configOptions: SessionConfigOption[] | null | undefined;
       let modes: { currentModeId?: string; availableModes?: Array<{ id: string }> } | null | undefined;
@@ -273,8 +305,6 @@ export class AcpProvider implements SessionProvider {
           }
         },
       });
-      req.signal?.addEventListener("abort", onAbort, { once: true });
-
       conn.agent
         .prompt({ sessionId, prompt: toAcpBlocks(req.prompt, req.media ?? [], this.id) })
         .then((res) => {
@@ -348,9 +378,35 @@ export class AcpProvider implements SessionProvider {
     });
   }
 
-  async listModels(): Promise<EngineModel[]> {
+  /**
+   * Run a short question against a fresh agent and close it, whatever
+   * happens. The deadline covers the whole exchange: an agent that answers
+   * the handshake and then sits on newSession forever (Gemini, signed out
+   * or mid-update) used to hold the probe open — and its process alive —
+   * for as long as the host ran.
+   */
+  private async probe<T>(ask: (conn: AcpConnection) => Promise<T>): Promise<T> {
     const conn = await this.connectImpl(this.workDir);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      return await Promise.race([
+        ask(conn),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new ProviderError(this.id, `${this.label} did not answer within ${Math.round(this.probeTimeoutMs / 1000)}s`)),
+            this.probeTimeoutMs,
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      conn.close();
+    }
+  }
+
+  async listModels(): Promise<EngineModel[]> {
+    return this.probe(async (conn) => {
       const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: [] }).catch((err) => {
         throw this.classify(err);
       });
@@ -377,9 +433,7 @@ export class AcpProvider implements SessionProvider {
         ...(efforts.length > 0 ? { reasoning_efforts: efforts } : {}),
         ...(effortOption?.type === "select" ? { default_reasoning_effort: effortOption.currentValue } : {}),
       }));
-    } finally {
-      conn.close();
-    }
+    });
   }
 
   /**

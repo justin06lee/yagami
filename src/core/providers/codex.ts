@@ -18,6 +18,7 @@ import type {
 import type { ContentBlockParam, Usage } from "../types.js";
 import { CodexAgentSession } from "./codexSession.js";
 import { spawnJsonl } from "./jsonl.js";
+import { killTree } from "./process.js";
 import { VERSION } from "../../version.js";
 
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
@@ -163,7 +164,7 @@ export class CodexProvider implements SessionProvider {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        child.kill("SIGTERM");
+        killTree(child);
         fn();
       };
       const timer = setTimeout(() => finish(() => reject(new ProviderError(this.id, "timed out listing models via app-server"))), 15_000);

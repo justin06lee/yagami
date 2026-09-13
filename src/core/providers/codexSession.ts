@@ -15,6 +15,7 @@ import type {
 } from "../provider.js";
 import type { ContentBlockParam, Usage } from "../types.js";
 import { writeTempImages } from "./codex.js";
+import { killTree } from "./process.js";
 import { AsyncQueue } from "./queue.js";
 import { VERSION } from "../../version.js";
 
@@ -646,7 +647,7 @@ export class CodexAgentSession implements ProviderSession {
     if (this.closed) return;
     this.closed = true;
     this.fail(new ProviderError("codex", "session closed"));
-    this.child?.kill("SIGTERM");
+    killTree(this.child);
     this.child = undefined;
   }
 }

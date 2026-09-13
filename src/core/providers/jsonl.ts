@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
+import { killTree } from "./process.js";
 import { AsyncQueue } from "./queue.js";
 
 export interface SpawnJsonlOptions {
@@ -26,7 +27,8 @@ export class ProcessExitError extends Error {
  * Spawn a CLI that prints one JSON object per stdout line and iterate the
  * parsed objects. Non-JSON lines are skipped. A non-zero exit throws
  * ProcessExitError carrying the stderr tail; aborting the signal kills the
- * child and ends the iteration quietly.
+ * child and ends the iteration quietly. So does a consumer that stops
+ * iterating early — the process has nobody left to answer, so it goes.
  */
 export function spawnJsonl(options: SpawnJsonlOptions): AsyncIterable<unknown> {
   const queue = new AsyncQueue<unknown>();
@@ -51,12 +53,17 @@ export function spawnJsonl(options: SpawnJsonlOptions): AsyncIterable<unknown> {
     }
   });
   const onAbort = () => {
-    child.kill("SIGTERM");
+    killTree(child);
     queue.end();
   };
   options.signal?.addEventListener("abort", onAbort, { once: true });
+  queue.onReturn = () => {
+    options.signal?.removeEventListener("abort", onAbort);
+    killTree(child);
+  };
   child.on("error", (err) => queue.fail(err));
   child.on("close", (code) => {
+    queue.onReturn = undefined;
     options.signal?.removeEventListener("abort", onAbort);
     if (options.signal?.aborted) return queue.end();
     if (code !== 0) queue.fail(new ProcessExitError(code, stderr));
