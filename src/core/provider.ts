@@ -191,12 +191,19 @@ export interface SessionPermissionHandler {
   decide(req: SessionPermissionRequest, signal?: AbortSignal): Promise<SessionPermissionDecision>;
 }
 
+/**
+ * Every normalized event. `thread` is set on text, thinking and tool calls
+ * that came from a subagent the session spawned rather than from the session
+ * itself — Codex's multi-agent threads, keyed by the spawned thread's id
+ * (the `receiverThreadIds` of the spawn_agent call that started it). Hosts
+ * nest those under the spawning call instead of reading them as the reply.
+ */
 export type AgentEvent =
   | { type: "session"; sessionId: string }
   /** Provider-native turn id, used by hosts to fork an exact exchange. */
   | { type: "turn"; id: string }
-  | { type: "text"; text: string }
-  | { type: "thinking"; text: string }
+  | { type: "text"; text: string; thread?: string }
+  | { type: "thinking"; text: string; thread?: string }
   | {
       type: "tool_call";
       id: string;
@@ -206,6 +213,7 @@ export type AgentEvent =
       kind?: string;
       input?: unknown;
       output?: unknown;
+      thread?: string;
     }
   | { type: "permission"; request: SessionPermissionRequest; decision: SessionPermissionDecision }
   | { type: "plan"; plan: SessionPlan }
