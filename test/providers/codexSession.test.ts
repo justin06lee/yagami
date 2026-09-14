@@ -36,12 +36,20 @@ describe("CodexAgentSession", () => {
     await s.close();
     expect(s.id).toBe("th-fake-1");
     expect(events[0]).toEqual({ type: "session", sessionId: "th-fake-1" });
-    expect(events.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { text: string }).text)).toEqual([
+    const own = events.filter((e: AgentEvent) => !("thread" in e));
+    expect(own.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { text: string }).text)).toEqual([
       "hel",
       "lo",
       " there", // item/completed fills what the deltas didn't cover
     ]);
-    const tools = events.filter((e: AgentEvent) => e.type === "tool_call") as Array<Record<string, unknown>>;
+    // the spawned agent's own work arrives whole and tagged with its thread;
+    // its delta, its turn ending and a stranger thread's message do not
+    expect(events.filter((e: AgentEvent) => "thread" in e)).toEqual([
+      expect.objectContaining({ type: "tool_call", name: "shell", status: "started", title: "bun test", thread: "sub-1" }),
+      { type: "text", text: "All tests pass.", thread: "sub-1" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("not ours");
+    const tools = own.filter((e: AgentEvent) => e.type === "tool_call") as Array<Record<string, unknown>>;
     expect(tools[0]).toMatchObject({ name: "spawn_agent", status: "started", title: "Check the tests" });
     expect(tools[1]).toMatchObject({ name: "spawn_agent", status: "completed" });
     expect(tools[2]).toMatchObject({ name: "shell", status: "started", title: "echo hi" });

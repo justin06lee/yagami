@@ -72,6 +72,9 @@ export class CodexAgentSession implements ProviderSession {
   private readonly incoming = new Map<number | string, AbortController>();
   /** Item text already emitted as deltas, so item/completed only fills gaps. */
   private readonly emitted = new Map<string, number>();
+  /** Threads this session's agents spawned (and theirs, all the way down):
+   *  their work is forwarded tagged with the thread instead of dropped. */
+  private readonly subThreads = new Set<string>();
 
   constructor(private readonly config: CodexSessionConfig) {}
 
@@ -221,8 +224,33 @@ export class CodexAgentSession implements ProviderSession {
     this.queue?.push(event);
   }
 
+  /** A thread started: one of ours when its parent is this session's thread
+   *  or a thread already ours (an agent's own agent). */
+  private adoptThread(thread: Record<string, unknown> | undefined): void {
+    const id = thread?.["id"];
+    if (typeof id !== "string") return;
+    const spawn = (thread?.["source"] as { subAgent?: { thread_spawn?: { parent_thread_id?: unknown } } } | undefined)
+      ?.subAgent?.thread_spawn;
+    const parent = thread?.["parentThreadId"] ?? spawn?.parent_thread_id;
+    if (typeof parent === "string" && (parent === this.threadId || this.subThreads.has(parent))) this.subThreads.add(id);
+  }
+
   private handleNotification(method: string, params: Record<string, unknown>): void {
-    if (params["threadId"] !== undefined && params["threadId"] !== this.threadId) return;
+    if (method === "thread/started") {
+      this.adoptThread(params["thread"] as Record<string, unknown> | undefined);
+      return;
+    }
+    const thread = params["threadId"];
+    if (thread !== undefined && thread !== this.threadId) {
+      // A subagent's thread: what it does reaches the host tagged with the
+      // thread, whole items only (its deltas would interleave with the
+      // reply's). Its own turn ending is not this turn ending, and a thread
+      // that is nobody's here stays dropped.
+      if (typeof thread === "string" && this.subThreads.has(thread) && (method === "item/started" || method === "item/completed")) {
+        this.handleItem(params["item"] as Record<string, unknown> | undefined, method === "item/completed", thread);
+      }
+      return;
+    }
     if (this.currentTurnId && typeof params["turnId"] === "string" && params["turnId"] !== this.currentTurnId) return;
     switch (method) {
       case "serverRequest/resolved": {
@@ -312,17 +340,21 @@ export class CodexAgentSession implements ProviderSession {
     }
   }
 
-  /** Normalize thread items into tool_call / thinking events. */
-  private handleItem(item: Record<string, unknown> | undefined, completed: boolean): void {
+  /** Normalize thread items into tool_call / thinking events — tagged with
+   *  `thread` when the item is a subagent's, from one of its threads. */
+  private handleItem(item: Record<string, unknown> | undefined, completed: boolean, thread?: string): void {
     if (!item) return;
     const id = String(item["id"] ?? "");
+    const push = (event: AgentEvent) => {
+      this.push(thread && (event.type === "text" || event.type === "thinking" || event.type === "tool_call") ? { ...event, thread } : event);
+    };
     switch (item["type"]) {
       case "agentMessage": {
         if (!completed) break;
         // fill in whatever the deltas didn't cover (non-streaming paths)
         const text = String(item["text"] ?? "");
-        const seen = this.emitted.get(id) ?? 0;
-        if (text.length > seen) this.push({ type: "text", text: text.slice(seen) });
+        const seen = thread ? 0 : (this.emitted.get(id) ?? 0);
+        if (text.length > seen) push({ type: "text", text: text.slice(seen) });
         this.emitted.delete(id);
         break;
       }
@@ -331,15 +363,15 @@ export class CodexAgentSession implements ProviderSession {
         const summaries = (item["summary"] as string[] | undefined) ?? [];
         summaries.forEach((summary, index) => {
           const key = `${id}:${index}`;
-          const seen = this.reasoningEmitted.get(key) ?? 0;
-          if (summary.length > seen) this.push({ type: "thinking", text: summary.slice(seen) });
+          const seen = thread ? 0 : (this.reasoningEmitted.get(key) ?? 0);
+          if (summary.length > seen) push({ type: "thinking", text: summary.slice(seen) });
           this.reasoningEmitted.delete(key);
         });
         break;
       }
       case "commandExecution": {
         const failed = item["status"] === "failed" || item["status"] === "declined";
-        this.push({
+        push({
           type: "tool_call",
           id,
           name: "shell",
@@ -354,7 +386,7 @@ export class CodexAgentSession implements ProviderSession {
       case "fileChange": {
         const changes = (item["changes"] as Array<{ path?: string }> | undefined) ?? [];
         const failed = item["status"] === "failed" || item["status"] === "declined";
-        this.push({
+        push({
           type: "tool_call",
           id,
           name: "apply_patch",
@@ -366,7 +398,7 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "mcpToolCall": {
-        this.push({
+        push({
           type: "tool_call",
           id,
           name: `${String(item["server"] ?? "mcp")}.${String(item["tool"] ?? "tool")}`,
@@ -377,7 +409,7 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "webSearch": {
-        this.push({
+        push({
           type: "tool_call",
           id,
           name: "web_search",
@@ -390,7 +422,7 @@ export class CodexAgentSession implements ProviderSession {
       case "dynamicToolCall": {
         const failed = item["status"] === "failed" || item["success"] === false;
         const namespace = typeof item["namespace"] === "string" ? `${item["namespace"]}.` : "";
-        this.push({
+        push({
           type: "tool_call",
           id,
           name: `${namespace}${String(item["tool"] ?? "tool")}`,
@@ -405,7 +437,12 @@ export class CodexAgentSession implements ProviderSession {
         const status = item["status"];
         const failed = status === "failed" || status === "interrupted";
         const tool = collabToolName(item["tool"]);
-        this.push({
+        // the spawned thread is ours from the call that made it, whether or
+        // not the server also announces it with thread/started
+        if (tool === "spawn_agent" && Array.isArray(item["receiverThreadIds"])) {
+          for (const receiver of item["receiverThreadIds"]) if (typeof receiver === "string") this.subThreads.add(receiver);
+        }
+        push({
           type: "tool_call",
           id,
           name: tool,
@@ -423,7 +460,7 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "imageView": {
-        this.push({
+        push({
           type: "tool_call",
           id,
           name: "read_file",
@@ -435,14 +472,15 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "plan":
-        if (completed && typeof item["text"] === "string") {
-          this.push({ type: "plan", plan: { id, markdown: item["text"] } });
+        // a subagent's plan is its own business — it is not this session's
+        if (!thread && completed && typeof item["text"] === "string") {
+          push({ type: "plan", plan: { id, markdown: item["text"] } });
         }
         break;
       case "userMessage":
         break;
       default:
-        this.push({ type: "raw", provider: "codex", payload: item });
+        if (!thread) push({ type: "raw", provider: "codex", payload: item });
         break;
     }
   }

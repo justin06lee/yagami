@@ -52,6 +52,27 @@ function startTools() {
       agentsStates: { "sub-1": { status: "completed" } },
     },
   });
+  // the spawned agent works on its own thread: announced, then a command and
+  // a message of its own; its deltas and its turn ending are not the
+  // session's, and a thread nobody here spawned is nobody's business
+  notify("thread/started", { thread: { id: "sub-1", parentThreadId: THREAD } });
+  notify("item/started", {
+    threadId: "sub-1",
+    turnId: "sub-turn-1",
+    item: { type: "commandExecution", id: "sub-exec-1", command: "bun test", cwd: "/tmp", status: "inProgress" },
+  });
+  notify("item/agentMessage/delta", { threadId: "sub-1", turnId: "sub-turn-1", itemId: "sub-msg-1", delta: "All " });
+  notify("item/completed", {
+    threadId: "sub-1",
+    turnId: "sub-turn-1",
+    item: { type: "agentMessage", id: "sub-msg-1", text: "All tests pass." },
+  });
+  notify("turn/completed", { threadId: "sub-1", turn: { id: "sub-turn-1", status: "completed", error: null } });
+  notify("item/completed", {
+    threadId: "stranger",
+    turnId: "x",
+    item: { type: "agentMessage", id: "stranger-1", text: "not ours" },
+  });
   notify("item/started", {
     threadId: THREAD,
     turnId,
