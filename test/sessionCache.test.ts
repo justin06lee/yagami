@@ -53,6 +53,18 @@ describe("SessionCache", () => {
       expect(reloaded.size).toBe(2);
     });
 
+    it("keeps only the newest entries when the file exceeds maxEntries", () => {
+      const file = path.join(dir, "sessions.json");
+      const big = new SessionCache({ persistPath: file, maxEntries: 10 });
+      for (let i = 0; i < 10; i += 1) big.set(`k${i}`, `s${i}`);
+      big.persistNow();
+
+      const small = new SessionCache({ persistPath: file, maxEntries: 3 });
+      expect(small.size).toBe(3);
+      expect(small.get("k0")).toBeUndefined();
+      expect(small.get("k9")).toBe("s9");
+    });
+
     it("ignores corrupt cache files", () => {
       const file = path.join(dir, "sessions.json");
       fs.writeFileSync(file, "not json{{{");

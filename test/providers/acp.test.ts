@@ -239,6 +239,8 @@ function sessionFake(opts: { permissionDecision?: SessionPermissionDecision; int
           } as never)
         : Promise.resolve({ outcome: { outcome: "cancelled" } } as never));
       push({ sessionUpdate: "tool_call_update", toolCallId: "tc-1", status: "completed", rawOutput: { picked: (answer as { outcome: { optionId?: string } }).outcome.optionId ?? "none" } });
+      // a stray update after completion: the call's metadata has been let go of by then
+      push({ sessionUpdate: "tool_call_update", toolCallId: "tc-1", rawOutput: { late: true } });
       push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "king" } });
       return { stopReason: "end_turn", usage: { inputTokens: 5, outputTokens: 2 } };
     },
@@ -284,6 +286,10 @@ describe("AcpProvider.openSession", () => {
     expect(tools[0]).toMatchObject({ id: "tc-1", status: "started", kind: "read", title: "Read README.md" });
     // allow_always picked the agent's allow_always option
     expect(tools[1]).toMatchObject({ status: "completed", output: { picked: "ya" } });
+    expect(tools[1]).toHaveProperty("title", "Read README.md");
+    // once completed, the call is forgotten: a late update carries no remembered title
+    expect(tools[2]).toMatchObject({ id: "tc-1", status: "updated", name: "tool", output: { late: true } });
+    expect(tools[2]).not.toHaveProperty("title");
     expect(events.filter((e) => e.type === "text").map((e) => (e as { text: string }).text)).toEqual(["wor", "king"]);
     expect(events.find((e) => e.type === "permission")).toMatchObject({ decision: "allow_always" });
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "end_turn" });

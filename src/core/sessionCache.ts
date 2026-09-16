@@ -62,9 +62,12 @@ export class SessionCache {
       const raw = JSON.parse(fs.readFileSync(this.persistPath, "utf8")) as {
         entries?: Array<[string, string]>;
       };
-      for (const [key, value] of raw.entries ?? []) {
-        if (typeof key === "string" && typeof value === "string") this.map.set(key, value);
-      }
+      // entries are stored oldest first; a file larger than this cache's
+      // limit (a lowered maxEntries, a hand-edited file) keeps the newest
+      const entries = (raw.entries ?? []).filter(
+        (entry): entry is [string, string] => Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "string",
+      );
+      for (const [key, value] of entries.slice(-this.maxEntries)) this.map.set(key, value);
     } catch (err) {
       // no file yet is the normal first run; anything else is worth a line
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {

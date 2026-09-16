@@ -654,10 +654,14 @@ class AcpAgentSession implements ProviderSession {
           ...(t.title ?? known?.title ? { title: t.title ?? known?.title } : {}),
           ...(t.kind ?? known?.kind ? { kind: t.kind ?? known?.kind } : {}),
         };
+        const status = t.status === "completed" ? "completed" : t.status === "failed" ? "failed" : "updated";
+        // a finished call gets no more updates; a session that runs for
+        // hours must not remember every call it ever made
+        if (status !== "updated") this.toolMeta.delete(t.toolCallId);
         this.queue?.push({
           type: "tool_call",
           id: t.toolCallId,
-          status: t.status === "completed" ? "completed" : t.status === "failed" ? "failed" : "updated",
+          status,
           ...meta,
           ...(t.rawOutput !== undefined ? { output: t.rawOutput } : {}),
         });
