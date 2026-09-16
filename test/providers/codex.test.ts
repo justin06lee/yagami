@@ -42,15 +42,34 @@ describe("CodexProvider", () => {
     ]);
   });
 
-  it("builds exec arguments with flags before the resume subcommand", () => {
+  it("builds exec arguments with flags before the resume subcommand, prompt via stdin", () => {
     const p = new CodexProvider({ path: FAKE_CODEX, workDir: "/tmp/ws", sandbox: "workspace-write" });
     expect(p.buildArgs({ prompt: "hi", model: "gpt-5", effort: "high", resume: "t-1" }, ["/tmp/a.png"])).toEqual([
       "exec", "--json", "--skip-git-repo-check", "-C", "/tmp/ws", "-s", "workspace-write", "--color", "never",
-      "-m", "gpt-5", "-c", 'model_reasoning_effort="high"', "-i", "/tmp/a.png", "resume", "t-1", "hi",
+      "-m", "gpt-5", "-c", 'model_reasoning_effort="high"', "-i", "/tmp/a.png", "resume", "t-1", "-",
     ]);
     expect(p.buildArgs({ prompt: "hi" }, [])).toEqual([
-      "exec", "--json", "--skip-git-repo-check", "-C", "/tmp/ws", "-s", "workspace-write", "--color", "never", "hi",
+      "exec", "--json", "--skip-git-repo-check", "-C", "/tmp/ws", "-s", "workspace-write", "--color", "never", "-",
     ]);
+  });
+
+  it("never lets the prompt reach codex as an argument", async () => {
+    // "--help" as a message is a message, not a flag; and a replayed
+    // transcript can be longer than an argument list may be
+    spawnMock.mockImplementation(() => codexRun(SUCCESS));
+    const p = new CodexProvider({ path: FAKE_CODEX, workDir: "/tmp/ws" });
+    const prompt = `--help\n${"x".repeat(2_000_000)}`;
+    await collect(p.run({ prompt }));
+    const spawned = spawnMock.mock.calls[0]![0] as { args: string[]; stdin?: string };
+    expect(spawned.args).not.toContain(prompt);
+    expect(spawned.args.some((a) => a.startsWith("--help"))).toBe(false);
+    expect(spawned.stdin).toBe(prompt);
+  });
+
+  it("refuses an effort that could smuggle extra TOML into the config override", () => {
+    const p = new CodexProvider({ path: FAKE_CODEX, workDir: "/tmp/ws" });
+    expect(() => p.buildArgs({ prompt: "hi", effort: 'high" sandbox_mode="danger-full-access' }, [])).toThrowError(/invalid effort/);
+    expect(() => p.buildArgs({ prompt: "hi", effort: "xhigh" }, [])).not.toThrow();
   });
 
   it("fails with AuthRequiredError when codex reports a login problem", async () => {
