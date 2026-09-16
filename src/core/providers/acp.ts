@@ -160,6 +160,9 @@ export class AcpProvider implements SessionProvider {
         if (stderr.length > 16_000) stderr = stderr.slice(-8_000);
       };
       child.stderr?.on("data", (d: Buffer) => noteNoise(d.toString()));
+      // EPIPE from an agent that died mid-write is reported by the exit
+      // handler; it must not surface as an uncaught exception in the host
+      child.stdin?.on("error", (err) => debug(this.id, `${this.label} closed its stdin early`, err));
       let handlers: AcpHandlers = {};
       const stream = ndJsonStream(
         Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,

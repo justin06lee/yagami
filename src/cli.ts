@@ -89,7 +89,10 @@ program
       const shutdown = () => {
         running.sessionCache.persistNow();
         clearServerState(process.pid);
-        void running.close().finally(() => process.exit(0));
+        void running
+          .close()
+          .catch((err: unknown) => debug("server", "close reported an error on shutdown", err))
+          .finally(() => process.exit(0));
         // Don't hang on a stuck in-flight response.
         setTimeout(() => process.exit(0), 3000).unref?.();
       };

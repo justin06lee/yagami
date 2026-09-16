@@ -137,6 +137,9 @@ export class CodexAgentSession implements ProviderSession {
       stderr += d.toString();
       if (stderr.length > 16_000) stderr = stderr.slice(-8_000);
     });
+    // EPIPE from a dying app-server must not become an uncaught exception
+    // in the host; the exit handler below is what reports the death.
+    child.stdin?.on("error", (err) => debug("codex", "app-server closed its stdin early", err));
     child.on("error", (err) => this.fail(this.classify(err)));
     child.on("exit", (code) => {
       if (this.closed) return;
@@ -150,7 +153,13 @@ export class CodexAgentSession implements ProviderSession {
       } catch {
         return;
       }
-      this.dispatch(msg);
+      // This runs on the readline event loop: anything a handler throws
+      // is an uncaught exception in the host process, not a failed turn.
+      try {
+        this.dispatch(msg);
+      } catch (err) {
+        debug("codex", `dropped an app-server message the session could not handle (${msg.method ?? `response ${String(msg.id)}`})`, err);
+      }
     });
 
     await this.request("initialize", {
@@ -212,10 +221,12 @@ export class CodexAgentSession implements ProviderSession {
       if (parent?.aborted) controller.abort();
       else parent?.addEventListener("abort", cancel, { once: true });
       this.incoming.set(id, controller);
-      void this.handleServerRequest(msg.method, id, msg.params ?? {}, controller.signal).finally(() => {
-        parent?.removeEventListener("abort", cancel);
-        this.incoming.delete(id);
-      });
+      void this.handleServerRequest(msg.method, id, msg.params ?? {}, controller.signal)
+        .finally(() => {
+          parent?.removeEventListener("abort", cancel);
+          this.incoming.delete(id);
+        })
+        .catch((err: unknown) => debug("codex", `could not answer the app-server's ${msg.method} request`, err));
       return;
     }
     this.handleNotification(msg.method, msg.params ?? {});
@@ -260,8 +271,9 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "item/agentMessage/delta": {
-        const itemId = params["itemId"] as string;
-        const delta = params["delta"] as string;
+        const itemId = String(params["itemId"]);
+        const delta = params["delta"];
+        if (typeof delta !== "string") break;
         this.emitted.set(itemId, (this.emitted.get(itemId) ?? 0) + delta.length);
         this.push({ type: "text", text: delta });
         break;
@@ -311,8 +323,9 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "turn/completed": {
-        const turn = params["turn"] as { status?: string; error?: { message?: string } | null };
-        const turnId = (params["turn"] as { id?: string } | undefined)?.id;
+        const turn = params["turn"] as { id?: string; status?: string; error?: { message?: string } | null } | undefined;
+        if (!turn) break;
+        const turnId = turn.id;
         if (this.currentTurnId && turnId && turnId !== this.currentTurnId) break;
         const queue = this.queue;
         this.queue = null;

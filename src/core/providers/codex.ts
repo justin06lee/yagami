@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, ProviderError } from "../errors.js";
+import { debug } from "../log.js";
 import type { EngineModel } from "../models.js";
 import type {
   Provider,
@@ -170,6 +171,9 @@ export class CodexProvider implements SessionProvider {
       const timer = setTimeout(() => finish(() => reject(new ProviderError(this.id, "timed out listing models via app-server"))), 15_000);
       timer.unref?.();
       child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+      // an app-server that exits mid-handshake raises EPIPE on our writes;
+      // the close handler reports it, this just keeps it off the host
+      child.stdin.on("error", (err) => debug("codex", "app-server closed its stdin early", err));
       child.on("error", (err) => finish(() => reject(classifyProviderFailure(this.id, this.loginCommand, err))));
       child.on("close", () =>
         finish(() => reject(classifyProviderFailure(this.id, this.loginCommand, new Error(stderr.trim() || "app-server exited")))),

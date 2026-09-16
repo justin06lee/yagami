@@ -71,6 +71,21 @@ describe("spawnJsonl", () => {
     expect(pid).toBeGreaterThan(0);
     expect(await gone(pid)).toBe(true);
   });
+
+  it("survives the child closing its stdin before the prompt is written (EPIPE)", async () => {
+    // A prompt bigger than the pipe buffer, written to a child that has
+    // already closed its end: the write fails with EPIPE, which used to be
+    // an unhandled 'error' event — an uncaught exception in the host.
+    const lines: unknown[] = [];
+    for await (const line of spawnJsonl({
+      command: process.execPath,
+      args: ["-e", 'process.stdin.destroy(); setTimeout(() => console.log(JSON.stringify({ ok: true })), 150)'],
+      stdin: "x".repeat(4 << 20),
+    })) {
+      lines.push(line);
+    }
+    expect(lines).toEqual([{ ok: true }]);
+  });
 });
 
 describe("AcpProvider deadlines", () => {

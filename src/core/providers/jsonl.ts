@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
+import { debug } from "../log.js";
 import { killTree } from "./process.js";
 import { AsyncQueue } from "./queue.js";
 
@@ -42,6 +43,10 @@ export function spawnJsonl(options: SpawnJsonlOptions): AsyncIterable<unknown> {
     stderr += chunk.toString();
     if (stderr.length > 16_000) stderr = stderr.slice(-8_000);
   });
+  // A child that dies (or closes its stdin) mid-write raises EPIPE on the
+  // pipe; unhandled, that is an uncaught exception in the host. The exit
+  // handler already reports what happened.
+  child.stdin?.on("error", (err) => debug("process", `${options.command}: stdin closed early`, err));
   const rl = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
   rl.on("line", (line) => {
     const trimmed = line.trim();
