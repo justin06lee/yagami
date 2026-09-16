@@ -113,6 +113,7 @@ export class AcpProvider implements SessionProvider {
     effort: false,
     streaming: "tokens",
     serverTools: false,
+    mcpServers: false,
   };
   readonly sessionCapabilities = { fork: false } as const;
 

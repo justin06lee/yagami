@@ -7,6 +7,7 @@ import {
   query,
   type CanUseTool,
   type Options,
+  type McpServerConfig,
   type SDKResultMessage,
   type SDKUserMessage,
   type ThinkingConfig,
@@ -14,6 +15,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { resolveClaudeExecutable } from "../executable.js";
 import { classifyProviderFailure, ProviderError, type VersionSkew } from "../errors.js";
+import { flattenToolResultContent, mcpToolAllowed, parseMcpToolName, type McpServerSpec } from "../mcp.js";
 import type { EngineModel } from "../models.js";
 import type { Provider, ProviderCapabilities, TurnEvent, TurnRequest } from "../provider.js";
 import type { ContentBlockParam, ThinkingParam, Usage } from "../types.js";
@@ -51,6 +53,29 @@ const allowOnly = (enabled: string[]): CanUseTool => {
  */
 const SERVER_TOOL_MAX_TURNS = 24;
 
+/**
+ * Turn cap with MCP servers connected: the model is doing real work against
+ * the caller's own tools (an editor, an app), so it gets room, but a runaway
+ * loop still ends.
+ */
+const MCP_MAX_TURNS = 64;
+
+/**
+ * Allow the enabled server tools and the tools of the request's MCP servers
+ * (`mcp__<server>__<tool>`), subject to each server's allow list. Denials
+ * are reported back to the model without ending the turn, so it can adapt.
+ */
+const allowMcp = (servers: Record<string, McpServerSpec>, serverTools: string[]): CanUseTool => {
+  const enabled = new Set(serverTools);
+  return async (toolName, input) => {
+    if (enabled.has(toolName)) return { behavior: "allow", updatedInput: input };
+    const parsed = parseMcpToolName(toolName);
+    const spec = parsed ? servers[parsed.server] : undefined;
+    if (parsed && spec && mcpToolAllowed(spec, parsed.tool)) return { behavior: "allow", updatedInput: input };
+    return { behavior: "deny", message: `tool "${toolName}" is not enabled for this request.` };
+  };
+};
+
 export interface ClaudeProviderOptions {
   /** Path to the `claude` binary. Auto-resolved when omitted. */
   path?: string;
@@ -83,6 +108,7 @@ export class ClaudeProvider implements Provider {
     effort: true,
     streaming: "tokens",
     serverTools: true,
+    mcpServers: true,
   };
 
   private readonly configDir: string | undefined;
@@ -127,6 +153,18 @@ export class ClaudeProvider implements Provider {
       options.canUseTool = allowOnly(req.serverTools);
       options.maxTurns = SERVER_TOOL_MAX_TURNS;
     }
+    const mcp = req.mcpServers && Object.keys(req.mcpServers).length > 0 ? req.mcpServers : undefined;
+    if (mcp) {
+      const servers: Record<string, McpServerConfig> = {};
+      for (const [name, spec] of Object.entries(mcp)) {
+        // alwaysLoad: the tools must be in the very first prompt, not
+        // deferred behind tool search.
+        servers[name] = { type: "http", url: spec.url, ...(spec.headers ? { headers: spec.headers } : {}), alwaysLoad: true };
+      }
+      options.mcpServers = servers;
+      options.canUseTool = allowMcp(mcp, req.serverTools ?? []);
+      options.maxTurns = Math.max(options.maxTurns ?? 1, MCP_MAX_TURNS);
+    }
     if (req.model) options.model = req.model;
     if (req.system !== undefined) options.systemPrompt = req.system;
     if (req.resume) {
@@ -145,6 +183,8 @@ export class ClaudeProvider implements Provider {
     let model: string | undefined;
     let stopReason: string | undefined;
     let sawText = false;
+    // Ids of MCP tool calls surfaced so far; only their results are reported.
+    const mcpCalls = new Set<string>();
 
     try {
       for await (const msg of query({ prompt, options })) {
@@ -161,9 +201,27 @@ export class ClaudeProvider implements Provider {
             yield { type: "thinking", text: delta.thinking };
           }
         } else if (msg.type === "assistant" && msg.parent_tool_use_id === null) {
-          const raw = msg.message as { model?: string; stop_reason?: string | null };
+          const raw = msg.message as { model?: string; stop_reason?: string | null; content?: unknown };
           if (typeof raw.model === "string") model = raw.model;
           if (typeof raw.stop_reason === "string") stopReason = raw.stop_reason;
+          if (mcp && Array.isArray(raw.content)) {
+            for (const block of raw.content as Array<Record<string, unknown>>) {
+              if (block?.["type"] !== "tool_use" || typeof block["name"] !== "string" || typeof block["id"] !== "string") continue;
+              const parsed = parseMcpToolName(block["name"] as string);
+              if (!parsed || !mcp[parsed.server]) continue;
+              mcpCalls.add(block["id"] as string);
+              yield { type: "tool_use", id: block["id"] as string, name: parsed.tool, serverName: parsed.server, input: block["input"] ?? {} };
+            }
+          }
+        } else if (msg.type === "user" && msg.parent_tool_use_id === null && mcp) {
+          const content = (msg.message as { content?: unknown }).content;
+          if (!Array.isArray(content)) continue;
+          for (const block of content as Array<Record<string, unknown>>) {
+            if (block?.["type"] !== "tool_result" || typeof block["tool_use_id"] !== "string") continue;
+            const id = block["tool_use_id"] as string;
+            if (!mcpCalls.has(id)) continue;
+            yield { type: "tool_result", toolUseId: id, isError: block["is_error"] === true, content: flattenToolResultContent(block["content"]) };
+          }
         } else if (msg.type === "result") {
           result = msg;
         }
@@ -182,6 +240,9 @@ export class ClaudeProvider implements Provider {
     }
     // Some engine paths emit no partial events; fall back to the final text.
     if (!sawText && result.result) yield { type: "text", text: result.result };
+    // Every tool the model asked for already ran inside the turn; the caller
+    // never has a tool_use to execute, so the turn is over.
+    if (stopReason === "tool_use") stopReason = "end_turn";
 
     yield {
       type: "done",

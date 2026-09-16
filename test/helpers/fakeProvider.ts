@@ -11,6 +11,7 @@ export const FULL_CAPS: ProviderCapabilities = {
   effort: true,
   streaming: "tokens",
   serverTools: true,
+  mcpServers: true,
 };
 
 export interface ReplyOptions {

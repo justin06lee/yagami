@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { flattenToolResultContent, resolveMcpServers, type McpServerSpec } from "./mcp.js";
 import { resolveServerTools } from "./serverTools.js";
 import {
   ApiError,
@@ -12,6 +13,12 @@ export interface NormalizedMessage {
   text: string;
   /** Image/document blocks (user messages only), passed through to the engine. */
   media?: ContentBlockParam[];
+  /**
+   * MCP tool calls an assistant message carried (`mcp_tool_use` /
+   * `mcp_tool_result` blocks), as one line each, for transcript replay.
+   * Not part of the prefix key: a resumed session already lived them.
+   */
+  toolTrace?: string[];
 }
 
 export interface NormalizedRequest {
@@ -25,6 +32,8 @@ export interface NormalizedRequest {
   ignored: string[];
   /** Anthropic server tools the caller enabled, as CLI tool names. */
   serverTools?: string[];
+  /** MCP servers enabled through `mcp_servers` + `mcp_toolset`, by name. */
+  mcpServers?: Record<string, McpServerSpec>;
 }
 
 /** Params the engine cannot honor but that shouldn't fail the request. */
@@ -61,16 +70,30 @@ const USER_MEDIA_TYPES: ReadonlySet<string> = new Set(["image", "document"]);
 function contentToParts(
   content: string | ContentBlockParam[],
   role: string,
-): { text: string; media: ContentBlockParam[] } {
-  if (typeof content === "string") return { text: content, media: [] };
+): { text: string; media: ContentBlockParam[]; toolTrace: string[] } {
+  if (typeof content === "string") return { text: content, media: [], toolTrace: [] };
   if (!Array.isArray(content)) {
     throw new ApiError(400, "invalid_request_error", `message content for role "${role}" must be a string or an array of blocks`);
   }
   const parts: string[] = [];
   const media: ContentBlockParam[] = [];
+  const toolTrace: string[] = [];
+  const toolNames = new Map<string, string>();
   for (const block of content) {
     if (block?.type === "text" && typeof block["text"] === "string") {
       parts.push(block["text"] as string);
+    } else if (role === "assistant" && block?.type === "mcp_tool_use") {
+      // The MCP connector's own history shape: the call and its result were
+      // executed by the MCP server inside an earlier turn. Kept as a trace
+      // line so a replayed transcript still shows what happened.
+      const name = typeof block["name"] === "string" ? (block["name"] as string) : "tool";
+      if (typeof block["id"] === "string") toolNames.set(block["id"] as string, name);
+      const server = typeof block["server_name"] === "string" ? ` on ${block["server_name"] as string}` : "";
+      toolTrace.push(`[called ${name}${server} with ${clip(JSON.stringify(block["input"] ?? {}), 300)}]`);
+    } else if (role === "assistant" && block?.type === "mcp_tool_result") {
+      const name = typeof block["tool_use_id"] === "string" ? (toolNames.get(block["tool_use_id"] as string) ?? "tool") : "tool";
+      const verb = block["is_error"] === true ? "failed" : "returned";
+      toolTrace.push(`[${name} ${verb}: ${clip(flattenToolResultContent(block["content"]), 300)}]`);
     } else if (role === "assistant" && (block?.type === "thinking" || block?.type === "redacted_thinking")) {
       // Clients echo thinking blocks back verbatim; they carry nothing the
       // replayed transcript needs, so they are dropped rather than rejected.
@@ -94,14 +117,20 @@ function contentToParts(
       );
     }
   }
-  return { text: parts.join("\n"), media };
+  return { text: parts.join("\n"), media, toolTrace };
+}
+
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
   if (req == null || typeof req !== "object") {
     throw new ApiError(400, "invalid_request_error", "request body must be a JSON object");
   }
-  const serverTools = resolveServerTools(req.tools, req.tool_choice);
+  const mcp = resolveMcpServers(req.mcp_servers, req.tools);
+  const serverTools = resolveServerTools(mcp ? mcp.remainingTools : req.tools, req.tool_choice);
+  const mcpServers = mcp && Object.keys(mcp.servers).length > 0 ? mcp.servers : undefined;
   if (!Array.isArray(req.messages) || req.messages.length === 0) {
     throw new ApiError(400, "invalid_request_error", "`messages` must be a non-empty array");
   }
@@ -110,8 +139,13 @@ export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
     if (m?.role !== "user" && m?.role !== "assistant") {
       throw new ApiError(400, "invalid_request_error", `messages[${i}].role must be "user" or "assistant"`);
     }
-    const { text, media } = contentToParts(m.content, m.role);
-    return media.length > 0 ? { role: m.role, text, media } : { role: m.role, text };
+    const { text, media, toolTrace } = contentToParts(m.content, m.role);
+    return {
+      role: m.role,
+      text,
+      ...(media.length > 0 ? { media } : {}),
+      ...(toolTrace.length > 0 ? { toolTrace } : {}),
+    };
   });
 
   // A trailing assistant message is prefill: the reply continues from it.
@@ -145,6 +179,7 @@ export function normalizeRequest(req: MessagesRequest): NormalizedRequest {
     ...(prefill !== undefined ? { prefill } : {}),
     ignored: [...ignored],
     ...(serverTools ? { serverTools } : {}),
+    ...(mcpServers ? { mcpServers } : {}),
   };
 }
 
@@ -240,7 +275,10 @@ export function prefixKey(system: string | undefined, messages: NormalizedMessag
 export function flattenConversation(messages: NormalizedMessage[]): string {
   const history = messages.slice(0, -1);
   const last = messages[messages.length - 1]!;
-  const lines = history.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`);
+  const lines = history.map((m) => {
+    const body = m.toolTrace && m.toolTrace.length > 0 ? [...m.toolTrace, m.text].join("\n") : m.text;
+    return `${m.role === "user" ? "User" : "Assistant"}: ${body}`;
+  });
   return [
     "<conversation-history>",
     "This is the conversation so far between the user (User) and you (Assistant):",

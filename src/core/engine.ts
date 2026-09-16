@@ -259,6 +259,15 @@ export class YagamiEngine {
       );
     }
 
+    if (norm.mcpServers && !caps.mcpServers) {
+      throw new ApiError(
+        400,
+        "invalid_request_error",
+        `provider "${provider.id}" cannot connect MCP servers (${Object.keys(norm.mcpServers).join(", ")}). ` +
+          `Use the claude provider, or drop \`mcp_servers\`.`,
+      );
+    }
+
     const turn: TurnRequest = {
       prompt: promptText,
       ...(lastMedia.length > 0 ? { media: lastMedia } : {}),
@@ -268,6 +277,7 @@ export class YagamiEngine {
       ...(req.thinking != null && caps.thinking ? { thinking: req.thinking } : {}),
       ...(typeof req.effort === "string" && caps.effort ? { effort: req.effort } : {}),
       ...(norm.serverTools ? { serverTools: norm.serverTools } : {}),
+      ...(norm.mcpServers ? { mcpServers: norm.mcpServers } : {}),
     };
     const requestedModel = model
       ? provider.id === this.defaultProviderId
@@ -326,21 +336,49 @@ export class YagamiEngine {
     let text = "";
     let thinking = "";
     let done: Extract<TurnEvent, { type: "done" }> | undefined;
+    // Text and MCP tool activity keep their order, as in the real API.
+    const blocks: ContentBlock[] = [];
+    const appendText = (chunk: string): void => {
+      if (chunk.length === 0) return;
+      const last = blocks[blocks.length - 1];
+      if (last && last.type === "text") last["text"] = `${String(last["text"])}${chunk}`;
+      else blocks.push({ type: "text", text: chunk });
+    };
 
     for await (const ev of provider.run(turn)) {
-      if (ev.type === "session") sessionId = ev.sessionId;
-      else if (ev.type === "text") text += stripper ? stripper.push(ev.text) : ev.text;
-      else if (ev.type === "thinking") thinking += ev.text;
-      else done = ev;
+      if (ev.type === "session") {
+        sessionId = ev.sessionId;
+      } else if (ev.type === "text") {
+        const out = stripper ? stripper.push(ev.text) : ev.text;
+        text += out;
+        appendText(out);
+      } else if (ev.type === "thinking") {
+        thinking += ev.text;
+      } else if (ev.type === "tool_use") {
+        blocks.push(mcpToolUseBlock(ev));
+      } else if (ev.type === "tool_result") {
+        blocks.push(mcpToolResultBlock(ev));
+      } else if (ev.type === "done") {
+        done = ev;
+      }
     }
-    if (stripper) text += stripper.flush();
+    if (stripper) {
+      const held = stripper.flush();
+      text += held;
+      appendText(held);
+    }
     if (!done) throw new ProviderError(provider.id, "turn ended without a result");
 
-    this.storeSession(prepared, text, sessionId);
+    // A client echoes the reply as its text blocks joined by newlines (see
+    // transcript.ts), so that is the text the session is remembered under.
+    this.storeSession(prepared, blocks.filter((b) => b.type === "text").map((b) => String(b["text"])).join("\n"), sessionId);
 
+    // Always deliver at least one (possibly empty) text block so clients
+    // that index content[0] never see a bare message.
+    if (!blocks.some((b) => b.type === "text")) blocks.push({ type: "text", text: "" });
     const content: ContentBlock[] = [
       ...(thinking ? [{ type: "thinking", thinking, signature: "" }] : []),
-      { type: "text", text },
+      ...blocks,
     ];
     const response: MessagesResponse = {
       id: `msg_${randomUUID().replace(/-/g, "")}`,
@@ -413,7 +451,19 @@ export class YagamiEngine {
     const stripper = norm.prefill ? new PrefillStripper(norm.prefill) : undefined;
     const sse = new SseSynthesizer(`msg_${randomUUID().replace(/-/g, "")}`, requestedModel);
     let sessionId: string | undefined;
-    let text = "";
+    // Text segments as the client will see them: a tool block ends one text
+    // block and the next text starts another, and an echoed history joins
+    // them with newlines (see transcript.ts).
+    const segments: string[] = [];
+    let segmentOpen = false;
+    const appendText = (chunk: string): void => {
+      if (chunk.length === 0) return;
+      if (!segmentOpen) {
+        segments.push("");
+        segmentOpen = true;
+      }
+      segments[segments.length - 1] += chunk;
+    };
     let done: Extract<TurnEvent, { type: "done" }> | undefined;
     // The envelope is sent with the first content event, not up front, so a
     // resumed session that dies before producing anything can still be
@@ -430,13 +480,21 @@ export class YagamiEngine {
         sessionId = ev.sessionId;
       } else if (ev.type === "text") {
         const out = stripper ? stripper.push(ev.text) : ev.text;
-        text += out;
+        appendText(out);
         yield* start();
         yield* sse.text(out);
       } else if (ev.type === "thinking") {
         yield* start();
         yield* sse.thinking(ev.text);
-      } else {
+      } else if (ev.type === "tool_use") {
+        segmentOpen = false;
+        yield* start();
+        yield* sse.block(mcpToolUseBlock(ev));
+      } else if (ev.type === "tool_result") {
+        segmentOpen = false;
+        yield* start();
+        yield* sse.block(mcpToolResultBlock(ev));
+      } else if (ev.type === "done") {
         done = ev;
       }
     }
@@ -445,15 +503,30 @@ export class YagamiEngine {
     yield* start();
     if (stripper) {
       const held = stripper.flush();
-      text += held;
+      appendText(held);
       yield* sse.text(held);
     }
     yield* sse.finish(done.usage, done.stopReason ?? "end_turn");
 
-    this.storeSession(prepared, text, sessionId);
+    this.storeSession(prepared, segments.join("\n"), sessionId);
     streamOptions.onResult?.({
       ...(done.costUsd !== undefined ? { costUsd: done.costUsd } : {}),
       ...(sessionId ? { sessionId } : {}),
     });
   }
+}
+
+/** Anthropic `mcp_tool_use` block for a tool call the MCP server ran. */
+function mcpToolUseBlock(ev: Extract<TurnEvent, { type: "tool_use" }>): ContentBlock {
+  return { type: "mcp_tool_use", id: ev.id, name: ev.name, server_name: ev.serverName, input: ev.input ?? {} };
+}
+
+/** Anthropic `mcp_tool_result` block for what that call returned. */
+function mcpToolResultBlock(ev: Extract<TurnEvent, { type: "tool_result" }>): ContentBlock {
+  return {
+    type: "mcp_tool_result",
+    tool_use_id: ev.toolUseId,
+    is_error: ev.isError,
+    content: [{ type: "text", text: ev.content }],
+  };
 }

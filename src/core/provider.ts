@@ -1,3 +1,4 @@
+import type { McpServerSpec } from "./mcp.js";
 import type { ContentBlockParam, ThinkingParam, Usage } from "./types.js";
 import type { EngineModel } from "./models.js";
 
@@ -20,6 +21,12 @@ export interface ProviderCapabilities {
    * `tool_use` blocks for the caller to execute.
    */
   serverTools: boolean;
+  /**
+   * Can connect the request's `mcp_servers` and let the model call their
+   * tools during the turn (Anthropic's MCP connector). Tool activity is
+   * reported as `tool_use` / `tool_result` turn events.
+   */
+  mcpServers: boolean;
 }
 
 /** One completion turn, already normalized by the engine. */
@@ -37,6 +44,8 @@ export interface TurnRequest {
   effort?: string;
   /** CLI tool names to enable for this turn (see `core/serverTools.ts`). */
   serverTools?: string[];
+  /** MCP servers to connect for this turn, by name (see `core/mcp.ts`). */
+  mcpServers?: Record<string, McpServerSpec>;
   signal?: AbortSignal;
 }
 
@@ -44,6 +53,10 @@ export type TurnEvent =
   | { type: "session"; sessionId: string }
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
+  /** The model called a tool on one of the request's MCP servers. */
+  | { type: "tool_use"; id: string; name: string; serverName: string; input: unknown }
+  /** What that call returned (already executed by the MCP server). */
+  | { type: "tool_result"; toolUseId: string; isError: boolean; content: string }
   | {
       type: "done";
       usage: Usage;
