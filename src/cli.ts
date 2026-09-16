@@ -222,21 +222,42 @@ program
     console.log(`  since     ${state.startedAt}`);
     if (state.log) console.log(`  log       ${state.log}`);
     try {
-      const res = await fetch(`${state.url}/healthz`, { signal: AbortSignal.timeout(3000) });
+      // the details behind /healthz need the key; the CLI has it
+      const key = loadConfig().apiKeys.at(-1);
+      const res = await fetch(`${state.url}/healthz`, {
+        signal: AbortSignal.timeout(3000),
+        ...(key ? { headers: { "x-api-key": key } } : {}),
+      });
       const body = (await res.json()) as {
         version?: string;
-        claude?: string;
+        provider?: string;
+        providers?: string[];
+        executable?: string;
+        uptime_s?: number;
         requests?: number;
         total_cost_usd?: number;
       };
       console.log(`  version   ${body.version ?? "?"}`);
-      console.log(`  claude    ${body.claude ?? "?"}`);
+      if (body.provider === undefined) {
+        console.log("  details   need an API key this config doesn't have — run `yagami keygen`");
+        return;
+      }
+      console.log(`  provider  ${body.provider} — ${body.executable ?? "?"}`);
+      console.log(`  also      ${(body.providers ?? []).filter((id) => id !== body.provider).join(", ") || "(none)"}`);
+      console.log(`  uptime    ${formatUptime(body.uptime_s ?? 0)}`);
       console.log(`  requests  ${body.requests ?? 0}`);
       console.log(`  cost      $${(body.total_cost_usd ?? 0).toFixed(4)} (would-be API cost since start)`);
     } catch {
       console.log(`  healthz   unreachable — process is alive but ${state.url} is not answering`);
     }
   });
+
+function formatUptime(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
 
 program
   .command("keygen")

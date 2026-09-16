@@ -81,14 +81,18 @@ describe("auth", () => {
     expect(res.status).toBe(200);
   });
 
-  it("leaves /healthz open and reports providers", async () => {
-    const app = createApp({ engine: fakeEngine(), apiKeys: [KEY] });
-    const res = await app.request("/healthz");
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { ok: boolean; provider: string; providers: string[] };
+  it("leaves /healthz liveness open but keeps the inventory behind the key", async () => {
+    const app = createApp({ engine: fakeEngine(), apiKeys: [KEY], version: "9.9.9" });
+    const open = await app.request("/healthz");
+    expect(open.status).toBe(200);
+    expect(await open.json()).toEqual({ ok: true, service: "yagami", version: "9.9.9" });
+
+    const keyed = await app.request("/healthz", { headers: { "x-api-key": KEY } });
+    const body = (await keyed.json()) as { ok: boolean; provider: string; providers: string[]; executable: string };
     expect(body.ok).toBe(true);
     expect(body.provider).toBe("claude");
     expect(body.providers).toEqual(["claude", "codex"]);
+    expect(body.executable).toBe("/fake/claude");
   });
 });
 
@@ -130,6 +134,36 @@ describe("POST /v1/messages", () => {
     expect(res.status).toBe(400);
   });
 
+  it("400s on JSON that is not an object instead of crashing into a 500", async () => {
+    const app = createApp({ engine: fakeEngine(), apiKeys: [KEY] });
+    for (const body of ["null", "[1]", '"hi"', "5"]) {
+      const res = await app.request("/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": KEY },
+        body,
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: { message: string } }).error.message).toMatch(/JSON object/);
+    }
+  });
+
+  it("413s bodies over the cap, in each dialect's error shape", async () => {
+    const app = createApp({ engine: fakeEngine(), apiKeys: [KEY], maxBodyBytes: 64 });
+    const big = JSON.stringify({ ...BASIC_REQ, padding: "x".repeat(200) });
+    const res = await post(app, JSON.parse(big));
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe("invalid_request_error");
+    const chat = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": KEY },
+      body: big,
+    });
+    expect(chat.status).toBe(413);
+    expect(await chat.json()).toMatchObject({ error: { type: "invalid_request_error", param: null, code: null } });
+    // under the cap still works
+    expect((await post(app, { messages: [{ role: "user", content: "hi" }] })).status).toBe(200);
+  });
+
   it("streams SSE events", async () => {
     const app = createApp({ engine: fakeEngine(), apiKeys: [KEY] });
     const res = await post(app, { ...BASIC_REQ, stream: true });
@@ -147,7 +181,7 @@ describe("stats and request logging", () => {
     const app = createApp({ engine: fakeEngine(), apiKeys: [KEY] });
     await post(app, BASIC_REQ);
     await (await post(app, { ...BASIC_REQ, stream: true })).text();
-    const res = await app.request("/healthz");
+    const res = await app.request("/healthz", { headers: { "x-api-key": KEY } });
     const body = (await res.json()) as { requests: number; total_cost_usd: number; uptime_s: number };
     expect(body.requests).toBe(2);
     expect(body.total_cost_usd).toBeCloseTo(0.0173, 6);

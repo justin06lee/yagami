@@ -195,7 +195,7 @@ if (isSessionProvider(codex)) {
 
 `ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), `permissions`, optional `input`, and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). A session provider reports `sessionCapabilities.fork`; when true, `{ resume, fork: true }` branches at the tip and `{ resume, forkAt: turnId }` branches through an exact `turn` event without mutating the source conversation. Input fields preserve labels, options, required/secret flags, primitive constraints, and URLs; omitting the handler declines safely instead of hanging a turn. ACP sessions also map `effort` onto the agent's `thought_level` option when it exposes one. The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
 
-The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
+The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"` — it takes the same fields as the config file plus `log` and `providerInstances` (hand-picked `Provider` objects instead of auto-detection).
 
 ## Providers
 
@@ -231,7 +231,7 @@ Any other ACP agent works too — add it to config with its launch command:
 |---|---|
 | `yagami start` | Start the server (`-p` port, `-H` host, `--provider <id>` default provider, `--claude <path>`, `--cors`). Add `--daemon` to run it in the background (`--log <file>` overrides the default log at `~/.config/yagami/yagami.log`) |
 | `yagami stop` | Stop the running server |
-| `yagami status` | Show whether it's running, plus uptime, request count, and cumulative would-be API cost |
+| `yagami status` | Show whether it's running, plus its providers, uptime, request count, and cumulative would-be API cost |
 | `yagami key` | Print the URL + API key, plus ready-to-paste `ANTHROPIC_*`/`OPENAI_*` env exports for client apps |
 | `yagami models` | List models across every installed provider (`--provider <id>` to filter) |
 | `yagami keygen` | Generate another API key and save it to the config |
@@ -266,9 +266,9 @@ A config file that exists but isn't valid JSON is an error, not "no config": the
 - **Multi-turn**: the Messages API is stateless but harness sessions aren't. yagami hashes each conversation prefix (per provider) and remembers which session produced it; a follow-up request resumes that session and sends only the new user message. Unmatched histories fall back to replaying the transcript in a single prompt, and if a cached session turns out to be gone, the stale mapping is dropped and the request transparently retries via replay. The cache persists across restarts at `~/.config/yagami/sessions.json`.
 - **Streaming**: every harness's output is normalized into deltas and re-emitted as a proper Anthropic SSE sequence — `message_start` → thinking/text content blocks → `message_delta` → `message_stop` (or the OpenAI chunk sequence on the chat-completions path). Claude and ACP agents stream tokens; Codex streams per message part.
 - **Models**: `GET /v1/models` asks each installed CLI what it supports (Claude via the SDK, Codex via its app-server protocol, ACP agents via their session config) — probed once per process, then cached. Library callers also receive native model metadata when reported: reasoning levels/default, input modalities, fast/auto/adaptive-thinking flags, personality and multi-agent support, service tiers, and the provider's default model. Failed probes are skipped and retried next time; a static fallback list is served only if nothing answers (`x-yagami-models-source` says which).
-- **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else.
+- **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else. Request bodies are capped at 32 MB (the real API's limit; `413` beyond it), and a port that's already taken fails `yagami start` with one line instead of a crash.
 
-Extra response headers: `x-yagami-provider`, `x-yagami-cost-usd` (what the turn would have cost at API prices, when the harness reports it), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params). `/healthz` (unauthenticated) reports the default provider, installed providers, uptime, request count, and the cumulative would-be cost — `yagami status` shows the same.
+Extra response headers: `x-yagami-provider`, `x-yagami-cost-usd` (what the turn would have cost at API prices, when the harness reports it), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params). `/healthz` answers `{ ok, service, version }` to anyone (liveness); with a valid key it also reports the default provider, installed providers, the binary's path, uptime, request count, and the cumulative would-be cost — `yagami status` shows the same.
 
 ## Limitations
 
