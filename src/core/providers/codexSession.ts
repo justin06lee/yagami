@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
 import { AuthRequiredError, classifyProviderFailure, looksLikeAuthFailure, ProviderError } from "../errors.js";
 import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
+import { debug } from "../log.js";
 import type {
   AgentEvent,
   ProviderSession,
@@ -493,7 +494,8 @@ export class CodexAgentSession implements ProviderSession {
       const decision = await this.config.options.permissions.decide(request, signal);
       this.push({ type: "permission", request, decision });
       return decision;
-    } catch {
+    } catch (err) {
+      debug("codex", `the host's permission handler failed; denying ${request.tool}`, err);
       return "deny";
     }
   }
@@ -608,7 +610,8 @@ export class CodexAgentSession implements ProviderSession {
     try {
       if (signal?.aborted) return { action: "cancel" };
       return await handler.respond(request, signal);
-    } catch {
+    } catch (err) {
+      debug("codex", "the host's input handler failed; cancelling the request", err);
       return { action: "cancel" };
     }
   }

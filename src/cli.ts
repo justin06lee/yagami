@@ -21,6 +21,7 @@ import {
   sessionCachePath,
   writeServerState,
 } from "./server/config.js";
+import { debug } from "./core/log.js";
 import { VERSION } from "./version.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -336,8 +337,9 @@ program
         if (skew) {
           console.log(`\nagent sdk   ${skew.sdkVersion} ↔ claude ${skew.binaryVersion} — ${skew.inSync ? "in sync" : `⚠ ${skew.note}`}`);
         }
-      } catch {
+      } catch (err) {
         // skew check is advisory
+        debug("doctor", "could not compare the Agent SDK build with the claude binary", err);
       }
     }
 
@@ -405,4 +407,9 @@ program
     }
   });
 
-await program.parseAsync(process.argv);
+// Whatever a command could not handle itself (an unreadable config file, a
+// dead binary) is one line, not a stack trace.
+await program.parseAsync(process.argv).catch((err: unknown) => {
+  console.error(`yagami: ${err instanceof Error ? err.message : String(err)}`);
+  process.exitCode = 1;
+});

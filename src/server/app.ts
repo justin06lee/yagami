@@ -5,6 +5,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError, type MessagesRequest } from "../core/types.js";
 import { toApiError } from "../core/errors.js";
+import { debug } from "../core/log.js";
 import type { CompleteResult, EngineModel, StreamOptions, StreamStart } from "../core/engine.js";
 import {
   ChatChunkTranslator,
@@ -123,8 +124,9 @@ export function createApp(options: AppOptions): Hono {
         models = probed;
         source = "engine";
       }
-    } catch {
+    } catch (err) {
       // engine unavailable or slow — the static list keeps clients working
+      debug("models", "probing the CLIs failed; serving the static fallback list", err);
     }
     c.header("x-yagami-models-source", source);
     return c.json(modelListBody(models));

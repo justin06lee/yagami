@@ -34,6 +34,7 @@ export {
   type TranslatedChatRequest,
 } from "./core/openai.js";
 export { loadHostEngineConfig, yagamiConfigDir, type HostEngineConfig } from "./core/hostConfig.js";
+export { setLogSink, type LogSink } from "./core/log.js";
 export {
   YagamiEngine,
   type EngineOptions,

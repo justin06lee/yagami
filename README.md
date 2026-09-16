@@ -257,6 +257,8 @@ Every request is logged as one line (time, status, model, duration, cost, sessio
 
 Env overrides: `YAGAMI_HOST`, `YAGAMI_PORT`, `YAGAMI_API_KEY`, `YAGAMI_PROVIDER`, `YAGAMI_DEFAULT_MODEL`, `YAGAMI_CLAUDE_PATH`, `YAGAMI_CODEX_PATH`. The older `claudePath` / `claudeConfigDir` keys still work as shorthands for `providers.claude`. Library mode reads the same file (minus the server-only fields — host, port, keys), which is what keeps an embedded `Yagami` and the binary in agreement.
 
+A config file that exists but isn't valid JSON is an error, not "no config": the binary refuses to start (it would otherwise save defaults plus a fresh key over your settings), and library mode warns and proceeds with auto-detection alone. Everything yagami survives on purpose — a failed model probe, a session cache it couldn't save, a host handler that threw — is reported on stderr; set `YAGAMI_DEBUG=1` to also see the expected, recoverable kind, and in library mode `setLogSink(fn)` routes all of it wherever your app logs (`setLogSink(() => {})` silences it, `setLogSink(null)` restores stderr).
+
 ## How it works
 
 - **Engine**: each request becomes one sandboxed turn on the chosen harness. Claude runs with `tools: []`, `settingSources: []` (your CLAUDE.md/skills never leak into API completions), `maxTurns: 1` and a deny-all permission callback; Codex runs in its read-only sandbox with no approvals; ACP agents are moved to a plan/read-only mode when they offer one and every permission request is refused. All of them work in a throwaway directory. The API is text-in/text-out; a leaked key can burn tokens but never edit anything on the host — though note that agents other than Claude keep their own read-only tools, so they can still *look* at that empty directory.

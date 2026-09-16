@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync, type ChildProcess } from "node:child_process";
+import { debug } from "../log.js";
 
 /**
  * Ending a CLI for good.
@@ -24,7 +25,8 @@ function descendants(root: number): number[] {
   let listing: string;
   try {
     listing = execFileSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8", timeout: 2000 });
-  } catch {
+  } catch (err) {
+    debug("process", `could not list processes; only pid ${root} itself will be signalled`, err);
     return [];
   }
   const children = new Map<number, number[]>();

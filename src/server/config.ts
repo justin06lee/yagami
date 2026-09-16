@@ -88,13 +88,36 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** Config as stored on disk, without env overrides (safe to save back). */
+/**
+ * Config as stored on disk, without env overrides (safe to save back).
+ *
+ * A missing file means defaults. A file that exists but cannot be parsed is
+ * an error, not defaults: treating it as empty used to make the next
+ * `yagami start` generate a key and save "defaults plus key" over the
+ * user's providers and settings.
+ */
 export function loadFileConfig(): YagamiConfig {
   let fromFile: Partial<YagamiConfig> = {};
+  const file = configFilePath();
+  let raw: string | undefined;
   try {
-    fromFile = JSON.parse(fs.readFileSync(configFilePath(), "utf8")) as Partial<YagamiConfig>;
-  } catch {
-    // no config file yet
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new Error(`cannot read config file ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (raw !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`config file ${file} is not valid JSON (${err instanceof Error ? err.message : String(err)}); fix or remove it`);
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`config file ${file} must contain a JSON object; fix or remove it`);
+    }
+    fromFile = parsed as Partial<YagamiConfig>;
   }
   return {
     ...DEFAULT_CONFIG,

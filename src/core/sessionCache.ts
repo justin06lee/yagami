@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { warn } from "./log.js";
 
 export interface SessionCacheOptions {
   maxEntries?: number;
@@ -17,6 +18,8 @@ export class SessionCache {
   private readonly maxEntries: number;
   private readonly persistPath: string | undefined;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A failing disk is reported once, not every 200 ms. */
+  private persistFailed = false;
 
   constructor(options: SessionCacheOptions = {}) {
     this.maxEntries = options.maxEntries ?? 1000;
@@ -62,8 +65,11 @@ export class SessionCache {
       for (const [key, value] of raw.entries ?? []) {
         if (typeof key === "string" && typeof value === "string") this.map.set(key, value);
       }
-    } catch {
-      // missing or corrupt cache file — start empty
+    } catch (err) {
+      // no file yet is the normal first run; anything else is worth a line
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        warn("sessions", `ignoring unreadable session cache ${this.persistPath}; starting empty`, err);
+      }
     }
   }
 
@@ -87,8 +93,11 @@ export class SessionCache {
         JSON.stringify({ version: 1, entries: [...this.map] }),
         { mode: 0o600 },
       );
-    } catch {
+      this.persistFailed = false;
+    } catch (err) {
       // persistence is best-effort; the cache still works in memory
+      if (!this.persistFailed) warn("sessions", `could not save the session cache to ${this.persistPath}`, err);
+      this.persistFailed = true;
     }
   }
 }

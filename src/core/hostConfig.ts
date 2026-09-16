@@ -9,6 +9,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { warn } from "./log.js";
 import type { ProviderConfigEntry } from "./providers/registry.js";
 
 export function yagamiConfigDir(): string {
@@ -26,10 +27,20 @@ export interface HostEngineConfig {
 
 export function loadHostEngineConfig(): HostEngineConfig {
   let file: Record<string, unknown> = {};
+  const configPath = path.join(yagamiConfigDir(), "config.json");
   try {
-    file = JSON.parse(fs.readFileSync(path.join(yagamiConfigDir(), "config.json"), "utf8")) as Record<string, unknown>;
-  } catch {
-    // no config file — auto-detection alone is fine
+    const parsed: unknown = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("expected a JSON object");
+    }
+    file = parsed as Record<string, unknown>;
+  } catch (err) {
+    // no config file — auto-detection alone is fine; a broken one is not
+    // silently the same thing, because "library and binary agree" is the
+    // promise and a corrupt file means they cannot
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      warn("config", `ignoring ${configPath}: not valid JSON`, err);
+    }
   }
   const env = process.env;
   const defaultProvider = env["YAGAMI_PROVIDER"] ?? (typeof file["defaultProvider"] === "string" ? file["defaultProvider"] : undefined);

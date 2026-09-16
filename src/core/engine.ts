@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ProviderError, ProviderNotInstalledError, toApiError } from "./errors.js";
+import { debug } from "./log.js";
 import type { EngineModel } from "./models.js";
 import { parseModelRef, qualifiedModel, type Provider, type TurnEvent, type TurnRequest } from "./provider.js";
 import { loadProviders, type ProviderConfigEntry } from "./providers/registry.js";
@@ -163,7 +164,8 @@ export class YagamiEngine {
       [...this.providers.entries()].map(async ([id, provider]) => {
         try {
           return [id, await this.providerModels(id, provider)] as const;
-        } catch {
+        } catch (err) {
+          debug("models", `${id} did not report its models; skipped until the next probe`, err);
           return [id, []] as const;
         }
       }),
@@ -286,7 +288,8 @@ export class YagamiEngine {
     this.cache.delete(failed.resumeKey);
     try {
       return this.prepare(req, { skipResume: true });
-    } catch {
+    } catch (err) {
+      debug("engine", "cannot replay the transcript after a failed resume; reporting the original failure", err);
       return undefined;
     }
   }
