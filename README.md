@@ -32,7 +32,7 @@ yagami start  # first run generates + saves an API key and prints it
 `make update` stops any running yagami server, rebuilds, reinstalls, and restarts it. Or install from npm: `bun add -g @justin06lee/yagami`.
 
 ```
-yagami v0.7.0
+yagami v0.9.0
   listening   http://127.0.0.1:8787
   provider    claude — /Users/you/.local/bin/claude (2.1.238 (Claude Code))
   also        codex, opencode (use model "<provider>:<model>")
