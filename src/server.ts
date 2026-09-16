@@ -101,6 +101,7 @@ export {
   writeServerState,
   clearServerState,
   isProcessAlive,
+  isServerProcess,
   yagamiConfigDir,
   type YagamiConfig,
   type ServerState,

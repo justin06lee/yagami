@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -86,6 +87,41 @@ export function isProcessAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/** `ps` elapsed time (`[[dd-]hh:]mm:ss`) in seconds; undefined when unparseable. */
+export function parseElapsed(etime: string): number | undefined {
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(etime.trim());
+  if (!m) return undefined;
+  const [, days = "0", hours = "0", minutes, seconds] = m;
+  return Number(days) * 86_400 + Number(hours) * 3_600 + Number(minutes) * 60 + Number(seconds);
+}
+
+/** When `pid` started, per `ps`; undefined where that cannot be asked. */
+function processStartedAt(pid: number): number | undefined {
+  if (process.platform === "win32") return undefined;
+  try {
+    const out = execFileSync("ps", ["-o", "etime=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 });
+    const elapsed = parseElapsed(out);
+    return elapsed === undefined ? undefined : Date.now() - elapsed * 1000;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether `state` still describes a live yagami server — not merely
+ * whether *some* process has its pid. server.json outlives reboots and
+ * crashes, and pids are recycled: after either, `yagami stop` used to
+ * SIGTERM whatever now holds the number. A process that started after
+ * the state file was written cannot be the server that wrote it.
+ */
+export function isServerProcess(state: ServerState, toleranceMs = 120_000): boolean {
+  if (!isProcessAlive(state.pid)) return false;
+  const startedAt = Date.parse(state.startedAt);
+  const processStart = processStartedAt(state.pid);
+  if (!Number.isFinite(startedAt) || processStart === undefined) return true;
+  return processStart <= startedAt + toleranceMs;
 }
 
 /**

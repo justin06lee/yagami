@@ -12,6 +12,7 @@ import {
   configFilePath,
   generateApiKey,
   isProcessAlive,
+  isServerProcess,
   loadConfig,
   loadFileConfig,
   logFilePath,
@@ -131,16 +132,17 @@ program
 
 async function startDaemon(opts: StartFlags, freshKey: string | undefined): Promise<void> {
   const existing = readServerState();
-  if (existing && isProcessAlive(existing.pid)) {
+  if (existing && isServerProcess(existing)) {
     console.error(`yagami is already running (pid ${existing.pid}, ${existing.url}) — \`yagami stop\` first`);
     process.exitCode = 1;
     return;
   }
   clearServerState();
 
+  // request lines name models and sessions; nobody else on the box needs them
   const logPath = opts.log ? path.resolve(opts.log) : logFilePath();
-  fs.mkdirSync(path.dirname(logPath), { recursive: true });
-  const fd = fs.openSync(logPath, "a");
+  fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+  const fd = fs.openSync(logPath, "a", 0o600);
   const args = [process.argv[1]!, "start"];
   if (opts.port !== undefined) args.push("-p", opts.port);
   if (opts.host !== undefined) args.push("-H", opts.host);
@@ -190,31 +192,44 @@ program
   .description("stop a running yagami server")
   .action(async () => {
     const state = readServerState();
-    if (!state || !isProcessAlive(state.pid)) {
+    if (!state || !isServerProcess(state)) {
       if (state) clearServerState();
       console.log("yagami is not running");
       return;
     }
+    // Ask first, insist after: a server wedged in a stuck turn must still
+    // end, or `make update` and the next `start` are blocked by it.
     process.kill(state.pid, "SIGTERM");
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      if (!isProcessAlive(state.pid)) {
-        clearServerState();
-        console.log(`stopped yagami (pid ${state.pid})`);
-        return;
-      }
-      await sleep(100);
+    if (await exited(state.pid, 5_000)) {
+      clearServerState();
+      console.log(`stopped yagami (pid ${state.pid})`);
+      return;
     }
-    console.error(`yagami (pid ${state.pid}) did not exit within 5s`);
+    process.kill(state.pid, "SIGKILL");
+    if (await exited(state.pid, 2_000)) {
+      clearServerState();
+      console.log(`stopped yagami (pid ${state.pid}) — it ignored SIGTERM and was killed`);
+      return;
+    }
+    console.error(`yagami (pid ${state.pid}) did not exit even after SIGKILL`);
     process.exitCode = 1;
   });
+
+async function exited(pid: number, withinMs: number): Promise<boolean> {
+  const deadline = Date.now() + withinMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await sleep(100);
+  }
+  return !isProcessAlive(pid);
+}
 
 program
   .command("status")
   .description("show whether yagami is running, plus request/cost totals")
   .action(async () => {
     const state = readServerState();
-    if (!state || !isProcessAlive(state.pid)) {
+    if (!state || !isServerProcess(state)) {
       if (state) clearServerState();
       console.log("yagami is not running");
       process.exitCode = 1;
@@ -280,7 +295,7 @@ program
   .action(() => {
     const cfg = loadConfig();
     const state = readServerState();
-    const live = state !== undefined && isProcessAlive(state.pid);
+    const live = state !== undefined && isServerProcess(state);
     const url = live ? state.url : `http://${cfg.host}:${cfg.port}`;
     if (cfg.apiKeys.length === 0) {
       console.error("no API keys configured — run `yagami start` (generates one) or `yagami keygen`");
@@ -326,7 +341,7 @@ program
     console.log(`sessions    ${sessionCachePath()}${fs.existsSync(sessionCachePath()) ? "" : " (empty)"}`);
     const state = readServerState();
     console.log(
-      `server      ${state && isProcessAlive(state.pid) ? `running (pid ${state.pid}, ${state.url})` : "not running"}`,
+      `server      ${state && isServerProcess(state) ? `running (pid ${state.pid}, ${state.url})` : "not running"}`,
     );
 
     console.log("\nproviders   (model ids route as \"<provider>:<model>\"; bare ids go to the default)");
