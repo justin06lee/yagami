@@ -484,6 +484,8 @@ export class YagamiEngine {
         yield* start();
         yield* sse.text(out);
       } else if (ev.type === "thinking") {
+        // A thinking block also ends the open text block on the wire.
+        segmentOpen = false;
         yield* start();
         yield* sse.thinking(ev.text);
       } else if (ev.type === "tool_use") {

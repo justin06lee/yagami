@@ -213,6 +213,26 @@ describe("engine with MCP servers", () => {
     expect(fake.calls[1]!.prompt).toBe("and its type?");
   });
 
+  it("remembers a streamed reply split by thinking the way the client echoes it", async () => {
+    const fake = new FakeProvider("fake", FULL_CAPS, () => [
+      { type: "session", sessionId: "sess-split" },
+      { type: "text", text: "one" },
+      { type: "thinking", text: "hmm" },
+      { type: "text", text: "two" },
+      { type: "done", usage: { input_tokens: 1, output_tokens: 1 } },
+    ]);
+    const engine = makeEngine([fake]);
+    await collect(engine.stream({ messages: [USER("go")], stream: true }).events);
+    await engine.complete({
+      messages: [
+        USER("go"),
+        { role: "assistant", content: [{ type: "text", text: "one" }, { type: "thinking", thinking: "hmm", signature: "" }, { type: "text", text: "two" }] },
+        USER("again"),
+      ],
+    });
+    expect(fake.calls[1]!.resume).toBe("sess-split");
+  });
+
   it("refuses MCP servers on providers that cannot connect them", async () => {
     const fake = new FakeProvider("codexish", { ...FULL_CAPS, mcpServers: false });
     const engine = makeEngine([fake]);
