@@ -56,6 +56,22 @@ export class SseSynthesizer {
     return out;
   }
 
+  /**
+   * A complete, non-streamed block (MCP tool use/result): closes whatever
+   * is open, then start + stop with the whole block in `content_block_start`.
+   */
+  block(block: { type: string; [key: string]: unknown }): SseEvent[] {
+    const out = this.closeOpen();
+    this.index += 1;
+    this.startedBlocks += 1;
+    out.push({
+      event: "content_block_start",
+      data: { type: "content_block_start", index: this.index, content_block: block },
+    });
+    out.push({ event: "content_block_stop", data: { type: "content_block_stop", index: this.index } });
+    return out;
+  }
+
   finish(usage: Usage, stopReason = "end_turn"): SseEvent[] {
     const out: SseEvent[] = [];
     // Always deliver at least one (possibly empty) text block so clients

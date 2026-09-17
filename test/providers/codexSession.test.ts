@@ -224,6 +224,25 @@ describe("CodexAgentSession", () => {
     } finally { await s.close(); }
   });
 
+  it("survives malformed notifications without dropping the turn", async () => {
+    const s = session("allow");
+    try {
+      const events = await collect(s.send("[malformed] run it"));
+      const own = events.filter((e: AgentEvent) => !("thread" in e));
+      expect(own.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { text: string }).text)).toEqual(["hel", "lo", " there"]);
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "end_turn" });
+    } finally { await s.close(); }
+  });
+
+  it("fails the turn, not the host, when the app-server dies mid-turn", async () => {
+    const s = session("allow");
+    try {
+      await expect(collect(s.send("[die] run it"))).rejects.toThrow(/exited with code 3/);
+      // the session is spent: a later send does not hang or crash either
+      await expect(collect(s.send("again"))).rejects.toThrow();
+    } finally { await s.close(); }
+  });
+
   it("dismisses an input request resolved by the server", async () => {
     let cancelled = false;
     const s = session("allow", undefined, {

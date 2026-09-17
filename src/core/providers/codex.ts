@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, ProviderError } from "../errors.js";
+import { debug } from "../log.js";
 import type { EngineModel } from "../models.js";
 import type {
   Provider,
@@ -58,6 +59,7 @@ export class CodexProvider implements SessionProvider {
     effort: true,
     streaming: "chunks",
     serverTools: false,
+    mcpServers: false,
   };
   readonly sessionCapabilities = { fork: true } as const;
 
@@ -77,14 +79,25 @@ export class CodexProvider implements SessionProvider {
     fs.mkdirSync(this.workDir, { recursive: true });
   }
 
-  /** Build the `codex exec` argument list for a turn (exported for tests). */
+  /**
+   * Build the `codex exec` argument list for a turn (exported for tests).
+   *
+   * The prompt itself is never an argument: `-` tells codex to read it
+   * from stdin (see `run`). Passed positionally, a message starting with
+   * `-` parsed as a flag, and a long replayed transcript could exceed the
+   * kernel's argument limit.
+   */
   buildArgs(req: TurnRequest, imagePaths: string[]): string[] {
     const args = ["exec", "--json", "--skip-git-repo-check", "-C", this.workDir, "-s", this.sandbox, "--color", "never"];
     if (req.model) args.push("-m", req.model);
-    if (req.effort) args.push("-c", `model_reasoning_effort="${req.effort}"`);
+    if (req.effort) {
+      // interpolated into a TOML override: only a bare word may go in
+      if (!/^[a-z]+$/.test(req.effort)) throw new ProviderError(this.id, `invalid effort "${req.effort}"`);
+      args.push("-c", `model_reasoning_effort="${req.effort}"`);
+    }
     for (const p of imagePaths) args.push("-i", p);
     if (req.resume) args.push("resume", req.resume);
-    args.push(req.prompt);
+    args.push("-");
     return args;
   }
 
@@ -98,6 +111,7 @@ export class CodexProvider implements SessionProvider {
         args: this.buildArgs(req, imagePaths),
         cwd: this.workDir,
         env: this.env,
+        stdin: req.prompt,
         ...(req.signal ? { signal: req.signal } : {}),
       })) {
         const ev = raw as { type: string; thread_id?: string; item?: CodexItem; usage?: Record<string, number>; error?: { message?: string }; message?: string };
@@ -170,6 +184,9 @@ export class CodexProvider implements SessionProvider {
       const timer = setTimeout(() => finish(() => reject(new ProviderError(this.id, "timed out listing models via app-server"))), 15_000);
       timer.unref?.();
       child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+      // an app-server that exits mid-handshake raises EPIPE on our writes;
+      // the close handler reports it, this just keeps it off the host
+      child.stdin.on("error", (err) => debug("codex", "app-server closed its stdin early", err));
       child.on("error", (err) => finish(() => reject(classifyProviderFailure(this.id, this.loginCommand, err))));
       child.on("close", () =>
         finish(() => reject(classifyProviderFailure(this.id, this.loginCommand, new Error(stderr.trim() || "app-server exited")))),

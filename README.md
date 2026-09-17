@@ -32,7 +32,7 @@ yagami start  # first run generates + saves an API key and prints it
 `make update` stops any running yagami server, rebuilds, reinstalls, and restarts it. Or install from npm: `bun add -g @justin06lee/yagami`.
 
 ```
-yagami v0.7.0
+yagami v0.10.0
   listening   http://127.0.0.1:8787
   provider    claude — /Users/you/.local/bin/claude (2.1.238 (Claude Code))
   also        codex, opencode (use model "<provider>:<model>")
@@ -89,6 +89,21 @@ curl http://127.0.0.1:8787/v1/messages \
 Server tools run *inside* the engine — they map onto the CLI's own `WebSearch` and `WebFetch`, and the results are folded into the reply. Nothing changes about the endpoint's contract: it still never emits a `tool_use` block for you to execute. Every dated variant of a type works (`web_search_20250305`, `web_search_20260209`, …), `tool_choice` may be `auto` or `none`, and any other tool in the array is rejected — a custom tool would have to run on your side, and there is no round trip here to run it on. Only the claude provider serves them; asking codex or an ACP agent for them fails loudly rather than quietly answering without the lookup.
 
 One caveat for OpenAI-dialect apps: the `model` field still routes through yagami's providers — set it to a model your CLIs actually serve (`sonnet`, `codex:gpt-5.6-sol`, `opencode:…`), not whatever `gpt-*` id the app defaults to.
+
+### MCP servers
+
+`/v1/messages` also accepts Anthropic's **MCP connector**: declare the servers in `mcp_servers`, enable them with `mcp_toolset` entries in `tools`, and the engine connects to them for the turn. The model calls their tools as it works, and the activity comes back in the reply as `mcp_tool_use` / `mcp_tool_result` content blocks, exactly as the real API does it:
+
+```sh
+curl http://127.0.0.1:8787/v1/messages \
+  -H "x-api-key: ygm_..." -H "content-type: application/json" \
+  -d '{"model":"opus","max_tokens":1024,
+       "mcp_servers":[{"type":"url","url":"http://127.0.0.1:52011/mcp","name":"editor"}],
+       "tools":[{"type":"mcp_toolset","mcp_server_name":"editor"}],
+       "messages":[{"role":"user","content":"What is the root node of the open scene?"}]}'
+```
+
+This is how a program gets tools without running a tool loop: the tools live wherever the MCP server lives (a game editor, a desktop app, a box on the LAN), the turn stays one request/response, and the server sees a normal MCP client. [hitbox](https://github.com/justin06lee/hitbox), the Godot fork with Claude built in, works this way: the editor is the MCP server, yagami is the brain. `authorization_token` becomes a bearer header, `tool_configuration.allowed_tools` and per-toolset `configs` narrow what the model may call, and `mcp_tool_use`/`mcp_tool_result` blocks echoed back in assistant history are accepted (they replay as a short trace when no cached session matches). Servers must speak streamable HTTP or SSE; the claude provider is the only one that connects them, and the turn cap rises from 1 to 64 model turns while they are connected.
 
 ## Library mode
 
@@ -195,7 +210,7 @@ if (isSessionProvider(codex)) {
 
 `ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), `permissions`, optional `input`, and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). A session provider reports `sessionCapabilities.fork`; when true, `{ resume, fork: true }` branches at the tip and `{ resume, forkAt: turnId }` branches through an exact `turn` event without mutating the source conversation. Input fields preserve labels, options, required/secret flags, primitive constraints, and URLs; omitting the handler declines safely instead of hanging a turn. ACP sessions also map `effort` onto the agent's `thought_level` option when it exposes one. The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
 
-The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"`.
+The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"` — it takes the same fields as the config file plus `log` and `providerInstances` (hand-picked `Provider` objects instead of auto-detection).
 
 ## Providers
 
@@ -230,8 +245,8 @@ Any other ACP agent works too — add it to config with its launch command:
 | Command | What it does |
 |---|---|
 | `yagami start` | Start the server (`-p` port, `-H` host, `--provider <id>` default provider, `--claude <path>`, `--cors`). Add `--daemon` to run it in the background (`--log <file>` overrides the default log at `~/.config/yagami/yagami.log`) |
-| `yagami stop` | Stop the running server |
-| `yagami status` | Show whether it's running, plus uptime, request count, and cumulative would-be API cost |
+| `yagami stop` | Stop the running server: SIGTERM, then SIGKILL after 5 s if it's wedged. Only ever signals the process that wrote the state file — a pid recycled after a reboot or crash is left alone |
+| `yagami status` | Show whether it's running, plus its providers, uptime, request count, and cumulative would-be API cost |
 | `yagami key` | Print the URL + API key, plus ready-to-paste `ANTHROPIC_*`/`OPENAI_*` env exports for client apps |
 | `yagami models` | List models across every installed provider (`--provider <id>` to filter) |
 | `yagami keygen` | Generate another API key and save it to the config |
@@ -257,20 +272,22 @@ Every request is logged as one line (time, status, model, duration, cost, sessio
 
 Env overrides: `YAGAMI_HOST`, `YAGAMI_PORT`, `YAGAMI_API_KEY`, `YAGAMI_PROVIDER`, `YAGAMI_DEFAULT_MODEL`, `YAGAMI_CLAUDE_PATH`, `YAGAMI_CODEX_PATH`. The older `claudePath` / `claudeConfigDir` keys still work as shorthands for `providers.claude`. Library mode reads the same file (minus the server-only fields — host, port, keys), which is what keeps an embedded `Yagami` and the binary in agreement.
 
+A config file that exists but isn't valid JSON is an error, not "no config": the binary refuses to start (it would otherwise save defaults plus a fresh key over your settings), and library mode warns and proceeds with auto-detection alone. Everything yagami survives on purpose — a failed model probe, a session cache it couldn't save, a host handler that threw — is reported on stderr; set `YAGAMI_DEBUG=1` to also see the expected, recoverable kind, and in library mode `setLogSink(fn)` routes all of it wherever your app logs (`setLogSink(() => {})` silences it, `setLogSink(null)` restores stderr).
+
 ## How it works
 
-- **Engine**: each request becomes one sandboxed turn on the chosen harness. Claude runs with `tools: []`, `settingSources: []` (your CLAUDE.md/skills never leak into API completions), `maxTurns: 1` and a deny-all permission callback; Codex runs in its read-only sandbox with no approvals; ACP agents are moved to a plan/read-only mode when they offer one and every permission request is refused. All of them work in a throwaway directory. The API is text-in/text-out; a leaked key can burn tokens but never edit anything on the host — though note that agents other than Claude keep their own read-only tools, so they can still *look* at that empty directory.
+- **Engine**: each request becomes one sandboxed turn on the chosen harness. Claude runs with `tools: []`, `settingSources: []` (your CLAUDE.md/skills never leak into API completions), `maxTurns: 1` and a deny-all permission callback — a request with server tools or MCP servers lifts the turn cap (24 and 64) and allows exactly those tools; Codex runs in its read-only sandbox with no approvals (the prompt reaches it on stdin, never as an argument, so a message that starts with `-` is a message and a long replayed transcript can't overflow the argument list); ACP agents are moved to a plan/read-only mode when they offer one and every permission request is refused. All of them work in a throwaway directory. The API is text-in/text-out; a leaked key can burn tokens but never edit anything on the host — though note that agents other than Claude keep their own read-only tools, so they can still *look* at that empty directory.
 - **Dialects**: `POST /v1/messages` is native. `POST /v1/chat/completions` translates OpenAI shapes at the edge — system/developer messages fold into `system`, `image_url` parts become image blocks, streams are re-emitted as `chat.completion.chunk` events ending in `[DONE]`, and thinking output rides along as `reasoning_content`. Errors on that path come back OpenAI-shaped too. `GET /v1/models` serves one merged shape both SDKs parse.
 - **Multi-turn**: the Messages API is stateless but harness sessions aren't. yagami hashes each conversation prefix (per provider) and remembers which session produced it; a follow-up request resumes that session and sends only the new user message. Unmatched histories fall back to replaying the transcript in a single prompt, and if a cached session turns out to be gone, the stale mapping is dropped and the request transparently retries via replay. The cache persists across restarts at `~/.config/yagami/sessions.json`.
 - **Streaming**: every harness's output is normalized into deltas and re-emitted as a proper Anthropic SSE sequence — `message_start` → thinking/text content blocks → `message_delta` → `message_stop` (or the OpenAI chunk sequence on the chat-completions path). Claude and ACP agents stream tokens; Codex streams per message part.
 - **Models**: `GET /v1/models` asks each installed CLI what it supports (Claude via the SDK, Codex via its app-server protocol, ACP agents via their session config) — probed once per process, then cached. Library callers also receive native model metadata when reported: reasoning levels/default, input modalities, fast/auto/adaptive-thinking flags, personality and multi-agent support, service tiers, and the provider's default model. Failed probes are skipped and retried next time; a static fallback list is served only if nothing answers (`x-yagami-models-source` says which).
-- **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else.
+- **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else. Request bodies are capped at 32 MB (the real API's limit; `413` beyond it), and a port that's already taken fails `yagami start` with one line instead of a crash.
 
-Extra response headers: `x-yagami-provider`, `x-yagami-cost-usd` (what the turn would have cost at API prices, when the harness reports it), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params). `/healthz` (unauthenticated) reports the default provider, installed providers, uptime, request count, and the cumulative would-be cost — `yagami status` shows the same.
+Extra response headers: `x-yagami-provider`, `x-yagami-cost-usd` (what the turn would have cost at API prices, when the harness reports it), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params). `/healthz` answers `{ ok, service, version }` to anyone (liveness); with a valid key it also reports the default provider, installed providers, the binary's path, uptime, request count, and the cumulative would-be cost — `yagami status` shows the same.
 
 ## Limitations
 
-- No `tools` / `tool_choice` / function calling (rejected with 400 — by design, see above). `tool_use`/`tool_result` content blocks and OpenAI `tool`/`function` messages are rejected too.
+- No client tool loop: custom `tools` / `tool_choice` / function calling are rejected with 400 (by design, see above), as are `tool_use`/`tool_result` content blocks and OpenAI `tool`/`function` messages. Tools reach the model only as Anthropic server tools or through the MCP connector, where they run on your MCP server inside the turn.
 - User messages may contain `text`, `image`, and `document` blocks (documents: Claude only; images: base64 sources only outside Claude); `system` and assistant messages are text-only. Thinking blocks echoed back in assistant history are dropped, not rejected. A conversation whose *history* contains images/documents can only be continued while the server that produced it still has that session cached.
 - Assistant prefill (a trailing `assistant` message) is emulated: the engine is instructed to continue from the prefill text, and the response carries only the continuation, like the real API. An accidentally repeated prefill is stripped from the reply, including mid-stream.
 - `max_tokens`, `temperature`, `top_p`, `top_k`, `stop_sequences` (and their OpenAI counterparts, plus `presence_penalty`, `seed`, `response_format`, …) are accepted but ignored (reported via `x-yagami-ignored`) — none of the CLI engines expose them. OpenAI `n` must be 1.

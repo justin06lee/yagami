@@ -1,6 +1,6 @@
 /**
  * End-to-end smoke test against the real Claude Code CLI.
- * Costs a few real tokens — run manually: pnpm smoke
+ * Costs a few real tokens — run manually: bun run smoke
  */
 import { startYagami } from "../src/server.js";
 

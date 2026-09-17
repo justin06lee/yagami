@@ -12,6 +12,7 @@ import {
   configFilePath,
   generateApiKey,
   isProcessAlive,
+  isServerProcess,
   loadConfig,
   loadFileConfig,
   logFilePath,
@@ -21,6 +22,7 @@ import {
   sessionCachePath,
   writeServerState,
 } from "./server/config.js";
+import { debug } from "./core/log.js";
 import { VERSION } from "./version.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,7 +90,10 @@ program
       const shutdown = () => {
         running.sessionCache.persistNow();
         clearServerState(process.pid);
-        void running.close().finally(() => process.exit(0));
+        void running
+          .close()
+          .catch((err: unknown) => debug("server", "close reported an error on shutdown", err))
+          .finally(() => process.exit(0));
         // Don't hang on a stuck in-flight response.
         setTimeout(() => process.exit(0), 3000).unref?.();
       };
@@ -127,16 +132,17 @@ program
 
 async function startDaemon(opts: StartFlags, freshKey: string | undefined): Promise<void> {
   const existing = readServerState();
-  if (existing && isProcessAlive(existing.pid)) {
+  if (existing && isServerProcess(existing)) {
     console.error(`yagami is already running (pid ${existing.pid}, ${existing.url}) — \`yagami stop\` first`);
     process.exitCode = 1;
     return;
   }
   clearServerState();
 
+  // request lines name models and sessions; nobody else on the box needs them
   const logPath = opts.log ? path.resolve(opts.log) : logFilePath();
-  fs.mkdirSync(path.dirname(logPath), { recursive: true });
-  const fd = fs.openSync(logPath, "a");
+  fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+  const fd = fs.openSync(logPath, "a", 0o600);
   const args = [process.argv[1]!, "start"];
   if (opts.port !== undefined) args.push("-p", opts.port);
   if (opts.host !== undefined) args.push("-H", opts.host);
@@ -186,31 +192,44 @@ program
   .description("stop a running yagami server")
   .action(async () => {
     const state = readServerState();
-    if (!state || !isProcessAlive(state.pid)) {
+    if (!state || !isServerProcess(state)) {
       if (state) clearServerState();
       console.log("yagami is not running");
       return;
     }
+    // Ask first, insist after: a server wedged in a stuck turn must still
+    // end, or `make update` and the next `start` are blocked by it.
     process.kill(state.pid, "SIGTERM");
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      if (!isProcessAlive(state.pid)) {
-        clearServerState();
-        console.log(`stopped yagami (pid ${state.pid})`);
-        return;
-      }
-      await sleep(100);
+    if (await exited(state.pid, 5_000)) {
+      clearServerState();
+      console.log(`stopped yagami (pid ${state.pid})`);
+      return;
     }
-    console.error(`yagami (pid ${state.pid}) did not exit within 5s`);
+    process.kill(state.pid, "SIGKILL");
+    if (await exited(state.pid, 2_000)) {
+      clearServerState();
+      console.log(`stopped yagami (pid ${state.pid}) — it ignored SIGTERM and was killed`);
+      return;
+    }
+    console.error(`yagami (pid ${state.pid}) did not exit even after SIGKILL`);
     process.exitCode = 1;
   });
+
+async function exited(pid: number, withinMs: number): Promise<boolean> {
+  const deadline = Date.now() + withinMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await sleep(100);
+  }
+  return !isProcessAlive(pid);
+}
 
 program
   .command("status")
   .description("show whether yagami is running, plus request/cost totals")
   .action(async () => {
     const state = readServerState();
-    if (!state || !isProcessAlive(state.pid)) {
+    if (!state || !isServerProcess(state)) {
       if (state) clearServerState();
       console.log("yagami is not running");
       process.exitCode = 1;
@@ -221,21 +240,42 @@ program
     console.log(`  since     ${state.startedAt}`);
     if (state.log) console.log(`  log       ${state.log}`);
     try {
-      const res = await fetch(`${state.url}/healthz`, { signal: AbortSignal.timeout(3000) });
+      // the details behind /healthz need the key; the CLI has it
+      const key = loadConfig().apiKeys.at(-1);
+      const res = await fetch(`${state.url}/healthz`, {
+        signal: AbortSignal.timeout(3000),
+        ...(key ? { headers: { "x-api-key": key } } : {}),
+      });
       const body = (await res.json()) as {
         version?: string;
-        claude?: string;
+        provider?: string;
+        providers?: string[];
+        executable?: string;
+        uptime_s?: number;
         requests?: number;
         total_cost_usd?: number;
       };
       console.log(`  version   ${body.version ?? "?"}`);
-      console.log(`  claude    ${body.claude ?? "?"}`);
+      if (body.provider === undefined) {
+        console.log("  details   need an API key this config doesn't have — run `yagami keygen`");
+        return;
+      }
+      console.log(`  provider  ${body.provider} — ${body.executable ?? "?"}`);
+      console.log(`  also      ${(body.providers ?? []).filter((id) => id !== body.provider).join(", ") || "(none)"}`);
+      console.log(`  uptime    ${formatUptime(body.uptime_s ?? 0)}`);
       console.log(`  requests  ${body.requests ?? 0}`);
       console.log(`  cost      $${(body.total_cost_usd ?? 0).toFixed(4)} (would-be API cost since start)`);
     } catch {
       console.log(`  healthz   unreachable — process is alive but ${state.url} is not answering`);
     }
   });
+
+function formatUptime(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
 
 program
   .command("keygen")
@@ -255,7 +295,7 @@ program
   .action(() => {
     const cfg = loadConfig();
     const state = readServerState();
-    const live = state !== undefined && isProcessAlive(state.pid);
+    const live = state !== undefined && isServerProcess(state);
     const url = live ? state.url : `http://${cfg.host}:${cfg.port}`;
     if (cfg.apiKeys.length === 0) {
       console.error("no API keys configured — run `yagami start` (generates one) or `yagami keygen`");
@@ -301,7 +341,7 @@ program
     console.log(`sessions    ${sessionCachePath()}${fs.existsSync(sessionCachePath()) ? "" : " (empty)"}`);
     const state = readServerState();
     console.log(
-      `server      ${state && isProcessAlive(state.pid) ? `running (pid ${state.pid}, ${state.url})` : "not running"}`,
+      `server      ${state && isServerProcess(state) ? `running (pid ${state.pid}, ${state.url})` : "not running"}`,
     );
 
     console.log("\nproviders   (model ids route as \"<provider>:<model>\"; bare ids go to the default)");
@@ -336,8 +376,9 @@ program
         if (skew) {
           console.log(`\nagent sdk   ${skew.sdkVersion} ↔ claude ${skew.binaryVersion} — ${skew.inSync ? "in sync" : `⚠ ${skew.note}`}`);
         }
-      } catch {
+      } catch (err) {
         // skew check is advisory
+        debug("doctor", "could not compare the Agent SDK build with the claude binary", err);
       }
     }
 
@@ -405,4 +446,9 @@ program
     }
   });
 
-await program.parseAsync(process.argv);
+// Whatever a command could not handle itself (an unreadable config file, a
+// dead binary) is one line, not a stack trace.
+await program.parseAsync(process.argv).catch((err: unknown) => {
+  console.error(`yagami: ${err instanceof Error ? err.message : String(err)}`);
+  process.exitCode = 1;
+});

@@ -34,6 +34,7 @@ export {
   type TranslatedChatRequest,
 } from "./core/openai.js";
 export { loadHostEngineConfig, yagamiConfigDir, type HostEngineConfig } from "./core/hostConfig.js";
+export { setLogSink, type LogSink } from "./core/log.js";
 export {
   YagamiEngine,
   type EngineOptions,
@@ -126,4 +127,5 @@ export {
   type Usage,
   type SseEvent,
 } from "./core/types.js";
+export { resolveMcpServers, parseMcpToolName, mcpToolAllowed, type McpServerSpec, type ResolvedMcp } from "./core/mcp.js";
 export { VERSION } from "./version.js";

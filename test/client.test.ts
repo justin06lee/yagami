@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Yagami } from "../src/core/client.js";
 import { loadHostEngineConfig } from "../src/core/hostConfig.js";
+import { setLogSink } from "../src/core/log.js";
 import type { ChatCompletionChunk } from "../src/core/openai.js";
 import { collect, FakeProvider } from "./helpers/fakeProvider.js";
 
@@ -107,6 +108,21 @@ describe("host config sync", () => {
   it("returns nothing when no config exists (pure auto-detect)", () => {
     process.env["YAGAMI_CONFIG_DIR"] = path.join(os.tmpdir(), "yagami-test-does-not-exist");
     expect(loadHostEngineConfig()).toEqual({});
+  });
+
+  it("warns about a corrupt config instead of silently ignoring it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yagami-test-"));
+    fs.writeFileSync(path.join(dir, "config.json"), "{ nope");
+    process.env["YAGAMI_CONFIG_DIR"] = dir;
+    const lines: string[] = [];
+    setLogSink((line) => lines.push(line));
+    try {
+      expect(loadHostEngineConfig()).toEqual({});
+    } finally {
+      setLogSink(null);
+    }
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/config: ignoring .*config\.json: not valid JSON/);
   });
 
   it("is skipped when explicit provider instances are passed", async () => {

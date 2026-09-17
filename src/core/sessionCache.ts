@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { warn } from "./log.js";
 
 export interface SessionCacheOptions {
   maxEntries?: number;
@@ -17,6 +18,8 @@ export class SessionCache {
   private readonly maxEntries: number;
   private readonly persistPath: string | undefined;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A failing disk is reported once, not every 200 ms. */
+  private persistFailed = false;
 
   constructor(options: SessionCacheOptions = {}) {
     this.maxEntries = options.maxEntries ?? 1000;
@@ -59,11 +62,17 @@ export class SessionCache {
       const raw = JSON.parse(fs.readFileSync(this.persistPath, "utf8")) as {
         entries?: Array<[string, string]>;
       };
-      for (const [key, value] of raw.entries ?? []) {
-        if (typeof key === "string" && typeof value === "string") this.map.set(key, value);
+      // entries are stored oldest first; a file larger than this cache's
+      // limit (a lowered maxEntries, a hand-edited file) keeps the newest
+      const entries = (raw.entries ?? []).filter(
+        (entry): entry is [string, string] => Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "string",
+      );
+      for (const [key, value] of entries.slice(-this.maxEntries)) this.map.set(key, value);
+    } catch (err) {
+      // no file yet is the normal first run; anything else is worth a line
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        warn("sessions", `ignoring unreadable session cache ${this.persistPath}; starting empty`, err);
       }
-    } catch {
-      // missing or corrupt cache file — start empty
     }
   }
 
@@ -87,8 +96,11 @@ export class SessionCache {
         JSON.stringify({ version: 1, entries: [...this.map] }),
         { mode: 0o600 },
       );
-    } catch {
+      this.persistFailed = false;
+    } catch (err) {
       // persistence is best-effort; the cache still works in memory
+      if (!this.persistFailed) warn("sessions", `could not save the session cache to ${this.persistPath}`, err);
+      this.persistFailed = true;
     }
   }
 }

@@ -212,6 +212,20 @@ rl.on("line", (line) => {
         notify("item/reasoning/summaryTextDelta", { threadId: THREAD, turnId, itemId: "reason-1", summaryIndex: 0, delta: "the files" });
         notify("item/completed", { threadId: THREAD, turnId, item: { type: "reasoning", id: "reason-1", summary: ["Checking the files carefully"] } });
       }
+      if (prompt.includes("[die]")) {
+        // the engine crashing mid-turn: nothing more is ever said
+        process.exit(3);
+      }
+      if (prompt.includes("[malformed]")) {
+        // shapes the session must survive without taking the host down:
+        // a delta with no text, a completion with no turn, usage with no
+        // numbers, and a notification nobody has heard of
+        notify("item/agentMessage/delta", { threadId: THREAD, turnId, itemId: "msg-1" });
+        notify("turn/completed", { threadId: THREAD });
+        notify("thread/tokenUsage/updated", { threadId: THREAD, turnId, tokenUsage: null });
+        notify("item/completed", { threadId: THREAD, turnId });
+        notify("something/new", { threadId: THREAD, turnId, payload: { deep: [1, 2, 3] } });
+      }
       interactive = prompt.includes("[interactive]");
       if (interactive) {
         notify("turn/plan/updated", {

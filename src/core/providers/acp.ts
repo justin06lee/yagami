@@ -20,6 +20,7 @@ import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, looksLikeAuthFailure, AuthRequiredError, ProviderError } from "../errors.js";
 import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
+import { debug } from "../log.js";
 import type { EngineModel } from "../models.js";
 import type {
   AgentEvent,
@@ -112,6 +113,7 @@ export class AcpProvider implements SessionProvider {
     effort: false,
     streaming: "tokens",
     serverTools: false,
+    mcpServers: false,
   };
   readonly sessionCapabilities = { fork: false } as const;
 
@@ -159,6 +161,9 @@ export class AcpProvider implements SessionProvider {
         if (stderr.length > 16_000) stderr = stderr.slice(-8_000);
       };
       child.stderr?.on("data", (d: Buffer) => noteNoise(d.toString()));
+      // EPIPE from an agent that died mid-write is reported by the exit
+      // handler; it must not surface as an uncaught exception in the host
+      child.stdin?.on("error", (err) => debug(this.id, `${this.label} closed its stdin early`, err));
       let handlers: AcpHandlers = {};
       const stream = ndJsonStream(
         Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
@@ -284,7 +289,9 @@ export class AcpProvider implements SessionProvider {
       // Hardening: prefer a read-only/plan mode when the agent offers one.
       const plan = modes?.availableModes?.find((m) => /^(plan|read[-_]?only|ask)$/i.test(m.id));
       if (plan && modes?.currentModeId !== plan.id) {
-        await conn.agent.setSessionMode({ sessionId, modeId: plan.id }).catch(() => {});
+        await conn.agent.setSessionMode({ sessionId, modeId: plan.id }).catch((err: unknown) => {
+          debug(this.id, `could not switch to ${plan.id} mode; running in the agent's default mode`, err);
+        });
       }
       if (req.model) await this.selectModel(conn, sessionId, configOptions, req.model);
       if (req.effort) await this.selectEffort(conn, sessionId, configOptions, req.effort);
@@ -535,7 +542,11 @@ class AcpAgentSession implements ProviderSession {
     const sessionId = this.sessionId;
     // verbatim by default: only an explicit native.mode changes the agent's mode
     const mode = (options.native as { mode?: string } | undefined)?.mode;
-    if (mode) await conn.agent.setSessionMode({ sessionId, modeId: mode }).catch(() => {});
+    if (mode) {
+      await conn.agent.setSessionMode({ sessionId, modeId: mode }).catch((err: unknown) => {
+        debug(this.provider, `could not switch to the requested "${mode}" mode`, err);
+      });
+    }
     if (options.model) await this.cfg.selectModel(conn, sessionId, configOptions, options.model);
     if (options.effort) await this.cfg.selectEffort(conn, sessionId, configOptions, options.effort);
     conn.setHandlers({
@@ -559,8 +570,9 @@ class AcpAgentSession implements ProviderSession {
     let decision: SessionPermissionDecision = "deny";
     try {
       decision = await this.cfg.options.permissions.decide(request);
-    } catch {
+    } catch (err) {
       // an unanswerable ask is a denied ask
+      debug(this.provider, `the host's permission handler failed; denying ${request.tool}`, err);
     }
     this.queue?.push({ type: "permission", request, decision });
     const preferred: Record<SessionPermissionDecision, string[]> = {
@@ -587,7 +599,8 @@ class AcpAgentSession implements ProviderSession {
     if (handler) {
       try {
         response = await handler.respond(request);
-      } catch {
+      } catch (err) {
+        debug(this.provider, "the host's input handler failed; cancelling the request", err);
         response = { action: "cancel" };
       }
     }
@@ -642,10 +655,14 @@ class AcpAgentSession implements ProviderSession {
           ...(t.title ?? known?.title ? { title: t.title ?? known?.title } : {}),
           ...(t.kind ?? known?.kind ? { kind: t.kind ?? known?.kind } : {}),
         };
+        const status = t.status === "completed" ? "completed" : t.status === "failed" ? "failed" : "updated";
+        // a finished call gets no more updates; a session that runs for
+        // hours must not remember every call it ever made
+        if (status !== "updated") this.toolMeta.delete(t.toolCallId);
         this.queue?.push({
           type: "tool_call",
           id: t.toolCallId,
-          status: t.status === "completed" ? "completed" : t.status === "failed" ? "failed" : "updated",
+          status,
           ...meta,
           ...(t.rawOutput !== undefined ? { output: t.rawOutput } : {}),
         });

@@ -1,5 +1,6 @@
 import { serve, type ServerType } from "@hono/node-server";
 import { YagamiEngine } from "./core/engine.js";
+import type { Provider } from "./core/provider.js";
 import { SessionCache } from "./core/sessionCache.js";
 import { createApp } from "./server/app.js";
 import {
@@ -21,6 +22,8 @@ export interface RunningServer {
 export interface StartOptions extends Partial<YagamiConfig> {
   /** Sink for one-line request logs (default: console.log). Pass null to disable. */
   log?: ((line: string) => void) | null;
+  /** Explicit provider instances instead of detecting the machine's CLIs (`providers` is the config map). */
+  providerInstances?: Provider[];
 }
 
 /**
@@ -28,7 +31,7 @@ export interface StartOptions extends Partial<YagamiConfig> {
  * (~/.config/yagami/config.json plus YAGAMI_* env vars).
  */
 export async function startYagami(overrides: StartOptions = {}): Promise<RunningServer> {
-  const { log, ...configOverrides } = overrides;
+  const { log, providerInstances, ...configOverrides } = overrides;
   const config: YagamiConfig = { ...loadConfig(), ...definedProps(configOverrides) };
   if (config.apiKeys.length === 0) {
     throw new Error(
@@ -38,6 +41,7 @@ export async function startYagami(overrides: StartOptions = {}): Promise<Running
 
   const sessionCache = new SessionCache({ persistPath: sessionCachePath() });
   const engine = new YagamiEngine({
+    ...(providerInstances ? { providers: providerInstances } : {}),
     ...(config.providers ? { providerConfig: config.providers } : {}),
     ...(config.defaultProvider ? { defaultProvider: config.defaultProvider } : {}),
     ...(config.claudePath ? { claudePath: config.claudePath } : {}),
@@ -55,8 +59,11 @@ export async function startYagami(overrides: StartOptions = {}): Promise<Running
     ...(log === null ? {} : { log: log ?? ((line: string) => console.log(line)) }),
   });
 
-  const server = await new Promise<ServerType>((resolve) => {
+  // A port already in use (or an address that isn't ours) is a rejection
+  // the caller can print, not an 'error' event nobody listens for.
+  const server = await new Promise<ServerType>((resolve, reject) => {
     const s = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => resolve(s));
+    s.once("error", (err: Error) => reject(new Error(`cannot listen on ${config.host}:${config.port}: ${err.message}`)));
   });
 
   const address = server.address();
@@ -94,6 +101,7 @@ export {
   writeServerState,
   clearServerState,
   isProcessAlive,
+  isServerProcess,
   yagamiConfigDir,
   type YagamiConfig,
   type ServerState,

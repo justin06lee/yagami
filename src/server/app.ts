@@ -1,10 +1,12 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError, type MessagesRequest } from "../core/types.js";
 import { toApiError } from "../core/errors.js";
+import { debug } from "../core/log.js";
 import type { CompleteResult, EngineModel, StreamOptions, StreamStart } from "../core/engine.js";
 import {
   ChatChunkTranslator,
@@ -33,7 +35,11 @@ export interface AppOptions {
   version?: string;
   /** Sink for one-line request logs; omit to disable request logging. */
   log?: (line: string) => void;
+  /** Largest request body accepted on /v1/* (default 32 MiB, the Anthropic API's own cap). */
+  maxBodyBytes?: number;
 }
+
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 /** Served by GET /v1/models only when probing the CLI fails. */
 const FALLBACK_MODELS: EngineModel[] = [
@@ -85,24 +91,30 @@ export function createApp(options: AppOptions): Hono {
     await next();
   });
 
-  app.get("/healthz", (c) =>
-    c.json({
-      ok: true,
-      service: "yagami",
-      version: options.version,
+  const authorized = (c: Context): boolean => {
+    const header = c.req.header("x-api-key") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
+    return header != null && apiKeys.some((key) => safeEqual(key, header));
+  };
+
+  // Liveness is open; the inventory is not. Bound beyond loopback, the
+  // binary's path (and so the user's home directory), the installed
+  // harnesses and the spend are nobody's business without the key.
+  app.get("/healthz", (c) => {
+    const liveness = { ok: true, service: "yagami", version: options.version };
+    if (!authorized(c)) return c.json(liveness);
+    return c.json({
+      ...liveness,
       provider: engine.defaultProviderId,
       providers: engine.providerIds,
       executable: engine.executable,
       uptime_s: Math.round((Date.now() - stats.startedAt) / 1000),
       requests: stats.requests,
       total_cost_usd: stats.totalCostUsd,
-    }),
-  );
+    });
+  });
 
   app.use("/v1/*", async (c, next) => {
-    const header = c.req.header("x-api-key") ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-    const ok = header != null && apiKeys.some((key) => safeEqual(key, header));
-    if (!ok) {
+    if (!authorized(c)) {
       const err = new ApiError(401, "authentication_error", "invalid API key (x-api-key or Authorization: Bearer)");
       // The chat-completions path answers in the OpenAI error shape.
       return c.req.path.startsWith("/v1/chat")
@@ -111,6 +123,20 @@ export function createApp(options: AppOptions): Hono {
     }
     await next();
   });
+
+  // A single request must not be able to take the process down by size:
+  // a base64 image is the biggest legitimate payload, and the real API caps
+  // requests at 32 MB too.
+  app.use(
+    "/v1/*",
+    bodyLimit({
+      maxSize: options.maxBodyBytes ?? MAX_BODY_BYTES,
+      onError: (c) => {
+        const err = new ApiError(413, "invalid_request_error", "request body is too large");
+        return c.req.path.startsWith("/v1/chat") ? c.json(openAiErrorBody(err), 413) : c.json(err.toBody(), 413);
+      },
+    }),
+  );
 
   // Served in a merged shape: Anthropic fields + OpenAI fields per model, so
   // both SDKs' models.list() parse it.
@@ -123,8 +149,9 @@ export function createApp(options: AppOptions): Hono {
         models = probed;
         source = "engine";
       }
-    } catch {
+    } catch (err) {
       // engine unavailable or slow — the static list keeps clients working
+      debug("models", "probing the CLIs failed; serving the static fallback list", err);
     }
     c.header("x-yagami-models-source", source);
     return c.json(modelListBody(models));
@@ -136,6 +163,9 @@ export function createApp(options: AppOptions): Hono {
       body = await c.req.json();
     } catch {
       return c.json(errorBody("invalid_request_error", "request body must be valid JSON"), 400);
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return c.json(errorBody("invalid_request_error", "request body must be a JSON object"), 400);
     }
     const req = body as MessagesRequest;
     const startedAt = Date.now();
