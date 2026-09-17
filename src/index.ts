@@ -127,4 +127,5 @@ export {
   type Usage,
   type SseEvent,
 } from "./core/types.js";
+export { resolveMcpServers, parseMcpToolName, mcpToolAllowed, type McpServerSpec, type ResolvedMcp } from "./core/mcp.js";
 export { VERSION } from "./version.js";

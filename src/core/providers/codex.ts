@@ -59,6 +59,7 @@ export class CodexProvider implements SessionProvider {
     effort: true,
     streaming: "chunks",
     serverTools: false,
+    mcpServers: false,
   };
   readonly sessionCapabilities = { fork: true } as const;
 

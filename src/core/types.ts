@@ -64,6 +64,8 @@ export interface MessagesRequest {
   thinking?: ThinkingParam;
   tools?: unknown;
   tool_choice?: unknown;
+  /** Anthropic MCP connector: servers whose tools the engine may call during the turn. */
+  mcp_servers?: unknown;
   /** yagami extension: Claude Code reasoning effort for this request. */
   effort?: string;
   [key: string]: unknown;
