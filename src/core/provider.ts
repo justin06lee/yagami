@@ -192,6 +192,8 @@ export interface SessionPermissionRequest {
   sessionId?: string;
   /** Tool name as the harness calls it (e.g. "Bash", "Edit", or an ACP title). */
   tool: string;
+  /** For MCP tool calls, the MCP server the tool belongs to, when the harness says. */
+  server?: string;
   /** Coarse category when known: read | edit | delete | execute | fetch | other … */
   kind?: string;
   title?: string;
@@ -215,7 +217,8 @@ export type AgentEvent =
   | { type: "session"; sessionId: string }
   /** Provider-native turn id, used by hosts to fork an exact exchange. */
   | { type: "turn"; id: string }
-  | { type: "text"; text: string; thread?: string }
+  /** `messageId` groups the pieces of one message, where the harness says (Codex). */
+  | { type: "text"; text: string; thread?: string; messageId?: string }
   | { type: "thinking"; text: string; thread?: string }
   | {
       type: "tool_call";
@@ -246,8 +249,10 @@ export interface ProviderSessionOptions {
   forkAt?: string;
   /**
    * "terminal" loads the same settings the interactive CLI would — user and
-   * project config, CLAUDE.md, skills, hooks, MCP servers. "isolated" loads
-   * none of it. Default "terminal", because that is the promise.
+   * project config, instructions, hooks, MCP servers. "isolated" keeps the
+   * user's own tools out: Codex switches off their MCP servers, plugins and
+   * apps for the thread (the rest of config.toml still applies). ACP agents
+   * always load their own config.
    */
   parity?: "terminal" | "isolated";
   permissions: SessionPermissionHandler;
@@ -259,12 +264,15 @@ export interface ProviderSessionOptions {
   /** Override the harness's interactive system prompt. */
   systemPrompt?: string;
   /**
-   * MCP servers the session should connect to (provider-native shape is
-   * derived from this). Brewer of the "bandage" era: hosts had to smuggle
-   * servers through `native.config`; now this is the front door.
+   * MCP servers (streamable HTTP) the session connects to, besides any the
+   * harness loads from its own config. Their tool calls reach
+   * `permissions.decide` like everything else, with `server` set where the
+   * harness reports it (Codex). `allowedTools` is enforced by Codex; ACP
+   * agents see every tool the server lists. Not supported for Claude, whose
+   * sessions go through AgentSession and its own `mcpServers` option.
    */
   mcpServers?: Record<string, McpServerSpec>;
-  /** Provider-specific escape hatch (Claude: Agent SDK Options; Codex: { sandbox }; ACP: { mode }). */
+  /** Provider-specific escape hatch (Codex: { sandbox, approvalPolicy, config }; ACP: { mode }). */
   native?: Record<string, unknown>;
 }
 

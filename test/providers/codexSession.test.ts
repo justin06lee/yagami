@@ -1,10 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { CodexAgentSession, mcpApprovalOf } from "../../src/core/providers/codexSession.js";
+import { CodexAgentSession, codexMcpConfig, mcpApprovalOf } from "../../src/core/providers/codexSession.js";
 import { isSessionProvider } from "../../src/core/provider.js";
 import { CodexProvider } from "../../src/core/providers/codex.js";
-import type { AgentEvent, SessionPermissionDecision } from "../../src/core/provider.js";
+import type { AgentEvent, SessionPermissionDecision, SessionPermissionRequest } from "../../src/core/provider.js";
 import { collect } from "../helpers/fakeProvider.js";
 
 const FAKE = path.join(import.meta.dirname, "..", "helpers", "fake-app-server.cjs");
@@ -26,25 +26,106 @@ function session(decision: SessionPermissionDecision, resume?: string, input?: u
 }
 
 describe("mcpApprovalOf", () => {
-  it("recognizes MCP tool approvals and ignores plain elicitations", () => {
-    expect(
-      mcpApprovalOf({ codex_approval_kind: "mcp_tool_call", serverName: "envlocal", toolName: "get_status", toolInput: {} }),
-    ).toMatchObject({ tool: "get_status", title: "envlocal.get_status" });
-    // the real app-server shape: kind in _meta, tool only in the message
+  it("recognizes Codex's MCP tool approvals and leaves real elicitations alone", () => {
     expect(
       mcpApprovalOf({
+        threadId: "th",
         serverName: "envlocal",
         mode: "form",
         message: 'Allow the envlocal MCP server to run tool "get_status"?',
-        _meta: { codex_approval_kind: "mcp_tool_call", tool_params: {} },
+        _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { verbose: true } },
         requestedSchema: { type: "object", properties: {} },
       }),
-    ).toMatchObject({ tool: "get_status", title: "envlocal.get_status" });
+    ).toEqual({
+      server: "envlocal",
+      tool: "get_status",
+      title: 'Allow the envlocal MCP server to run tool "get_status"?',
+      input: { verbose: true },
+    });
+    // a server's own form, even one whose message mentions a tool, is a question
+    expect(mcpApprovalOf({ serverName: "demo", message: 'run tool "x"', requestedSchema: {}, _meta: null })).toBeUndefined();
     expect(mcpApprovalOf({ message: "Name?", requestedSchema: {} })).toBeUndefined();
   });
 });
 
+describe("codexMcpConfig", () => {
+  it("writes session servers in config.toml's shape, keeping the host's own config", () => {
+    expect(codexMcpConfig(undefined, undefined)).toBeUndefined();
+    expect(codexMcpConfig({ model_reasoning_effort: "low" }, {})).toEqual({ model_reasoning_effort: "low" });
+    expect(
+      codexMcpConfig(
+        { features: { shell_tool: false }, mcp_servers: { other: { url: "http://o/mcp" } } },
+        { envlocal: { url: "http://127.0.0.1:4242/mcp", headers: { Authorization: "Bearer t" }, allowedTools: ["get_status"] } },
+      ),
+    ).toEqual({
+      features: { shell_tool: false },
+      mcp_servers: {
+        other: { url: "http://o/mcp" },
+        envlocal: { url: "http://127.0.0.1:4242/mcp", http_headers: { Authorization: "Bearer t" }, enabled_tools: ["get_status"] },
+      },
+    });
+  });
+});
+
 describe("CodexAgentSession", () => {
+  it("connects session MCP servers and asks the permission handler before their tools run", async () => {
+    for (const decision of ["allow", "deny"] as const) {
+      const asked: SessionPermissionRequest[] = [];
+      const s = new CodexAgentSession({
+        executable: FAKE,
+        env: process.env,
+        loginCommand: "codex login",
+        options: {
+          cwd: "/tmp",
+          mcpServers: { envlocal: { url: "http://127.0.0.1:4242/mcp" } },
+          permissions: {
+            decide: async (req) => {
+              asked.push(req);
+              return decision;
+            },
+          },
+        },
+      });
+      const events = await collect(s.send("[mcp]"));
+      await s.close();
+      expect(asked).toEqual([
+        expect.objectContaining({ tool: "get_status", server: "envlocal", kind: "other", input: { verbose: true } }),
+      ]);
+      const done = events.filter((e: AgentEvent) => e.type === "tool_call").at(-1);
+      expect(done).toMatchObject(
+        decision === "allow"
+          ? { name: "envlocal.get_status", status: "completed", output: [{ type: "text", text: "3 blocks" }] }
+          : { name: "envlocal.get_status", status: "failed", output: "user rejected MCP tool call" },
+      );
+      const text = events.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { text: string }).text).join("");
+      expect(text).toContain('config={"mcp_servers":{"envlocal":{"url":"http://127.0.0.1:4242/mcp"}}}');
+      expect(text).toContain(`approval={"action":"${decision === "allow" ? "accept" : "decline"}","content":null,"_meta":null}`);
+    }
+  });
+
+  it("isolated parity switches off the user's MCP servers, plugins and apps", async () => {
+    const s = new CodexAgentSession({
+      executable: FAKE,
+      env: process.env,
+      loginCommand: "codex login",
+      options: {
+        cwd: "/tmp",
+        parity: "isolated",
+        mcpServers: { envlocal: { url: "http://127.0.0.1:4242/mcp" } },
+        permissions: { decide: async () => "allow" },
+        native: { config: { features: { shell_tool: false } } },
+      },
+    });
+    const events = await collect(s.send("[mcp]"));
+    await s.close();
+    const text = events.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { text: string }).text).join("");
+    const config = JSON.parse(/config=(\{.*?\}) approval=/.exec(text)![1]!);
+    expect(config).toEqual({
+      features: { plugins: false, apps: false, shell_tool: false },
+      mcp_servers: { notes: { enabled: false }, envlocal: { url: "http://127.0.0.1:4242/mcp" } },
+    });
+  });
+
   it("is detected by isSessionProvider on CodexProvider", () => {
     expect(isSessionProvider(new CodexProvider({ path: process.execPath, workDir: "/tmp/yagami-test-ws" }))).toBe(true);
   });
@@ -56,6 +137,8 @@ describe("CodexAgentSession", () => {
     expect(s.id).toBe("th-fake-1");
     expect(events[0]).toEqual({ type: "session", sessionId: "th-fake-1" });
     const own = events.filter((e: AgentEvent) => !("thread" in e));
+    // every piece of the reply names the message it belongs to
+    expect(new Set(own.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { messageId?: string }).messageId))).toEqual(new Set(["msg-1"]));
     expect(own.filter((e: AgentEvent) => e.type === "text").map((e) => (e as { text: string }).text)).toEqual([
       "hel",
       "lo",
@@ -65,7 +148,7 @@ describe("CodexAgentSession", () => {
     // its delta, its turn ending and a stranger thread's message do not
     expect(events.filter((e: AgentEvent) => "thread" in e)).toEqual([
       expect.objectContaining({ type: "tool_call", name: "shell", status: "started", title: "bun test", thread: "sub-1" }),
-      { type: "text", text: "All tests pass.", thread: "sub-1" },
+      { type: "text", text: "All tests pass.", thread: "sub-1", messageId: "sub-msg-1" },
     ]);
     expect(JSON.stringify(events)).not.toContain("not ours");
     const tools = own.filter((e: AgentEvent) => e.type === "tool_call") as Array<Record<string, unknown>>;
