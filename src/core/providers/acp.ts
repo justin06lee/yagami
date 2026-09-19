@@ -16,9 +16,7 @@ import {
   type SessionConfigOption,
   type SessionNotification,
 } from "@agentclientprotocol/sdk";
-import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk";
-import type { McpServer } from "@agentclientprotocol/sdk";
-import type { HttpHeader } from "@agentclientprotocol/sdk";
+import type { ContentBlock as AcpContentBlock, HttpHeader, McpServer } from "@agentclientprotocol/sdk";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, looksLikeAuthFailure, AuthRequiredError, ProviderError } from "../errors.js";
 import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
@@ -87,21 +85,21 @@ const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 20_000;
 
 /**
- * Translate yagami's MCP server specs (HTTP URLs) into the ACP
- * `newSession` shape. Unknown URL kinds fall back to stdio-less http;
- * servers the spec disallows entirely are left out by the caller.
+ * Translate session MCP server specs into ACP `newSession` servers. They are
+ * streamable-HTTP endpoints, which an agent only accepts when it advertises
+ * `mcpCapabilities.http`; otherwise this throws rather than silently opening
+ * a session without the tools.
  */
-export function acpMcpServers(specs: Record<string, McpServerSpec> | undefined): McpServer[] {
-  if (!specs) return [];
-  const out: McpServer[] = [];
-  for (const [name, spec] of Object.entries(specs)) {
-    // v1 McpServerHttp requires headers; empty means none.
-    const headers: HttpHeader[] = spec.headers
-      ? Object.entries(spec.headers).map(([n, v]): HttpHeader => ({ name: n, value: v }))
-      : [];
-    out.push({ type: "http", name, url: spec.url, headers });
-  }
-  return out;
+export function acpMcpServers(id: string, init: InitializeResponse, specs: Record<string, McpServerSpec> | undefined): McpServer[] {
+  if (!specs || Object.keys(specs).length === 0) return [];
+  const http = (init.agentCapabilities as { mcpCapabilities?: { http?: boolean } } | undefined)?.mcpCapabilities?.http === true;
+  if (!http) throw new ProviderError(id, "this agent cannot connect to HTTP MCP servers");
+  return Object.entries(specs).map(([name, spec]) => ({
+    type: "http",
+    name,
+    url: spec.url,
+    headers: Object.entries(spec.headers ?? {}).map(([n, value]): HttpHeader => ({ name: n, value })),
+  }));
 }
 
 /** Pick the most conservative option an agent offers for a permission ask. */
@@ -134,7 +132,7 @@ export class AcpProvider implements SessionProvider {
     effort: false,
     streaming: "tokens",
     serverTools: false,
-    mcpServers: true,
+    mcpServers: false,
   };
   readonly sessionCapabilities = { fork: false } as const;
 
@@ -298,7 +296,7 @@ export class AcpProvider implements SessionProvider {
         configOptions = resumed.configOptions;
         modes = resumed.modes as typeof modes;
       } else {
-        const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: acpMcpServers(req.mcpServers) }).catch((err) => {
+        const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: [] }).catch((err) => {
           throw this.classify(err);
         });
         sessionId = created.sessionId;
@@ -545,16 +543,17 @@ class AcpAgentSession implements ProviderSession {
     const conn = await this.cfg.connect(options.cwd);
     this.conn = conn;
     let configOptions: SessionConfigOption[] | null | undefined;
+    const mcpServers = acpMcpServers(this.provider, conn.init, options.mcpServers);
     if (options.resume && supportsResume(conn.init)) {
       const resumed = await conn.agent
-        .resumeSession({ sessionId: options.resume, cwd: options.cwd })
+        .resumeSession({ sessionId: options.resume, cwd: options.cwd, ...(mcpServers.length > 0 ? { mcpServers } : {}) })
         .catch((err) => {
           throw this.cfg.classify(err);
         });
       this.sessionId = options.resume;
       configOptions = resumed.configOptions;
     } else {
-      const created = await conn.agent.newSession({ cwd: options.cwd, mcpServers: acpMcpServers(options.mcpServers) }).catch((err) => {
+      const created = await conn.agent.newSession({ cwd: options.cwd, mcpServers }).catch((err) => {
         throw this.cfg.classify(err);
       });
       this.sessionId = created.sessionId;

@@ -168,14 +168,22 @@ describe("AcpProvider.run", () => {
 });
 
 describe("acpMcpServers", () => {
+  const init = (http?: boolean) => ({ protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http } } }) as never;
+
   it("maps specs to ACP http servers, empty headers when none", () => {
-    expect(acpMcpServers(undefined)).toEqual([]);
-    expect(acpMcpServers({ envlocal: { url: "http://127.0.0.1:4242/mcp" } })).toEqual([
+    expect(acpMcpServers("fake", init(true), undefined)).toEqual([]);
+    expect(acpMcpServers("fake", init(true), { envlocal: { url: "http://127.0.0.1:4242/mcp" } })).toEqual([
       { type: "http", name: "envlocal", url: "http://127.0.0.1:4242/mcp", headers: [] },
     ]);
-    expect(acpMcpServers({ s: { url: "https://x/mcp", headers: { Authorization: "Bearer t" } } })).toEqual([
+    expect(acpMcpServers("fake", init(true), { s: { url: "https://x/mcp", headers: { Authorization: "Bearer t" } } })).toEqual([
       { type: "http", name: "s", url: "https://x/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] },
     ]);
+  });
+
+  it("refuses HTTP servers an agent has not said it can reach", () => {
+    expect(acpMcpServers("fake", init(false), {})).toEqual([]);
+    expect(() => acpMcpServers("fake", init(false), { s: { url: "https://x/mcp" } })).toThrow(ProviderError);
+    expect(() => acpMcpServers("fake", init(), { s: { url: "https://x/mcp" } })).toThrow(/cannot connect to HTTP MCP servers/);
   });
 });
 
@@ -194,7 +202,7 @@ describe("rejectOption", () => {
 
 import { isSessionProvider, type SessionPermissionDecision } from "../../src/core/provider.js";
 
-function sessionFake(opts: { permissionDecision?: SessionPermissionDecision; interactive?: boolean } = {}) {
+function sessionFake(opts: { permissionDecision?: SessionPermissionDecision; interactive?: boolean; http?: boolean } = {}) {
   let handlers: AcpHandlers = {};
   const calls: Record<string, unknown[]> = { setSessionMode: [], cancel: [], newSession: [], resumeSession: [] };
   const agent = {
@@ -260,7 +268,11 @@ function sessionFake(opts: { permissionDecision?: SessionPermissionDecision; int
   const closed = vi.fn();
   const conn: AcpConnection = {
     agent: agent as never,
-    init: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {} } }, agentInfo: { name: "FakeAgent" } } as never,
+    init: {
+      protocolVersion: 1,
+      agentCapabilities: { sessionCapabilities: { resume: {} }, mcpCapabilities: { http: opts.http ?? false } },
+      agentInfo: { name: "FakeAgent" },
+    } as never,
     setHandlers: (h) => {
       handlers = h;
     },
@@ -308,21 +320,32 @@ describe("AcpProvider.openSession", () => {
     expect(fake.closed).toHaveBeenCalled();
   });
 
-  it("passes options.mcpServers through to newSession", async () => {
+  it("passes options.mcpServers to newSession and resumeSession", async () => {
+    const mcpServers = { envlocal: { url: "http://127.0.0.1:4242/mcp" } };
+    const expected = [{ type: "http", name: "envlocal", url: "http://127.0.0.1:4242/mcp", headers: [] }];
+    const fake = sessionFake({ http: true });
+    const s = provider(fake).openSession({ cwd: "/tmp/proj", mcpServers, permissions: { decide: async () => "deny" } });
+    await collect(s.send("hi"));
+    await s.close();
+    expect(fake.calls["newSession"]).toEqual([{ cwd: "/tmp/proj", mcpServers: expected }]);
+
+    const again = sessionFake({ http: true });
+    const r = provider(again).openSession({ cwd: "/tmp/proj", resume: "ses-9", mcpServers, permissions: { decide: async () => "deny" } });
+    await collect(r.send("hi"));
+    await r.close();
+    expect(again.calls["resumeSession"]).toEqual([{ sessionId: "ses-9", cwd: "/tmp/proj", mcpServers: expected }]);
+  });
+
+  it("fails the turn when the agent cannot reach HTTP MCP servers", async () => {
     const fake = sessionFake();
     const s = provider(fake).openSession({
       cwd: "/tmp/proj",
       mcpServers: { envlocal: { url: "http://127.0.0.1:4242/mcp" } },
       permissions: { decide: async () => "deny" },
     });
-    await collect(s.send("hi"));
+    await expect(collect(s.send("hi"))).rejects.toThrow(/cannot connect to HTTP MCP servers/);
     await s.close();
-    expect(fake.calls["newSession"]).toEqual([
-      {
-        cwd: "/tmp/proj",
-        mcpServers: [{ type: "http", name: "envlocal", url: "http://127.0.0.1:4242/mcp", headers: [] }],
-      },
-    ]);
+    expect(fake.calls["newSession"]).toEqual([]);
   });
 
   it("honors native.mode, resume, and interrupt", async () => {
