@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { CodexAgentSession } from "../../src/core/providers/codexSession.js";
+import { CodexAgentSession, mcpApprovalOf } from "../../src/core/providers/codexSession.js";
 import { isSessionProvider } from "../../src/core/provider.js";
 import { CodexProvider } from "../../src/core/providers/codex.js";
 import type { AgentEvent, SessionPermissionDecision } from "../../src/core/provider.js";
@@ -24,6 +24,25 @@ function session(decision: SessionPermissionDecision, resume?: string, input?: u
     } as never,
   });
 }
+
+describe("mcpApprovalOf", () => {
+  it("recognizes MCP tool approvals and ignores plain elicitations", () => {
+    expect(
+      mcpApprovalOf({ codex_approval_kind: "mcp_tool_call", serverName: "envlocal", toolName: "get_status", toolInput: {} }),
+    ).toMatchObject({ tool: "get_status", title: "envlocal.get_status" });
+    // the real app-server shape: kind in _meta, tool only in the message
+    expect(
+      mcpApprovalOf({
+        serverName: "envlocal",
+        mode: "form",
+        message: 'Allow the envlocal MCP server to run tool "get_status"?',
+        _meta: { codex_approval_kind: "mcp_tool_call", tool_params: {} },
+        requestedSchema: { type: "object", properties: {} },
+      }),
+    ).toMatchObject({ tool: "get_status", title: "envlocal.get_status" });
+    expect(mcpApprovalOf({ message: "Name?", requestedSchema: {} })).toBeUndefined();
+  });
+});
 
 describe("CodexAgentSession", () => {
   it("is detected by isSessionProvider on CodexProvider", () => {

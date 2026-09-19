@@ -55,6 +55,35 @@ interface CodexNative {
   config?: Record<string, unknown>;
 }
 
+/**
+ * Is this elicitation an MCP-tool approval? Codex marks it with
+ * `codex_approval_kind: "mcp_tool_call"` inside `params._meta` and names the
+ * server in `serverName`; the tool itself is only in the human-readable
+ * `message` (`Allow the <server> MCP server to run tool "<tool>"?`).
+ * Returns the tool identity for the permission handler.
+ */
+export function mcpApprovalOf(params: Record<string, unknown>): { tool: string; title?: string; input: unknown } | undefined {
+  const meta = params["_meta"] as Record<string, unknown> | undefined;
+  const kind = params["codex_approval_kind"] ?? meta?.["codex_approval_kind"];
+  const serverName = typeof params["serverName"] === "string" ? params["serverName"] : undefined;
+  const message = typeof params["message"] === "string" ? params["message"] : "";
+  const fromMessage = /run tool "([^"]+)"/.exec(message)?.[1];
+  const toolName =
+    typeof params["toolName"] === "string"
+      ? params["toolName"]
+      : typeof params["tool"] === "string"
+        ? params["tool"]
+        : fromMessage;
+  const isMcp = kind === "mcp_tool_call" || (toolName !== undefined && serverName !== undefined);
+  if (!isMcp) return undefined;
+  const tool = toolName ?? "mcp_tool";
+  return {
+    tool,
+    ...(serverName ? { title: `${serverName}.${tool}` } : {}),
+    input: params["toolInput"] ?? params["input"] ?? meta?.["tool_params"] ?? params,
+  };
+}
+
 export class CodexAgentSession implements ProviderSession {
   readonly provider = "codex";
 
@@ -169,12 +198,23 @@ export class CodexAgentSession implements ProviderSession {
     this.notify("initialized", {});
 
     const native = (options.native ?? {}) as CodexNative;
+    // Session MCP servers become thread config entries. Approvals stay on
+    // the host's permission handler (MCP elicitations are routed there), so
+    // no per-server approval-mode override is set here.
+    const baseConfig = (native.config ?? {}) as Record<string, unknown>;
+    const baseServers = (baseConfig["mcp_servers"] ?? {}) as Record<string, unknown>;
+    const sessionServers: Record<string, unknown> = {};
+    for (const [name, spec] of Object.entries(options.mcpServers ?? {})) {
+      sessionServers[name] = { url: spec.url, ...(spec.headers ? { headers: spec.headers } : {}) };
+    }
+    const config =
+      Object.keys(sessionServers).length > 0 ? { ...baseConfig, mcp_servers: { ...baseServers, ...sessionServers } } : (native.config ?? undefined);
     const overrides = {
       cwd: options.cwd,
       ...(options.model ? { model: options.model } : {}),
       ...(native.approvalPolicy ? { approvalPolicy: native.approvalPolicy } : {}),
       ...(native.sandbox ? { sandbox: native.sandbox } : {}),
-      ...(native.config ? { config: native.config } : {}),
+      ...(config ? { config } : {}),
       ...(options.systemPrompt ? { developerInstructions: options.systemPrompt } : {}),
     };
     if (options.resume && (options.fork || options.forkAt)) {
@@ -599,6 +639,34 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "mcpServer/elicitation/request": {
+        // Codex asks to call an MCP tool through an elicitation request
+        // (codex_approval_kind=mcp_tool_call). Answer it from the host's
+        // permission handler so MCP tools obey the same policy as everything
+        // else — no server-side pre-approval override needed.
+        const approval = mcpApprovalOf(params);
+        if (approval) {
+          const decision = await this.decide({
+            provider: "codex",
+            ...(this.threadId ? { sessionId: this.threadId } : {}),
+            tool: approval.tool,
+            kind: "other",
+            ...(approval.title ? { title: approval.title } : {}),
+            input: approval.input,
+            raw: params,
+          }, signal);
+          this.push({
+            type: "raw",
+            provider: "codex",
+            payload: { mcpApproval: approval.tool, decision },
+          });
+          this.respond(id, {
+            ...(decision === "allow" || decision === "allow_always"
+              ? { action: "accept", content: null }
+              : { action: "decline" }),
+            _meta: null,
+          });
+          break;
+        }
         const response = await this.input(elicitationRequest("codex", this.threadId, params), signal);
         this.respond(id, { ...elicitationResponse(response), _meta: null });
         break;

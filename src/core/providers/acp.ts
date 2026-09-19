@@ -17,11 +17,14 @@ import {
   type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk";
+import type { McpServer } from "@agentclientprotocol/sdk";
+import type { HttpHeader } from "@agentclientprotocol/sdk";
 import { resolveExecutable } from "../executable.js";
 import { classifyProviderFailure, looksLikeAuthFailure, AuthRequiredError, ProviderError } from "../errors.js";
 import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
 import { debug } from "../log.js";
 import type { EngineModel } from "../models.js";
+import type { McpServerSpec } from "../mcp.js";
 import type {
   AgentEvent,
   Provider,
@@ -83,6 +86,24 @@ export interface AcpProviderOptions {
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 20_000;
 
+/**
+ * Translate yagami's MCP server specs (HTTP URLs) into the ACP
+ * `newSession` shape. Unknown URL kinds fall back to stdio-less http;
+ * servers the spec disallows entirely are left out by the caller.
+ */
+export function acpMcpServers(specs: Record<string, McpServerSpec> | undefined): McpServer[] {
+  if (!specs) return [];
+  const out: McpServer[] = [];
+  for (const [name, spec] of Object.entries(specs)) {
+    // v1 McpServerHttp requires headers; empty means none.
+    const headers: HttpHeader[] = spec.headers
+      ? Object.entries(spec.headers).map(([n, v]): HttpHeader => ({ name: n, value: v }))
+      : [];
+    out.push({ type: "http", name, url: spec.url, headers });
+  }
+  return out;
+}
+
 /** Pick the most conservative option an agent offers for a permission ask. */
 export function rejectOption(p: RequestPermissionRequest): RequestPermissionResponse {
   const pick =
@@ -113,7 +134,7 @@ export class AcpProvider implements SessionProvider {
     effort: false,
     streaming: "tokens",
     serverTools: false,
-    mcpServers: false,
+    mcpServers: true,
   };
   readonly sessionCapabilities = { fork: false } as const;
 
@@ -277,7 +298,7 @@ export class AcpProvider implements SessionProvider {
         configOptions = resumed.configOptions;
         modes = resumed.modes as typeof modes;
       } else {
-        const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: [] }).catch((err) => {
+        const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: acpMcpServers(req.mcpServers) }).catch((err) => {
           throw this.classify(err);
         });
         sessionId = created.sessionId;
@@ -533,7 +554,7 @@ class AcpAgentSession implements ProviderSession {
       this.sessionId = options.resume;
       configOptions = resumed.configOptions;
     } else {
-      const created = await conn.agent.newSession({ cwd: options.cwd, mcpServers: [] }).catch((err) => {
+      const created = await conn.agent.newSession({ cwd: options.cwd, mcpServers: acpMcpServers(options.mcpServers) }).catch((err) => {
         throw this.cfg.classify(err);
       });
       this.sessionId = created.sessionId;

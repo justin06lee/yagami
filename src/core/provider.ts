@@ -258,6 +258,12 @@ export interface ProviderSessionOptions {
   thinking?: ThinkingParam;
   /** Override the harness's interactive system prompt. */
   systemPrompt?: string;
+  /**
+   * MCP servers the session should connect to (provider-native shape is
+   * derived from this). Brewer of the "bandage" era: hosts had to smuggle
+   * servers through `native.config`; now this is the front door.
+   */
+  mcpServers?: Record<string, McpServerSpec>;
   /** Provider-specific escape hatch (Claude: Agent SDK Options; Codex: { sandbox }; ACP: { mode }). */
   native?: Record<string, unknown>;
 }

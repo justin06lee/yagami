@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AcpConnection, AcpHandlers } from "../../src/core/providers/acp.js";
-import { AcpProvider, rejectOption } from "../../src/core/providers/acp.js";
+import { AcpProvider, acpMcpServers, rejectOption } from "../../src/core/providers/acp.js";
 import { AuthRequiredError, ProviderError } from "../../src/core/errors.js";
 import { collect } from "../helpers/fakeProvider.js";
 
@@ -167,6 +167,18 @@ describe("AcpProvider.run", () => {
   });
 });
 
+describe("acpMcpServers", () => {
+  it("maps specs to ACP http servers, empty headers when none", () => {
+    expect(acpMcpServers(undefined)).toEqual([]);
+    expect(acpMcpServers({ envlocal: { url: "http://127.0.0.1:4242/mcp" } })).toEqual([
+      { type: "http", name: "envlocal", url: "http://127.0.0.1:4242/mcp", headers: [] },
+    ]);
+    expect(acpMcpServers({ s: { url: "https://x/mcp", headers: { Authorization: "Bearer t" } } })).toEqual([
+      { type: "http", name: "s", url: "https://x/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] },
+    ]);
+  });
+});
+
 describe("rejectOption", () => {
   it("prefers reject_once, then reject_always, then the first option", () => {
     const req = (kinds: string[]) =>
@@ -294,6 +306,23 @@ describe("AcpProvider.openSession", () => {
     expect(events.find((e) => e.type === "permission")).toMatchObject({ decision: "allow_always" });
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "end_turn" });
     expect(fake.closed).toHaveBeenCalled();
+  });
+
+  it("passes options.mcpServers through to newSession", async () => {
+    const fake = sessionFake();
+    const s = provider(fake).openSession({
+      cwd: "/tmp/proj",
+      mcpServers: { envlocal: { url: "http://127.0.0.1:4242/mcp" } },
+      permissions: { decide: async () => "deny" },
+    });
+    await collect(s.send("hi"));
+    await s.close();
+    expect(fake.calls["newSession"]).toEqual([
+      {
+        cwd: "/tmp/proj",
+        mcpServers: [{ type: "http", name: "envlocal", url: "http://127.0.0.1:4242/mcp", headers: [] }],
+      },
+    ]);
   });
 
   it("honors native.mode, resume, and interrupt", async () => {
