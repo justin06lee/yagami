@@ -17,6 +17,7 @@ let turnSeq = 0;
 let interactive = false;
 let interactiveAnswers;
 let currentTimeOk = false;
+let startConfig = null;
 
 function startTools() {
   const turnId = `turn-${turnSeq}`;
@@ -124,6 +125,25 @@ rl.on("line", (line) => {
       });
       return;
     }
+    if (msg.id === 903) {
+      const accepted = msg.result?.action === "accept";
+      notify("item/completed", {
+        threadId: THREAD,
+        turnId: `turn-${turnSeq}`,
+        item: {
+          type: "mcpToolCall",
+          id: "mcp-1",
+          server: "envlocal",
+          tool: "get_status",
+          status: accepted ? "completed" : "failed",
+          arguments: {},
+          result: accepted ? { content: [{ type: "text", text: "3 blocks" }] } : null,
+          error: accepted ? null : { message: "user rejected MCP tool call" },
+        },
+      });
+      finishTurn(`config=${JSON.stringify(startConfig)} approval=${JSON.stringify(msg.result)}`);
+      return;
+    }
     if (msg.id === 902) {
       finishTurn(`input=${JSON.stringify(interactiveAnswers)} elicitation=${JSON.stringify(msg.result)}`);
       return;
@@ -151,7 +171,15 @@ rl.on("line", (line) => {
       break;
     case "initialized":
       break;
+    case "config/read":
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { config: { model: "gpt-test", mcp_servers: { notes: { command: "notes-mcp" }, envlocal: { url: "http://old/mcp" } } }, origins: {} },
+      });
+      break;
     case "thread/start":
+      startConfig = msg.params.config ?? null;
       send({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: THREAD, startedFresh: true } } });
       break;
     case "thread/resume":
@@ -225,6 +253,36 @@ rl.on("line", (line) => {
         notify("thread/tokenUsage/updated", { threadId: THREAD, turnId, tokenUsage: null });
         notify("item/completed", { threadId: THREAD, turnId });
         notify("something/new", { threadId: THREAD, turnId, payload: { deep: [1, 2, 3] } });
+      }
+      if (prompt.includes("[mcp]")) {
+        // Codex asks before running an MCP tool: an elicitation whose _meta
+        // marks it as a tool approval, with the tool named only in the message
+        notify("item/started", {
+          threadId: THREAD,
+          turnId,
+          item: { type: "mcpToolCall", id: "mcp-1", server: "envlocal", tool: "get_status", status: "inProgress", arguments: {} },
+        });
+        send({
+          jsonrpc: "2.0",
+          id: 903,
+          method: "mcpServer/elicitation/request",
+          params: {
+            threadId: THREAD,
+            turnId,
+            serverName: "envlocal",
+            mode: "form",
+            message: 'Allow the envlocal MCP server to run tool "get_status"?',
+            requestedSchema: { type: "object", properties: {} },
+            _meta: {
+              codex_approval_kind: "mcp_tool_call",
+              persist: ["session", "always"],
+              tool_description: "Cell count and grid config.",
+              tool_params: { verbose: true },
+              tool_params_display: [],
+            },
+          },
+        });
+        break;
       }
       interactive = prompt.includes("[interactive]");
       if (interactive) {

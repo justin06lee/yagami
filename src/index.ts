@@ -83,7 +83,7 @@ export type {
 } from "./core/provider.js";
 export { ClaudeProvider, type ClaudeProviderOptions } from "./core/providers/claude.js";
 export { CodexProvider, type CodexProviderOptions, type CodexSandboxMode } from "./core/providers/codex.js";
-export { AcpProvider, acpMcpServers, type AcpProviderOptions, type AcpConnection } from "./core/providers/acp.js";
+export { AcpProvider, type AcpProviderOptions, type AcpConnection } from "./core/providers/acp.js";
 export {
   PROVIDER_PRESETS,
   createProvider,

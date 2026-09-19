@@ -32,7 +32,7 @@ yagami start  # first run generates + saves an API key and prints it
 `make update` stops any running yagami server, rebuilds, reinstalls, and restarts it. Or install from npm: `bun add -g @justin06lee/yagami`.
 
 ```
-yagami v0.10.0
+yagami v0.11.0
   listening   http://127.0.0.1:8787
   provider    claude — /Users/you/.local/bin/claude (2.1.238 (Claude Code))
   also        codex, opencode (use model "<provider>:<model>")
@@ -178,7 +178,7 @@ For a lower-level handle, `claudeCodeSession(prompt, { options })` returns the r
 
 ### Building a UI on any other harness
 
-The same idea works for the non-Claude harnesses — verbatim. Codex and every ACP agent implement `SessionProvider.openSession()`: a live, warm session on the harness's own engine (`codex app-server` — what the Codex TUI runs on; a persistent ACP connection for OpenCode, Gemini, and friends), with the harness's own config, sandbox, and approval flow. Nothing is overridden unless you pass `native` overrides; approval requests are forwarded to your handler exactly as the harness's own UI would prompt.
+The same idea works for the non-Claude harnesses — verbatim. Codex and every ACP agent implement `SessionProvider.openSession()`: a live, warm session on the harness's own engine (`codex app-server` — what the Codex TUI runs on; a persistent ACP connection for OpenCode, Gemini, and friends), with the harness's own config, sandbox, and approval flow. Nothing is overridden unless you pass `native` overrides (or `parity: "isolated"`, which switches the user's own MCP servers, plugins and apps off for a Codex thread); approval requests are forwarded to your handler exactly as the harness's own UI would prompt.
 
 ```ts
 import { createProvider, isSessionProvider } from "@justin06lee/yagami";
@@ -208,7 +208,7 @@ if (isSessionProvider(codex)) {
 }
 ```
 
-`ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), `permissions`, optional `input`, and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). A session provider reports `sessionCapabilities.fork`; when true, `{ resume, fork: true }` branches at the tip and `{ resume, forkAt: turnId }` branches through an exact `turn` event without mutating the source conversation. Input fields preserve labels, options, required/secret flags, primitive constraints, and URLs; omitting the handler declines safely instead of hanging a turn. ACP sessions also map `effort` onto the agent's `thought_level` option when it exposes one. The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
+`ProviderSessionOptions` takes `cwd`, `model`, `resume`, `effort`, `systemPrompt` (extra developer instructions where the harness supports them), `permissions`, optional `input`, `mcpServers`, and a `native` escape hatch (Codex: `{ sandbox, approvalPolicy, config }`; ACP: `{ mode }`). `mcpServers` (`{ name: { url, headers?, allowedTools? } }`, streamable HTTP) connects the session to your own tool servers on top of whatever the harness loads from its config. Codex asks before running their tools, and that ask reaches `permissions.decide` with `server` set to the MCP server's name, so a host can allow exactly its own tools. ACP agents take the servers only if they advertise HTTP MCP support, and they don't enforce `allowedTools`. A session provider reports `sessionCapabilities.fork`; when true, `{ resume, fork: true }` branches at the tip and `{ resume, forkAt: turnId }` branches through an exact `turn` event without mutating the source conversation. Input fields preserve labels, options, required/secret flags, primitive constraints, and URLs; omitting the handler declines safely instead of hanging a turn. ACP sessions also map `effort` onto the agent's `thought_level` option when it exposes one. The completion-turn `run()` path stays for API-style callers; sessions are for hosts that want the real interactive agent.
 
 The server is also embeddable: `import { startYagami } from "@justin06lee/yagami/server"` — it takes the same fields as the config file plus `log` and `providerInstances` (hand-picked `Provider` objects instead of auto-detection).
 

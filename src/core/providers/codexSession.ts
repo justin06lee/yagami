@@ -3,6 +3,7 @@ import * as readline from "node:readline";
 import { AuthRequiredError, classifyProviderFailure, looksLikeAuthFailure, ProviderError } from "../errors.js";
 import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
 import { debug } from "../log.js";
+import type { McpServerSpec } from "../mcp.js";
 import type {
   AgentEvent,
   ProviderSession,
@@ -56,32 +57,55 @@ interface CodexNative {
 }
 
 /**
- * Is this elicitation an MCP-tool approval? Codex marks it with
- * `codex_approval_kind: "mcp_tool_call"` inside `params._meta` and names the
- * server in `serverName`; the tool itself is only in the human-readable
- * `message` (`Allow the <server> MCP server to run tool "<tool>"?`).
- * Returns the tool identity for the permission handler.
+ * Is this `mcpServer/elicitation/request` Codex asking to run an MCP tool?
+ * Codex marks those with `_meta.codex_approval_kind: "mcp_tool_call"`,
+ * names the server in `serverName`, and puts the tool's name only in the
+ * human-readable message (`Allow the <server> MCP server to run tool
+ * "<tool>"?`). Anything else is a real elicitation for the input handler.
  */
-export function mcpApprovalOf(params: Record<string, unknown>): { tool: string; title?: string; input: unknown } | undefined {
-  const meta = params["_meta"] as Record<string, unknown> | undefined;
-  const kind = params["codex_approval_kind"] ?? meta?.["codex_approval_kind"];
-  const serverName = typeof params["serverName"] === "string" ? params["serverName"] : undefined;
+export function mcpApprovalOf(params: Record<string, unknown>): { server: string; tool: string; title: string; input: unknown } | undefined {
+  const meta = params["_meta"];
+  if (meta === null || typeof meta !== "object" || (meta as Record<string, unknown>)["codex_approval_kind"] !== "mcp_tool_call") return undefined;
+  const server = typeof params["serverName"] === "string" ? params["serverName"] : "";
   const message = typeof params["message"] === "string" ? params["message"] : "";
-  const fromMessage = /run tool "([^"]+)"/.exec(message)?.[1];
-  const toolName =
-    typeof params["toolName"] === "string"
-      ? params["toolName"]
-      : typeof params["tool"] === "string"
-        ? params["tool"]
-        : fromMessage;
-  const isMcp = kind === "mcp_tool_call" || (toolName !== undefined && serverName !== undefined);
-  if (!isMcp) return undefined;
-  const tool = toolName ?? "mcp_tool";
-  return {
-    tool,
-    ...(serverName ? { title: `${serverName}.${tool}` } : {}),
-    input: params["toolInput"] ?? params["input"] ?? meta?.["tool_params"] ?? params,
-  };
+  const tool = /run tool "([^"]+)"/.exec(message)?.[1] ?? "";
+  return { server, tool, title: message || `${server}.${tool}`, input: (meta as Record<string, unknown>)["tool_params"] };
+}
+
+/**
+ * Add session MCP servers to a thread's config override, in the shape
+ * `config.toml` uses (`http_headers`, `enabled_tools`). Codex merges the
+ * table with the user's own servers. Calls to them still ask the host's
+ * permission handler, like every other approval.
+ */
+export function codexMcpConfig(
+  base: Record<string, unknown> | undefined,
+  specs: Record<string, McpServerSpec> | undefined,
+): Record<string, unknown> | undefined {
+  if (!specs || Object.keys(specs).length === 0) return base;
+  const servers: Record<string, unknown> = { ...(base?.["mcp_servers"] as Record<string, unknown> | undefined) };
+  for (const [name, spec] of Object.entries(specs)) {
+    servers[name] = {
+      url: spec.url,
+      ...(spec.headers ? { http_headers: spec.headers } : {}),
+      ...(spec.allowedTools ? { enabled_tools: spec.allowedTools } : {}),
+    };
+  }
+  return { ...base, mcp_servers: servers };
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** Deep-merge two Codex config overrides; `b` wins where both set a value. */
+function mergeConfig(a: Record<string, unknown> | undefined, b: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const out: Record<string, unknown> = { ...a };
+  for (const [key, value] of Object.entries(b)) {
+    const prev = out[key];
+    out[key] = isPlainObject(prev) && isPlainObject(value) ? mergeConfig(prev, value) : value;
+  }
+  return out;
 }
 
 export class CodexAgentSession implements ProviderSession {
@@ -198,17 +222,8 @@ export class CodexAgentSession implements ProviderSession {
     this.notify("initialized", {});
 
     const native = (options.native ?? {}) as CodexNative;
-    // Session MCP servers become thread config entries. Approvals stay on
-    // the host's permission handler (MCP elicitations are routed there), so
-    // no per-server approval-mode override is set here.
-    const baseConfig = (native.config ?? {}) as Record<string, unknown>;
-    const baseServers = (baseConfig["mcp_servers"] ?? {}) as Record<string, unknown>;
-    const sessionServers: Record<string, unknown> = {};
-    for (const [name, spec] of Object.entries(options.mcpServers ?? {})) {
-      sessionServers[name] = { url: spec.url, ...(spec.headers ? { headers: spec.headers } : {}) };
-    }
-    const config =
-      Object.keys(sessionServers).length > 0 ? { ...baseConfig, mcp_servers: { ...baseServers, ...sessionServers } } : (native.config ?? undefined);
+    const isolation = options.parity === "isolated" ? await this.isolation(options.cwd, options.mcpServers) : undefined;
+    const config = codexMcpConfig(mergeConfig(isolation, native.config), options.mcpServers);
     const overrides = {
       cwd: options.cwd,
       ...(options.model ? { model: options.model } : {}),
@@ -237,6 +252,25 @@ export class CodexAgentSession implements ProviderSession {
     const started = await this.request("thread/start", overrides);
     this.threadId = (started["thread"] as { id?: string } | undefined)?.id;
     if (!this.threadId) throw new ProviderError("codex", "thread/start returned no thread id");
+  }
+
+  /**
+   * `parity: "isolated"`: none of the user's own tools. Every MCP server in
+   * their config, as Codex resolves it for `cwd`, is switched off for the
+   * thread, and so are plugins and apps. The rest of config.toml still
+   * applies; Codex has no switch for that.
+   */
+  private async isolation(cwd: string, keep: Record<string, McpServerSpec> | undefined): Promise<Record<string, unknown>> {
+    const read = await this.request("config/read", { cwd });
+    const servers = (read["config"] as { mcp_servers?: Record<string, unknown> } | undefined)?.mcp_servers ?? {};
+    return {
+      features: { plugins: false, apps: false },
+      mcp_servers: Object.fromEntries(
+        Object.keys(servers)
+          .filter((name) => !keep?.[name])
+          .map((name) => [name, { enabled: false }]),
+      ),
+    };
   }
 
   // ── inbound traffic ────────────────────────────────────────────────
@@ -315,7 +349,7 @@ export class CodexAgentSession implements ProviderSession {
         const delta = params["delta"];
         if (typeof delta !== "string") break;
         this.emitted.set(itemId, (this.emitted.get(itemId) ?? 0) + delta.length);
-        this.push({ type: "text", text: delta });
+        this.push({ type: "text", text: delta, messageId: itemId });
         break;
       }
       case "item/reasoning/summaryTextDelta": {
@@ -408,7 +442,7 @@ export class CodexAgentSession implements ProviderSession {
         // fill in whatever the deltas didn't cover (non-streaming paths)
         const text = String(item["text"] ?? "");
         const seen = thread ? 0 : (this.emitted.get(id) ?? 0);
-        if (text.length > seen) push({ type: "text", text: text.slice(seen) });
+        if (text.length > seen) push({ type: "text", text: text.slice(seen), messageId: id });
         this.emitted.delete(id);
         break;
       }
@@ -452,13 +486,17 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "mcpToolCall": {
+        const failed = item["status"] === "failed";
+        const result = item["result"] as { content?: unknown } | null | undefined;
+        const error = item["error"] as { message?: unknown } | null | undefined;
         push({
           type: "tool_call",
           id,
           name: `${String(item["server"] ?? "mcp")}.${String(item["tool"] ?? "tool")}`,
-          status: completed ? (item["status"] === "failed" ? "failed" : "completed") : "started",
+          status: completed ? (failed ? "failed" : "completed") : "started",
           kind: "other",
           input: item["arguments"],
+          ...(completed ? { output: failed ? error?.message : result?.content } : {}),
         });
         break;
       }
@@ -639,32 +677,22 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "mcpServer/elicitation/request": {
-        // Codex asks to call an MCP tool through an elicitation request
-        // (codex_approval_kind=mcp_tool_call). Answer it from the host's
-        // permission handler so MCP tools obey the same policy as everything
-        // else — no server-side pre-approval override needed.
+        // Codex asks before running an MCP tool through an elicitation; that
+        // is a permission question, so it goes to the permission handler.
         const approval = mcpApprovalOf(params);
         if (approval) {
           const decision = await this.decide({
             provider: "codex",
             ...(this.threadId ? { sessionId: this.threadId } : {}),
             tool: approval.tool,
+            server: approval.server,
             kind: "other",
-            ...(approval.title ? { title: approval.title } : {}),
+            title: approval.title,
             input: approval.input,
             raw: params,
           }, signal);
-          this.push({
-            type: "raw",
-            provider: "codex",
-            payload: { mcpApproval: approval.tool, decision },
-          });
-          this.respond(id, {
-            ...(decision === "allow" || decision === "allow_always"
-              ? { action: "accept", content: null }
-              : { action: "decline" }),
-            _meta: null,
-          });
+          const allowed = decision === "allow" || decision === "allow_always";
+          this.respond(id, { action: allowed ? "accept" : "decline", content: null, _meta: null });
           break;
         }
         const response = await this.input(elicitationRequest("codex", this.threadId, params), signal);
