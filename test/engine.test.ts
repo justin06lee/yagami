@@ -142,6 +142,70 @@ describe("capabilities", () => {
   });
 });
 
+describe("model-native effort", () => {
+  function codexWithUltra() {
+    const claude = new FakeProvider("claude");
+    const codex = new FakeProvider("codex");
+    codex.models = [
+      { id: "gpt-6-astra", display_name: "Astra", reasoning_efforts: [{ id: "low" }, { id: "high" }, { id: "ultra" }], is_default: true },
+      { id: "gpt-5-mini", display_name: "Mini", reasoning_efforts: [{ id: "low" }, { id: "high" }] },
+    ];
+    return { claude, codex, engine: makeEngine([claude, codex]) };
+  }
+
+  it("passes a level beyond the standard set through when the model lists it", async () => {
+    const { codex, engine } = codexWithUltra();
+    const { ignored } = await engine.complete({ model: "codex:gpt-6-astra", messages: [USER("x")], effort: "ultra" });
+    expect(codex.calls[0]!.effort).toBe("ultra");
+    expect(ignored).toEqual([]);
+  });
+
+  it("rejects it, naming the model's levels, when the model does not list it", async () => {
+    const { codex, engine } = codexWithUltra();
+    const err = await engine.complete({ model: "codex:gpt-5-mini", messages: [USER("x")], effort: "ultra" }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(400);
+    expect(err.message).toMatch(/codex:gpt-5-mini takes low, high/);
+    expect(codex.calls).toHaveLength(0);
+  });
+
+  it("checks the provider's default model when none is named", async () => {
+    const { codex } = codexWithUltra();
+    const engine = makeEngine([codex]);
+    await engine.complete({ messages: [USER("x")], effort: "ultra" });
+    expect(codex.calls[0]!.effort).toBe("ultra");
+  });
+
+  it("still rejects malformed levels and native levels for providers without effort", async () => {
+    const { engine } = codexWithUltra();
+    await expect(engine.complete({ model: "codex:gpt-6-astra", messages: [USER("x")], effort: "Ultra!" })).rejects.toThrowError(/effort/);
+    const limited = new FakeProvider("codex", { ...FULL_CAPS, effort: false });
+    limited.models = [{ id: "m", display_name: "M", reasoning_efforts: [{ id: "ultra" }], is_default: true }];
+    await expect(makeEngine([limited]).complete({ messages: [USER("x")], effort: "ultra" })).rejects.toThrowError(/effort/);
+  });
+
+  it("reports a model list that cannot be read as unavailable, not as a bad request", async () => {
+    const { codex, engine } = codexWithUltra();
+    codex.modelsError = new Error("app-server down");
+    const err = await engine.complete({ model: "codex:gpt-6-astra", messages: [USER("x")], effort: "ultra" }).catch((e) => e);
+    expect(err.status).toBe(503);
+    expect(err.message).toMatch(/app-server down/);
+  });
+
+  it("streams: rejects up front once the model list is known, else as an error event", async () => {
+    const { codex, engine } = codexWithUltra();
+    const req = { model: "codex:gpt-5-mini", messages: [USER("x")], effort: "ultra", stream: true };
+    const first = await collect(engine.stream(req).events);
+    expect(first).toHaveLength(1);
+    expect(first[0]!.event).toBe("error");
+    expect(codex.calls).toHaveLength(0);
+    // the probe above loaded the list: now the check is synchronous
+    expect(() => engine.stream(req)).toThrowError(/takes low, high/);
+    await collect(engine.stream({ ...req, model: "codex:gpt-6-astra" }).events);
+    expect(codex.calls[0]!.effort).toBe("ultra");
+  });
+});
+
 describe("multi-turn", () => {
   it("resumes a cached session for a known conversation prefix", async () => {
     const p = new FakeProvider("claude", FULL_CAPS, () => reply("first reply"));

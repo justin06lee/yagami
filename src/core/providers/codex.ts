@@ -92,7 +92,7 @@ export class CodexProvider implements SessionProvider {
     if (req.model) args.push("-m", req.model);
     if (req.effort) {
       // interpolated into a TOML override: only a bare word may go in
-      if (!/^[a-z]+$/.test(req.effort)) throw new ProviderError(this.id, `invalid effort "${req.effort}"`);
+      if (!/^[a-z][a-z0-9_-]*$/.test(req.effort)) throw new ProviderError(this.id, `invalid effort "${req.effort}"`);
       args.push("-c", `model_reasoning_effort="${req.effort}"`);
     }
     for (const p of imagePaths) args.push("-i", p);
