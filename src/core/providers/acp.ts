@@ -129,7 +129,7 @@ export class AcpProvider implements SessionProvider {
     documents: false,
     systemPrompt: false,
     thinking: false,
-    effort: false,
+    effort: true,
     streaming: "tokens",
     serverTools: false,
     mcpServers: false,
@@ -283,26 +283,23 @@ export class AcpProvider implements SessionProvider {
     }
     req.signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      let configOptions: SessionConfigOption[] | null | undefined;
-      let modes: { currentModeId?: string; availableModes?: Array<{ id: string }> } | null | undefined;
+      let setup: SessionSetup;
       if (req.resume) {
         if (!supportsResume(conn.init)) {
           throw new ProviderError(this.id, "this agent cannot resume sessions; replaying the transcript instead");
         }
-        const resumed = await conn.agent.resumeSession({ sessionId: req.resume, cwd: this.workDir }).catch((err) => {
+        setup = await conn.agent.resumeSession({ sessionId: req.resume, cwd: this.workDir }).catch((err) => {
           throw this.classify(err);
         });
         sessionId = req.resume;
-        configOptions = resumed.configOptions;
-        modes = resumed.modes as typeof modes;
       } else {
         const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: [] }).catch((err) => {
           throw this.classify(err);
         });
         sessionId = created.sessionId;
-        configOptions = created.configOptions;
-        modes = created.modes as typeof modes;
+        setup = created;
       }
+      const modes = setup.modes as { currentModeId?: string; availableModes?: Array<{ id: string }> } | null | undefined;
       yield { type: "session", sessionId };
 
       // Hardening: prefer a read-only/plan mode when the agent offers one.
@@ -312,8 +309,8 @@ export class AcpProvider implements SessionProvider {
           debug(this.id, `could not switch to ${plan.id} mode; running in the agent's default mode`, err);
         });
       }
-      if (req.model) await this.selectModel(conn, sessionId, configOptions, req.model);
-      if (req.effort) await this.selectEffort(conn, sessionId, configOptions, req.effort);
+      if (req.model) await this.selectModel(conn, sessionId, setup, req.model);
+      if (req.effort) await this.selectEffort(conn, sessionId, setup, req.effort);
 
       const sid = sessionId;
       conn.setHandlers({
@@ -363,42 +360,50 @@ export class AcpProvider implements SessionProvider {
       modelConfigId: this.modelConfigId,
       connect: (cwd) => this.connectImpl(cwd),
       classify: (err, ctx) => this.classify(err, ctx),
-      selectModel: (conn, sessionId, configOptions, model) => this.selectModel(conn, sessionId, configOptions, model),
-      selectEffort: (conn, sessionId, configOptions, effort) => this.selectEffort(conn, sessionId, configOptions, effort),
+      selectModel: (conn, sessionId, setup, model) => this.selectModel(conn, sessionId, setup, model),
+      selectEffort: (conn, sessionId, setup, effort) => this.selectEffort(conn, sessionId, setup, effort),
       options,
     });
   }
 
-  private async selectModel(
-    conn: AcpConnection,
-    sessionId: string,
-    configOptions: SessionConfigOption[] | null | undefined,
-    model: string,
-  ): Promise<void> {
+  /** The session's model config option, when it is a select. */
+  private modelOption(setup: SessionSetup): SelectOption | undefined {
     const option =
-      configOptions?.find((o) => o.id === this.modelConfigId) ?? configOptions?.find((o) => o.category === "model");
-    if (!option || option.type !== "select") {
-      throw new ProviderError(this.id, `cannot select model "${model}": the agent exposes no model option (omit the model to use its default)`);
-    }
-    if (option.currentValue === model) return;
-    await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value: model }).catch((err) => {
-      throw this.classify(err);
-    });
+      setup.configOptions?.find((o) => o.id === this.modelConfigId) ?? setup.configOptions?.find((o) => o.category === "model");
+    return option?.type === "select" ? option : undefined;
   }
 
-  private async selectEffort(
-    conn: AcpConnection,
-    sessionId: string,
-    configOptions: SessionConfigOption[] | null | undefined,
-    effort: string,
-  ): Promise<void> {
-    const option = configOptions?.find(
-      (candidate) =>
-        candidate.category === "thought_level" ||
-        /^(?:thought[_-]?level|reasoning[_-]?effort|effort)$/i.test(candidate.id),
-    );
-    if (!option || option.type !== "select" || option.currentValue === effort) return;
-    if (!flattenSelectOptions(option).some((candidate) => candidate.value === effort)) return;
+  private async selectModel(conn: AcpConnection, sessionId: string, setup: SessionSetup, model: string): Promise<void> {
+    const option = this.modelOption(setup);
+    if (option) {
+      if (option.currentValue === model) return;
+      await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value: model }).catch((err) => {
+        throw this.classify(err);
+      });
+      return;
+    }
+    const legacy = legacyModels(setup);
+    if (legacy) {
+      if (legacy.current === model) return;
+      await conn.agent.request("session/set_model", { sessionId, modelId: model }).catch((err) => {
+        throw this.classify(err);
+      });
+      return;
+    }
+    throw new ProviderError(this.id, `cannot select model "${model}": the agent exposes no model option (omit the model to use its default)`);
+  }
+
+  private async selectEffort(conn: AcpConnection, sessionId: string, setup: SessionSetup, effort: string): Promise<void> {
+    const option = effortOption(setup);
+    if (!option) {
+      debug(this.id, `${this.label} exposes no reasoning-level option; effort "${effort}" not applied`);
+      return;
+    }
+    if (option.currentValue === effort) return;
+    if (!flattenSelectOptions(option).some((candidate) => candidate.value === effort)) {
+      debug(this.id, `${this.label} does not offer reasoning level "${effort}"; keeping "${option.currentValue}"`);
+      return;
+    }
     await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value: effort }).catch((err) => {
       throw this.classify(err);
     });
@@ -436,28 +441,26 @@ export class AcpProvider implements SessionProvider {
       const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: [] }).catch((err) => {
         throw this.classify(err);
       });
-      const option =
-        created.configOptions?.find((o) => o.id === this.modelConfigId) ??
-        created.configOptions?.find((o) => o.category === "model");
-      if (!option || option.type !== "select") return [];
-      const effortOption = created.configOptions?.find(
-        (candidate) =>
-          candidate.type === "select" &&
-          (candidate.category === "thought_level" ||
-            /^(?:thought[_-]?level|reasoning[_-]?effort|effort)$/i.test(candidate.id)),
-      );
-      const efforts = effortOption?.type === "select"
-        ? flattenSelectOptions(effortOption).map((entry) => ({
+      const option = this.modelOption(created);
+      const legacy = option ? undefined : legacyModels(created);
+      const choices = option
+        ? flattenSelectOptions(option).map((o) => ({ id: o.value, name: o.name, description: o.description }))
+        : legacy?.available ?? [];
+      const current = option ? option.currentValue : legacy?.current;
+      const reasoning = effortOption(created);
+      const efforts = reasoning
+        ? flattenSelectOptions(reasoning).map((entry) => ({
             id: entry.value,
             ...(entry.description ? { description: entry.description } : {}),
           }))
         : [];
-      return flattenSelectOptions(option).map((o) => ({
-        id: o.value,
+      return choices.map((o) => ({
+        id: o.id,
         display_name: o.name,
         ...(o.description ? { description: o.description } : {}),
         ...(efforts.length > 0 ? { reasoning_efforts: efforts } : {}),
-        ...(effortOption?.type === "select" ? { default_reasoning_effort: effortOption.currentValue } : {}),
+        ...(reasoning ? { default_reasoning_effort: reasoning.currentValue } : {}),
+        ...(o.id === current ? { is_default: true } : {}),
       }));
     });
   }
@@ -497,18 +500,8 @@ interface AcpSessionConfig {
   modelConfigId: string;
   connect: (cwd: string) => Promise<AcpConnection>;
   classify: (err: unknown, context?: string) => Error;
-  selectModel: (
-    conn: AcpConnection,
-    sessionId: string,
-    configOptions: SessionConfigOption[] | null | undefined,
-    model: string,
-  ) => Promise<void>;
-  selectEffort: (
-    conn: AcpConnection,
-    sessionId: string,
-    configOptions: SessionConfigOption[] | null | undefined,
-    effort: string,
-  ) => Promise<void>;
+  selectModel: (conn: AcpConnection, sessionId: string, setup: SessionSetup, model: string) => Promise<void>;
+  selectEffort: (conn: AcpConnection, sessionId: string, setup: SessionSetup, effort: string) => Promise<void>;
   options: ProviderSessionOptions;
 }
 
@@ -542,22 +535,21 @@ class AcpAgentSession implements ProviderSession {
     const { options } = this.cfg;
     const conn = await this.cfg.connect(options.cwd);
     this.conn = conn;
-    let configOptions: SessionConfigOption[] | null | undefined;
+    let setup: SessionSetup;
     const mcpServers = acpMcpServers(this.provider, conn.init, options.mcpServers);
     if (options.resume && supportsResume(conn.init)) {
-      const resumed = await conn.agent
+      setup = await conn.agent
         .resumeSession({ sessionId: options.resume, cwd: options.cwd, ...(mcpServers.length > 0 ? { mcpServers } : {}) })
         .catch((err) => {
           throw this.cfg.classify(err);
         });
       this.sessionId = options.resume;
-      configOptions = resumed.configOptions;
     } else {
       const created = await conn.agent.newSession({ cwd: options.cwd, mcpServers }).catch((err) => {
         throw this.cfg.classify(err);
       });
       this.sessionId = created.sessionId;
-      configOptions = created.configOptions;
+      setup = created;
     }
     const sessionId = this.sessionId;
     // verbatim by default: only an explicit native.mode changes the agent's mode
@@ -567,8 +559,8 @@ class AcpAgentSession implements ProviderSession {
         debug(this.provider, `could not switch to the requested "${mode}" mode`, err);
       });
     }
-    if (options.model) await this.cfg.selectModel(conn, sessionId, configOptions, options.model);
-    if (options.effort) await this.cfg.selectEffort(conn, sessionId, configOptions, options.effort);
+    if (options.model) await this.cfg.selectModel(conn, sessionId, setup, options.model);
+    if (options.effort) await this.cfg.selectEffort(conn, sessionId, setup, options.effort);
     conn.setHandlers({
       onPermission: (p) => this.onPermission(p),
       onInput: (p) => this.onInput(p),
@@ -778,8 +770,51 @@ function supportsResume(init: InitializeResponse): boolean {
   return caps?.sessionCapabilities?.resume !== undefined;
 }
 
+/**
+ * What a new or resumed session reports about itself. `models` is ACP's
+ * older session-model list, which Gemini CLI still sends instead of a
+ * "model" config option; the SDK no longer types it but passes it through.
+ */
+interface SessionSetup {
+  configOptions?: SessionConfigOption[] | null;
+  modes?: unknown;
+  models?: unknown;
+}
+
+type SelectOption = SessionConfigOption & { type: "select" };
+
+/** The session's reasoning-level option, when it is a select. */
+function effortOption(setup: SessionSetup): SelectOption | undefined {
+  const option = setup.configOptions?.find(
+    (candidate) =>
+      candidate.type === "select" &&
+      (candidate.category === "thought_level" || /^(?:thought[_-]?level|reasoning[_-]?effort|effort)$/i.test(candidate.id)),
+  );
+  return option?.type === "select" ? option : undefined;
+}
+
+/** The legacy `models` list of a session, when the agent sends one. */
+function legacyModels(
+  setup: SessionSetup,
+): { current?: string; available: Array<{ id: string; name: string; description?: string }> } | undefined {
+  const raw = setup.models as { availableModels?: unknown; currentModelId?: unknown } | null | undefined;
+  if (!raw || !Array.isArray(raw.availableModels)) return undefined;
+  const available = (raw.availableModels as Array<Record<string, unknown>>).flatMap((m) => {
+    const id = m["modelId"];
+    if (typeof id !== "string") return [];
+    const description = m["description"];
+    return [{
+      id,
+      name: typeof m["name"] === "string" ? m["name"] : id,
+      ...(typeof description === "string" && description ? { description } : {}),
+    }];
+  });
+  if (available.length === 0) return undefined;
+  return { available, ...(typeof raw.currentModelId === "string" ? { current: raw.currentModelId } : {}) };
+}
+
 /** Select options may be flat or grouped; return the leaves. */
-function flattenSelectOptions(option: SessionConfigOption & { type: "select" }): Array<{ value: string; name: string; description?: string | null }> {
+function flattenSelectOptions(option: SelectOption): Array<{ value: string; name: string; description?: string | null }> {
   const raw = (option as { options?: unknown }).options;
   if (!Array.isArray(raw)) return [];
   const out: Array<{ value: string; name: string; description?: string | null }> = [];

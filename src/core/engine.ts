@@ -22,6 +22,8 @@ import { ApiError, type ContentBlock, type MessagesRequest, type MessagesRespons
 export type { EngineModel } from "./models.js";
 
 const EFFORT_LEVELS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max"]);
+/** Shape of a model-native effort level (Codex splices it into a TOML override). */
+const NATIVE_EFFORT = /^[a-z][a-z0-9_-]{0,31}$/;
 const THINKING_TYPES: ReadonlySet<string> = new Set(["enabled", "disabled", "adaptive"]);
 
 export interface EngineOptions {
@@ -79,6 +81,8 @@ interface PreparedTurn {
   ignored: string[];
   /** Cache key the resume came from — set only when resuming a session. */
   resumeKey?: string;
+  /** A model-native effort level still to be checked against the model list. */
+  effortToConfirm?: string;
 }
 
 /**
@@ -93,6 +97,8 @@ export class YagamiEngine {
   private readonly defaultModel: string | undefined;
   private readonly cache: SessionCache;
   private readonly modelsPromises = new Map<string, Promise<EngineModel[]>>();
+  /** Model lists that have arrived, for checks that cannot wait on a probe. */
+  private readonly modelsLoaded = new Map<string, EngineModel[]>();
 
   constructor(options: EngineOptions = {}) {
     const workDir = options.workDir ?? path.join(os.tmpdir(), "yagami-workspace");
@@ -160,17 +166,7 @@ export class YagamiEngine {
    */
   async listModels(): Promise<EngineModel[]> {
     const out: EngineModel[] = [];
-    const entries = await Promise.all(
-      [...this.providers.entries()].map(async ([id, provider]) => {
-        try {
-          return [id, await this.providerModels(id, provider)] as const;
-        } catch (err) {
-          debug("models", `${id} did not report its models; skipped until the next probe`, err);
-          return [id, []] as const;
-        }
-      }),
-    );
-    for (const [id, models] of entries) {
+    for (const { provider: id, models } of await this.probeModels()) {
       for (const m of models) {
         if (id === this.defaultProviderId) out.push({ ...m, provider: id });
         out.push({ ...m, id: qualifiedModel(id, m.id), provider: id });
@@ -179,13 +175,33 @@ export class YagamiEngine {
     return out;
   }
 
+  /** Each available provider's own model list, or why it could not give one. */
+  async probeModels(): Promise<Array<{ provider: string; models: EngineModel[]; error?: string }>> {
+    return Promise.all(
+      [...this.providers.entries()].map(async ([id, provider]) => {
+        try {
+          return { provider: id, models: await this.providerModels(id, provider) };
+        } catch (err) {
+          debug("models", `${id} did not report its models; skipped until the next probe`, err);
+          return { provider: id, models: [], error: err instanceof Error ? err.message : String(err) };
+        }
+      }),
+    );
+  }
+
   private providerModels(id: string, provider: Provider): Promise<EngineModel[]> {
     let promise = this.modelsPromises.get(id);
     if (!promise) {
-      promise = provider.listModels().catch((err) => {
-        this.modelsPromises.delete(id);
-        throw err;
-      });
+      promise = provider.listModels().then(
+        (models) => {
+          this.modelsLoaded.set(id, models);
+          return models;
+        },
+        (err) => {
+          this.modelsPromises.delete(id);
+          throw err;
+        },
+      );
       this.modelsPromises.set(id, promise);
     }
     return promise;
@@ -203,11 +219,21 @@ export class YagamiEngine {
       }
       if (!caps.thinking) ignored.push("thinking");
     }
+    let effortToConfirm: string | undefined;
     if (req.effort != null) {
-      if (typeof req.effort !== "string" || !EFFORT_LEVELS.has(req.effort)) {
-        throw new ApiError(400, "invalid_request_error", `invalid \`effort\`: ${String(req.effort)}`);
+      const effort = req.effort;
+      // Beyond the standard levels, a harness may take its own (Codex's
+      // "ultra"): those pass only when the target model lists them.
+      const native = caps.effort && typeof effort === "string" && !EFFORT_LEVELS.has(effort) && NATIVE_EFFORT.test(effort);
+      if (typeof effort !== "string" || (!EFFORT_LEVELS.has(effort) && !native)) {
+        throw new ApiError(400, "invalid_request_error", `invalid \`effort\`: ${String(effort)}`);
       }
       if (!caps.effort) ignored.push("effort");
+      if (native) {
+        const models = this.modelsLoaded.get(provider.id);
+        if (models) assertModelEffort(provider.id, model, effort, models);
+        else effortToConfirm = effort;
+      }
     }
 
     const last = norm.messages[norm.messages.length - 1]!;
@@ -285,7 +311,36 @@ export class YagamiEngine {
         : qualifiedModel(provider.id, model)
       : provider.id;
 
-    return { provider, turn, norm, requestedModel, ignored, ...(resume && resumeKey ? { resumeKey } : {}) };
+    return {
+      provider,
+      turn,
+      norm,
+      requestedModel,
+      ignored,
+      ...(resume && resumeKey ? { resumeKey } : {}),
+      ...(effortToConfirm ? { effortToConfirm } : {}),
+    };
+  }
+
+  /**
+   * Check a model-native effort level against the provider's model list,
+   * probing it first when no list has arrived yet.
+   */
+  private async confirmEffort(prepared: PreparedTurn): Promise<void> {
+    const { provider, turn, effortToConfirm } = prepared;
+    if (!effortToConfirm) return;
+    let models: EngineModel[];
+    try {
+      models = await this.providerModels(provider.id, provider);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new ApiError(
+        503,
+        "api_error",
+        `cannot check \`effort\` "${effortToConfirm}": ${provider.id} did not report its models (${reason})`,
+      );
+    }
+    assertModelEffort(provider.id, turn.model, effortToConfirm, models);
   }
 
   /**
@@ -316,6 +371,7 @@ export class YagamiEngine {
 
   async complete(req: MessagesRequest): Promise<CompleteResult> {
     const prepared = this.prepare(req);
+    await this.confirmEffort(prepared);
     try {
       return await this.attemptComplete(prepared);
     } catch (err) {
@@ -419,6 +475,12 @@ export class YagamiEngine {
   ): AsyncGenerator<SseEvent, void, undefined> {
     const { signal } = streamOptions;
     let emitted = false;
+    try {
+      await this.confirmEffort(prepared);
+    } catch (err) {
+      yield { event: "error", data: toApiError(err).toBody() };
+      return;
+    }
     try {
       for await (const ev of this.attemptStream(prepared, streamOptions)) {
         emitted = true;
@@ -531,4 +593,29 @@ function mcpToolResultBlock(ev: Extract<TurnEvent, { type: "tool_result" }>): Co
     is_error: ev.isError,
     content: [{ type: "text", text: ev.content }],
   };
+}
+
+/**
+ * A model-native effort level is passed on only when the target model — or,
+ * with no model named, the provider's default — lists it.
+ */
+function assertModelEffort(providerId: string, model: string | undefined, effort: string, models: EngineModel[]): void {
+  const entry = model
+    ? models.find((m) => m.id === model || m.resolved_model === model)
+    : models.find((m) => m.is_default) ?? (models.length === 1 ? models[0] : undefined);
+  const levels = entry?.reasoning_efforts?.map((e) => e.id) ?? [];
+  if (levels.includes(effort)) return;
+  const name = model ? `${providerId}:${model}` : `${providerId}'s default model`;
+  const why = !entry
+    ? model
+      ? `${name} is not in ${providerId}'s model list`
+      : `${providerId} does not say which model is its default; name one`
+    : levels.length > 0
+      ? `${name} takes ${levels.join(", ")}`
+      : `${name} lists no reasoning levels`;
+  throw new ApiError(
+    400,
+    "invalid_request_error",
+    `invalid \`effort\`: "${effort}" is not one of ${[...EFFORT_LEVELS].join(", ")}, and ${why}`,
+  );
 }

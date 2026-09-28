@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Command } from "commander";
 import { YagamiEngine } from "./core/engine.js";
+import { qualifiedModel } from "./core/provider.js";
 import { ClaudeProvider } from "./core/providers/claude.js";
 import { createProvider, detectProviders } from "./core/providers/registry.js";
 import { startYagami } from "./server.js";
@@ -424,22 +425,18 @@ program
         ...(cfg.providers ? { providerConfig: cfg.providers } : {}),
         ...(cfg.defaultProvider ? { defaultProvider: cfg.defaultProvider } : {}),
       });
-      const models = await engine.listModels();
-      const byProvider = new Map<string, typeof models>();
-      for (const m of models) {
-        if (opts.provider && m.provider !== opts.provider) continue;
-        if (!m.id.includes(":")) continue; // print the qualified form once
-        const list = byProvider.get(m.provider ?? "?") ?? [];
-        list.push(m);
-        byProvider.set(m.provider ?? "?", list);
-      }
-      for (const [provider, list] of byProvider) {
+      let reported = 0;
+      for (const { provider, models, error } of await engine.probeModels()) {
+        if (opts.provider && provider !== opts.provider) continue;
+        if (models.length === 0 && !error) continue;
+        reported += 1;
         console.log(`${provider}${provider === engine.defaultProviderId ? " (default — bare ids work too)" : ""}`);
-        for (const m of list) {
-          console.log(`  ${m.id.padEnd(40)} ${m.display_name}${m.resolved_model ? ` → ${m.resolved_model}` : ""}`);
+        if (error) console.log(`  ✗ ${error.split("\n")[0]}`);
+        for (const m of models) {
+          console.log(`  ${qualifiedModel(provider, m.id).padEnd(40)} ${m.display_name}${m.resolved_model ? ` → ${m.resolved_model}` : ""}`);
         }
       }
-      if (byProvider.size === 0) console.log("no models reported — run `yagami doctor`");
+      if (reported === 0) console.log("no models reported — run `yagami doctor`");
     } catch (err) {
       console.error(`yagami: ${err instanceof Error ? err.message : String(err)}`);
       process.exitCode = 1;
