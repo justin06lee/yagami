@@ -7,6 +7,8 @@ import { collect } from "../helpers/fakeProvider.js";
 interface FakeOptions {
   resume?: boolean;
   models?: boolean;
+  /** Report models the older way (Gemini CLI): a session `models` list, no config option. */
+  legacyModels?: boolean;
   modes?: boolean;
   promptError?: Error & { code?: number };
   sessionError?: Error & { code?: number };
@@ -14,8 +16,8 @@ interface FakeOptions {
 
 function fakeConnection(opts: FakeOptions = {}) {
   let handlers: AcpHandlers = {};
-  const calls: Record<string, unknown[]> = { setSessionMode: [], setSessionConfigOption: [], cancel: [] };
-  const configOptions = opts.models === false ? [] : [
+  const calls: Record<string, unknown[]> = { setSessionMode: [], setSessionConfigOption: [], cancel: [], request: [] };
+  const configOptions = opts.models === false || opts.legacyModels ? [] : [
     {
       id: "model",
       name: "Model",
@@ -40,10 +42,23 @@ function fakeConnection(opts: FakeOptions = {}) {
     },
   ];
   const modes = opts.modes === false ? null : { currentModeId: "build", availableModes: [{ id: "build" }, { id: "plan" }] };
+  const models = opts.legacyModels
+    ? {
+        currentModelId: "auto",
+        availableModels: [
+          { modelId: "auto", name: "Auto", description: "Picks for you" },
+          { modelId: "gemini-pro", name: "Gemini Pro" },
+        ],
+      }
+    : undefined;
   const agent = {
     newSession: async () => {
       if (opts.sessionError) throw opts.sessionError;
-      return { sessionId: "ses-1", configOptions, modes };
+      return { sessionId: "ses-1", configOptions, modes, ...(models ? { models } : {}) };
+    },
+    request: async (method: string, params: unknown) => {
+      calls["request"]!.push({ method, params });
+      return {};
     },
     resumeSession: async () => ({ configOptions, modes }),
     setSessionMode: async (p: unknown) => {
@@ -121,6 +136,26 @@ describe("AcpProvider.run", () => {
     expect(fake.calls["setSessionConfigOption"]).toEqual([{ sessionId: "ses-1", configId: "model", value: "b" }]);
   });
 
+  it("selects the model through session/set_model when the agent reports models the older way", async () => {
+    const fake = fakeConnection({ legacyModels: true });
+    const p = provider(fake);
+    await collect(p.run({ prompt: "ping", model: "auto" }));
+    expect(fake.calls["request"]).toEqual([]);
+    await collect(p.run({ prompt: "ping", model: "gemini-pro" }));
+    expect(fake.calls["request"]).toEqual([{ method: "session/set_model", params: { sessionId: "ses-1", modelId: "gemini-pro" } }]);
+  });
+
+  it("applies effort through the agent's reasoning-level option, only when offered", async () => {
+    const fake = fakeConnection();
+    const p = provider(fake);
+    expect(p.capabilities.effort).toBe(true);
+    await collect(p.run({ prompt: "ping", effort: "high" }));
+    expect(fake.calls["setSessionConfigOption"]).toEqual([{ sessionId: "ses-1", configId: "thought_level", value: "high" }]);
+    await collect(p.run({ prompt: "ping", effort: "max" }));
+    await collect(p.run({ prompt: "ping", effort: "medium" }));
+    expect(fake.calls["setSessionConfigOption"]).toHaveLength(1);
+  });
+
   it("errors clearly when a model is requested but the agent has no model option", async () => {
     const fake = fakeConnection({ models: false });
     await expect(collect(provider(fake).run({ prompt: "ping", model: "x" }))).rejects.toThrowError(/no model option/);
@@ -148,6 +183,7 @@ describe("AcpProvider.run", () => {
           { id: "high", description: "Deeper" },
         ],
         default_reasoning_effort: "medium",
+        is_default: true,
       },
       {
         id: "b",
@@ -160,6 +196,14 @@ describe("AcpProvider.run", () => {
       },
     ]);
     expect(fake.closed).toHaveBeenCalled();
+  });
+
+  it("lists models from the session's older models list (Gemini CLI)", async () => {
+    const fake = fakeConnection({ legacyModels: true });
+    expect(await provider(fake).listModels()).toEqual([
+      { id: "auto", display_name: "Auto", description: "Picks for you", is_default: true },
+      { id: "gemini-pro", display_name: "Gemini Pro" },
+    ]);
   });
 
   it("reports the agent's advertised version", async () => {
