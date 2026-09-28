@@ -330,6 +330,17 @@ describe("listModels", () => {
     codex.models = [{ id: "gpt-5", display_name: "GPT-5" }];
     expect((await engine.listModels()).map((m) => m.id)).toContain("codex:gpt-5");
   });
+
+  it("says per provider why a probe came back empty", async () => {
+    const claude = new FakeProvider("claude");
+    const gemini = new FakeProvider("gemini");
+    gemini.modelsError = new Error("gemini is not signed in");
+    const engine = makeEngine([claude, gemini]);
+    expect(await engine.probeModels()).toEqual([
+      { provider: "claude", models: [{ id: "fake-1", display_name: "Fake 1" }] },
+      { provider: "gemini", models: [], error: "gemini is not signed in" },
+    ]);
+  });
 });
 
 describe("server tools", () => {

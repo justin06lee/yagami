@@ -248,7 +248,7 @@ Any other ACP agent works too — add it to config with its launch command:
 | `yagami stop` | Stop the running server: SIGTERM, then SIGKILL after 5 s if it's wedged. Only ever signals the process that wrote the state file — a pid recycled after a reboot or crash is left alone |
 | `yagami status` | Show whether it's running, plus its providers, uptime, request count, and cumulative would-be API cost |
 | `yagami key` | Print the URL + API key, plus ready-to-paste `ANTHROPIC_*`/`OPENAI_*` env exports for client apps |
-| `yagami models` | List models across every installed provider (`--provider <id>` to filter) |
+| `yagami models` | List models across every installed provider (`--provider <id>` to filter), and why a provider reported none |
 | `yagami keygen` | Generate another API key and save it to the config |
 | `yagami doctor` | Check every harness CLI; `--live` sends one tiny real completion (`--provider <id>` to pick which) |
 

@@ -160,23 +160,27 @@ export class YagamiEngine {
    */
   async listModels(): Promise<EngineModel[]> {
     const out: EngineModel[] = [];
-    const entries = await Promise.all(
-      [...this.providers.entries()].map(async ([id, provider]) => {
-        try {
-          return [id, await this.providerModels(id, provider)] as const;
-        } catch (err) {
-          debug("models", `${id} did not report its models; skipped until the next probe`, err);
-          return [id, []] as const;
-        }
-      }),
-    );
-    for (const [id, models] of entries) {
+    for (const { provider: id, models } of await this.probeModels()) {
       for (const m of models) {
         if (id === this.defaultProviderId) out.push({ ...m, provider: id });
         out.push({ ...m, id: qualifiedModel(id, m.id), provider: id });
       }
     }
     return out;
+  }
+
+  /** Each available provider's own model list, or why it could not give one. */
+  async probeModels(): Promise<Array<{ provider: string; models: EngineModel[]; error?: string }>> {
+    return Promise.all(
+      [...this.providers.entries()].map(async ([id, provider]) => {
+        try {
+          return { provider: id, models: await this.providerModels(id, provider) };
+        } catch (err) {
+          debug("models", `${id} did not report its models; skipped until the next probe`, err);
+          return { provider: id, models: [], error: err instanceof Error ? err.message : String(err) };
+        }
+      }),
+    );
   }
 
   private providerModels(id: string, provider: Provider): Promise<EngineModel[]> {
