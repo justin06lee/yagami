@@ -23,7 +23,12 @@ export interface AgentSessionOptions {
   parity?: Parity;
   /** Model id/alias; the CLI default when omitted. */
   model?: string;
-  /** Host permission callback (see {@link PermissionAdapter}). */
+  /**
+   * Host permission callback (see {@link PermissionAdapter}). Not consulted
+   * while the session is in bypassPermissions mode; a session that starts in
+   * bypass with neither this nor `permission` never consults it, even after
+   * leaving bypass.
+   */
   onPermission?: PermissionHandler;
   /** Options for the permission adapter (fallback, auto-allow/deny). */
   permission?: PermissionAdapterOptions;
@@ -59,6 +64,14 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
     this.appName = options.appName ?? "yagami";
     this.permissions = new PermissionAdapter(options.permission ?? {});
     if (options.onPermission) this.permissions.setHandler(options.onPermission);
+    // The SDK never consults canUseTool in bypassPermissions mode and warns
+    // when one is set, so a session that starts there only gets the adapter
+    // if the host wired permissions — it routes prompts again once
+    // setPermissionMode() leaves bypass.
+    const startsInBypass = options.options?.permissionMode === "bypassPermissions";
+    const canUseTool =
+      options.options?.canUseTool ??
+      (startsInBypass && !options.onPermission && !options.permission ? undefined : this.permissions.canUseTool);
     this.baseOptions = {
       systemPrompt: { type: "preset", preset: "claude_code" },
       settingSources: settingSourcesFor(options.parity ?? "terminal"),
@@ -66,7 +79,7 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
       ...(options.cwd ? { cwd: options.cwd } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...options.options,
-      canUseTool: options.options?.canUseTool ?? this.permissions.canUseTool,
+      ...(canUseTool ? { canUseTool } : {}),
       pathToClaudeCodeExecutable: this.claudePath,
       env: {
         ...process.env,
