@@ -114,6 +114,37 @@ describe("AgentSession", () => {
     expect(onPermission).toHaveBeenCalled();
   });
 
+  it("installs no canUseTool when the session starts in bypassPermissions", async () => {
+    fakeQuery();
+    const s = new AgentSession({
+      claudePath: FAKE_CLAUDE,
+      options: { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true },
+    });
+    s.send("hi");
+    await runOneTurn(s);
+    s.close();
+    expect(lastOptions().permissionMode).toBe("bypassPermissions");
+    expect(lastOptions()).not.toHaveProperty("canUseTool");
+  });
+
+  it("keeps canUseTool in bypassPermissions when the host wired permissions", async () => {
+    const bypass = { permissionMode: "bypassPermissions" as const, allowDangerouslySkipPermissions: true };
+    const ownCanUseTool = vi.fn();
+    for (const [options, expected] of [
+      [{ onPermission: async () => ({ behavior: "allow" as const }) }, "function"],
+      [{ permission: { autoDeny: ["Bash"] } }, "function"],
+      [{ options: { ...bypass, canUseTool: ownCanUseTool } }, ownCanUseTool],
+    ] as const) {
+      fakeQuery();
+      const s = new AgentSession({ claudePath: FAKE_CLAUDE, options: bypass, ...options });
+      s.send("hi");
+      await runOneTurn(s);
+      s.close();
+      if (expected === "function") expect(lastOptions().canUseTool).toBeTypeOf("function");
+      else expect(lastOptions().canUseTool).toBe(expected);
+    }
+  });
+
   it("refuses sending after close", () => {
     fakeQuery();
     const s = new AgentSession({ claudePath: FAKE_CLAUDE });
