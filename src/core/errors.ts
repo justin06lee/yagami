@@ -92,13 +92,16 @@ export function classifyProviderFailure(provider: string, loginCommand: string, 
   return new ProviderError(provider, message);
 }
 
-/** Map any failure onto the Anthropic-shaped HTTP error the API returns. */
+/**
+ * Map any failure onto the Anthropic-shaped HTTP error the API returns. The
+ * original failure rides along as `cause`.
+ */
 export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
   if (err instanceof AuthRequiredError || err instanceof ProviderNotInstalledError) {
-    return new ApiError(503, "api_error", err.message);
+    return new ApiError(503, "api_error", err.message, { cause: err });
   }
-  if (err instanceof YagamiError) return new ApiError(500, "api_error", err.message);
+  if (err instanceof YagamiError) return new ApiError(500, "api_error", err.message, { cause: err });
   const message = err instanceof Error ? err.message : String(err);
-  return new ApiError(500, "api_error", `engine error: ${message}`);
+  return new ApiError(500, "api_error", `engine error: ${message}`, { cause: err });
 }

@@ -12,7 +12,7 @@
 
 import { YagamiEngine, type EngineOptions } from "./engine.js";
 import { loadHostEngineConfig } from "./hostConfig.js";
-import { ApiError, type MessagesRequest, type MessagesResponse } from "./types.js";
+import { ApiError, type MessagesRequest, type MessagesResponse, type SseEvent } from "./types.js";
 import type { EngineModel } from "./models.js";
 import {
   ChatChunkTranslator,
@@ -98,7 +98,7 @@ export class Yagami {
   private async *streamMessageEvents(req: MessagesRequest): AsyncGenerator<MessageStreamEvent, void, undefined> {
     const { events } = this.engine.stream(req);
     for await (const ev of events) {
-      if (ev.event === "error") throw errorFromEvent(ev.data);
+      if (ev.event === "error") throw errorFromEvent(ev);
       yield ev.data as MessageStreamEvent;
     }
   }
@@ -108,14 +108,16 @@ export class Yagami {
     const translator = new ChatChunkTranslator(includeUsage);
     const { events } = this.engine.stream(translated);
     for await (const ev of events) {
-      if (ev.event === "error") throw errorFromEvent(ev.data);
+      if (ev.event === "error") throw errorFromEvent(ev);
       for (const chunk of translator.push(ev)) yield chunk as ChatCompletionChunk;
     }
   }
 }
 
-function errorFromEvent(data: unknown): ApiError {
-  const error = (data as { error?: { type?: string; message?: string } } | undefined)?.error;
+/** The engine's own ApiError (status and typed cause intact), else one rebuilt from the body. */
+function errorFromEvent(ev: SseEvent): ApiError {
+  if (ev.error) return ev.error;
+  const error = (ev.data as { error?: { type?: string; message?: string } } | undefined)?.error;
   return new ApiError(500, (error?.type as ApiError["type"]) ?? "api_error", error?.message ?? "stream error");
 }
 

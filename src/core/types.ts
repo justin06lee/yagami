@@ -12,13 +12,19 @@ export type ApiErrorType =
   | "api_error"
   | "overloaded_error";
 
+/**
+ * An Anthropic-shaped API failure. When it was made from another failure (a
+ * typed `YagamiError` such as `AuthRequiredError`), that failure is its
+ * `cause`, so library callers keep the typed fields the HTTP body drops.
+ */
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     readonly type: ApiErrorType,
     message: string,
+    options?: { cause?: unknown },
   ) {
-    super(message);
+    super(message, options);
     this.name = "ApiError";
   }
 
@@ -98,4 +104,6 @@ export interface MessagesResponse {
 export interface SseEvent {
   event: string;
   data: unknown;
+  /** On an `error` event: the failure itself, for in-process consumers. Never serialized. */
+  error?: ApiError;
 }
