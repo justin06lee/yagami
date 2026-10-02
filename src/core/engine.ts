@@ -338,6 +338,7 @@ export class YagamiEngine {
         503,
         "api_error",
         `cannot check \`effort\` "${effortToConfirm}": ${provider.id} did not report its models (${reason})`,
+        { cause: err },
       );
     }
     assertModelEffort(provider.id, turn.model, effortToConfirm, models);
@@ -478,7 +479,7 @@ export class YagamiEngine {
     try {
       await this.confirmEffort(prepared);
     } catch (err) {
-      yield { event: "error", data: toApiError(err).toBody() };
+      yield errorEvent(err);
       return;
     }
     try {
@@ -493,13 +494,13 @@ export class YagamiEngine {
       // transparently against a fresh session (transcript replay).
       const fallback = emitted ? undefined : this.prepareResumeFallback(req, prepared);
       if (!fallback) {
-        yield { event: "error", data: toApiError(err).toBody() };
+        yield errorEvent(err);
         return;
       }
       try {
         yield* this.attemptStream(fallback, streamOptions);
       } catch (err2) {
-        if (!signal?.aborted) yield { event: "error", data: toApiError(err2).toBody() };
+        if (!signal?.aborted) yield errorEvent(err2);
       }
     }
   }
@@ -578,6 +579,12 @@ export class YagamiEngine {
       ...(sessionId ? { sessionId } : {}),
     });
   }
+}
+
+/** The SSE `error` event for a failure, carrying the ApiError (and its typed cause) for in-process consumers. */
+function errorEvent(err: unknown): SseEvent {
+  const error = toApiError(err);
+  return { event: "error", data: error.toBody(), error };
 }
 
 /** Anthropic `mcp_tool_use` block for a tool call the MCP server ran. */

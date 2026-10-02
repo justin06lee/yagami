@@ -3,6 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Yagami } from "../src/core/client.js";
+import { AuthRequiredError, ProviderNotInstalledError } from "../src/core/errors.js";
+import { ApiError } from "../src/core/types.js";
 import { loadHostEngineConfig } from "../src/core/hostConfig.js";
 import { setLogSink } from "../src/core/log.js";
 import type { ChatCompletionChunk } from "../src/core/openai.js";
@@ -69,6 +71,30 @@ describe("Yagami client", () => {
     const result = await yagami.engine.complete({ messages: [{ role: "user", content: "hi" }] });
     expect(result.provider).toBe("fake");
     expect(result.costUsd).toBe(0.01);
+  });
+
+  it("keeps the typed failure as the ApiError's cause on every path", async () => {
+    const failures = [
+      new AuthRequiredError("fake", "fake login"),
+      new ProviderNotInstalledError("fake", "install fake"),
+    ];
+    for (const failure of failures) {
+      const { yagami } = client(new FakeProvider("fake", undefined, () => failure));
+      const req = { messages: [{ role: "user" as const, content: "hi" }] };
+      const rejections = [
+        yagami.messages.create(req),
+        yagami.engine.complete(req),
+        yagami.chat.completions.create(req),
+        collect(yagami.messages.create({ ...req, stream: true })),
+        collect(yagami.chat.completions.create({ ...req, stream: true })),
+      ];
+      for (const rejection of rejections) {
+        const err = await rejection.then(() => undefined, (e: unknown) => e);
+        expect(err).toBeInstanceOf(ApiError);
+        expect((err as ApiError).status).toBe(503);
+        expect((err as ApiError).cause).toBe(failure);
+      }
+    }
   });
 });
 
