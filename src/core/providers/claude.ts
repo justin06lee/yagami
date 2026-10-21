@@ -129,9 +129,13 @@ export class ClaudeProvider implements Provider {
       pathToClaudeCodeExecutable: this.executable,
       cwd: this.workDir,
       // Pure completions: no built-in tools, no settings/CLAUDE.md/skills
-      // leaking in, exactly one assistant turn per request.
+      // leaking in, exactly one assistant turn per request. Only a request's
+      // own MCP servers load: the account's claude.ai connectors otherwise
+      // join whenever they connect before the turn, ~10k input tokens each time.
       tools: [],
       settingSources: [],
+      strictMcpConfig: true,
+      skills: [],
       maxTurns: 1,
       canUseTool: DENY_ALL_TOOLS,
       env: {
