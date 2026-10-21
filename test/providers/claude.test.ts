@@ -58,6 +58,8 @@ describe("ClaudeProvider.run", () => {
     expect(options.model).toBe("claude-x");
     expect(options.tools).toEqual([]);
     expect(options.settingSources).toEqual([]);
+    expect(options.strictMcpConfig).toBe(true);
+    expect(options.skills).toEqual([]);
     expect(options.maxTurns).toBe(1);
     expect(options.includePartialMessages).toBe(true);
   });
