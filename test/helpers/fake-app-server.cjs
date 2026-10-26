@@ -244,6 +244,20 @@ rl.on("line", (line) => {
         // the engine crashing mid-turn: nothing more is ever said
         process.exit(3);
       }
+      if (prompt.includes("[capped]")) {
+        // the plan running out: the account's window is used up, then the turn fails
+        notify("account/rateLimits/updated", {
+          rateLimits: {
+            primary: { usedPercent: 100, resetsAt: 1798000000, windowDurationMins: 300 },
+            secondary: { usedPercent: 40, resetsAt: 1799000000, windowDurationMins: 10080 },
+          },
+        });
+        notify("turn/completed", {
+          threadId: THREAD,
+          turn: { id: turnId, status: "failed", error: { message: "You've hit your usage limit.", codexErrorInfo: "usageLimitExceeded" } },
+        });
+        break;
+      }
       if (prompt.includes("[malformed]")) {
         // shapes the session must survive without taking the host down:
         // a delta with no text, a completion with no turn, usage with no

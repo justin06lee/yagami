@@ -52,6 +52,18 @@ export class ProviderError extends YagamiError {
   }
 }
 
+/** The provider's plan is out of usage until `resetsAt` (epoch seconds, when known). */
+export class UsageLimitError extends YagamiError {
+  constructor(
+    readonly provider: string,
+    readonly resetsAt: number | undefined,
+    message: string,
+  ) {
+    super(`${provider}: ${message}`, "usage_limit");
+    this.name = "UsageLimitError";
+  }
+}
+
 /** Result of comparing an SDK build against the CLI binary it drives. */
 export interface VersionSkew {
   sdkVersion: string;
@@ -101,6 +113,7 @@ export function toApiError(err: unknown): ApiError {
   if (err instanceof AuthRequiredError || err instanceof ProviderNotInstalledError) {
     return new ApiError(503, "api_error", err.message, { cause: err });
   }
+  if (err instanceof UsageLimitError) return new ApiError(429, "rate_limit_error", err.message, { cause: err });
   if (err instanceof YagamiError) return new ApiError(500, "api_error", err.message, { cause: err });
   const message = err instanceof Error ? err.message : String(err);
   return new ApiError(500, "api_error", `engine error: ${message}`, { cause: err });

@@ -20,6 +20,9 @@ export interface McpServerSpec {
   headers?: Record<string, string>;
   /** When set, only these tool names from the server may be called. */
   allowedTools?: string[];
+  /** How long one tool call may run before the harness gives up on it (Codex
+   *  defaults to 60 s). Harnesses without the setting ignore it. */
+  toolTimeoutSec?: number;
 }
 
 export interface ResolvedMcp {

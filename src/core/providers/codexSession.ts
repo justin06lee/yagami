@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
-import { AuthRequiredError, classifyProviderFailure, looksLikeAuthFailure, ProviderError } from "../errors.js";
+import { AuthRequiredError, classifyProviderFailure, looksLikeAuthFailure, ProviderError, UsageLimitError } from "../errors.js";
 import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
 import { debug } from "../log.js";
 import type { McpServerSpec } from "../mcp.js";
@@ -89,9 +89,30 @@ export function codexMcpConfig(
       url: spec.url,
       ...(spec.headers ? { http_headers: spec.headers } : {}),
       ...(spec.allowedTools ? { enabled_tools: spec.allowedTools } : {}),
+      ...(spec.toolTimeoutSec ? { tool_timeout_sec: spec.toolTimeoutSec } : {}),
     };
   }
   return { ...base, mcp_servers: servers };
+}
+
+/** Is a failed turn the plan running out (not a transient rate limit)? */
+export function isUsageLimit(info: unknown, message: string): boolean {
+  if (info === "usageLimitExceeded") return true;
+  if (isPlainObject(info) && "usageLimitExceeded" in info) return true;
+  return /usage limit|hit your (usage )?limit/i.test(message);
+}
+
+/** The latest reset (epoch seconds) of the rate-limit windows that are used up. */
+export function exhaustedResetsAt(snapshot: unknown): number | undefined {
+  if (!isPlainObject(snapshot)) return undefined;
+  let latest: number | undefined;
+  for (const key of ["primary", "secondary"]) {
+    const w = snapshot[key];
+    if (!isPlainObject(w) || typeof w["usedPercent"] !== "number" || w["usedPercent"] < 100) continue;
+    const at = w["resetsAt"];
+    if (typeof at === "number" && (latest === undefined || at > latest)) latest = at;
+  }
+  return latest;
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -118,6 +139,8 @@ export class CodexAgentSession implements ProviderSession {
   private currentTurnId: string | undefined;
   private queue: AsyncQueue<AgentEvent> | null = null;
   private lastUsage: Usage | undefined;
+  /** When a used-up rate-limit window resets (epoch seconds), from account/rateLimits/updated. */
+  private limitResetsAt: number | undefined;
   private opening: Promise<void> | undefined;
   private closed = false;
   private sending = false;
@@ -397,7 +420,9 @@ export class CodexAgentSession implements ProviderSession {
         break;
       }
       case "turn/completed": {
-        const turn = params["turn"] as { id?: string; status?: string; error?: { message?: string } | null } | undefined;
+        const turn = params["turn"] as
+          | { id?: string; status?: string; error?: { message?: string; codexErrorInfo?: unknown } | null }
+          | undefined;
         if (!turn) break;
         const turnId = turn.id;
         if (this.currentTurnId && turnId && turnId !== this.currentTurnId) break;
@@ -407,7 +432,12 @@ export class CodexAgentSession implements ProviderSession {
         this.turnAbort?.abort();
         if (!queue) break;
         if (turn.status === "failed") {
-          queue.fail(this.classify(new Error(turn.error?.message ?? "turn failed")));
+          const message = turn.error?.message ?? "turn failed";
+          queue.fail(
+            isUsageLimit(turn.error?.codexErrorInfo, message)
+              ? new UsageLimitError("codex", this.limitResetsAt, message)
+              : this.classify(new Error(message)),
+          );
         } else {
           queue.push({
             type: "done",
@@ -416,6 +446,11 @@ export class CodexAgentSession implements ProviderSession {
           });
           queue.end();
         }
+        break;
+      }
+      case "account/rateLimits/updated": {
+        const resets = exhaustedResetsAt(params["rateLimits"]);
+        if (resets !== undefined) this.limitResetsAt = resets;
         break;
       }
       case "error": {

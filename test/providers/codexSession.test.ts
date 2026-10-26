@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { CodexAgentSession, codexMcpConfig, mcpApprovalOf } from "../../src/core/providers/codexSession.js";
+import { CodexAgentSession, codexMcpConfig, exhaustedResetsAt, isUsageLimit, mcpApprovalOf } from "../../src/core/providers/codexSession.js";
+import { UsageLimitError } from "../../src/core/errors.js";
 import { isSessionProvider } from "../../src/core/provider.js";
 import { CodexProvider } from "../../src/core/providers/codex.js";
 import type { AgentEvent, SessionPermissionDecision, SessionPermissionRequest } from "../../src/core/provider.js";
@@ -64,6 +65,29 @@ describe("codexMcpConfig", () => {
         envlocal: { url: "http://127.0.0.1:4242/mcp", http_headers: { Authorization: "Bearer t" }, enabled_tools: ["get_status"] },
       },
     });
+  });
+
+  it("gives a server's tools the timeout it asks for", () => {
+    expect(codexMcpConfig(undefined, { midna: { url: "http://m/mcp", toolTimeoutSec: 900 } })).toEqual({
+      mcp_servers: { midna: { url: "http://m/mcp", tool_timeout_sec: 900 } },
+    });
+  });
+});
+
+describe("usage limits", () => {
+  it("tells the plan running out from other failures", () => {
+    expect(isUsageLimit("usageLimitExceeded", "x")).toBe(true);
+    expect(isUsageLimit({ usageLimitExceeded: {} }, "x")).toBe(true);
+    expect(isUsageLimit(null, "You've hit your usage limit. Try again later.")).toBe(true);
+    expect(isUsageLimit("rateLimitExceeded", "slow down")).toBe(false);
+    expect(isUsageLimit("serverOverloaded", "busy")).toBe(false);
+  });
+
+  it("takes the latest reset of the windows that are used up", () => {
+    expect(exhaustedResetsAt({ primary: { usedPercent: 100, resetsAt: 10 }, secondary: { usedPercent: 100, resetsAt: 20 } })).toBe(20);
+    expect(exhaustedResetsAt({ primary: { usedPercent: 100, resetsAt: 10 }, secondary: { usedPercent: 50, resetsAt: 20 } })).toBe(10);
+    expect(exhaustedResetsAt({ primary: { usedPercent: 80, resetsAt: 10 } })).toBeUndefined();
+    expect(exhaustedResetsAt(null)).toBeUndefined();
   });
 });
 
@@ -342,6 +366,18 @@ describe("CodexAgentSession", () => {
       await expect(collect(s.send("[die] run it"))).rejects.toThrow(/exited with code 3/);
       // the session is spent: a later send does not hang or crash either
       await expect(collect(s.send("again"))).rejects.toThrow();
+    } finally { await s.close(); }
+  });
+
+  it("fails a turn the plan has no usage left for with UsageLimitError and its reset", async () => {
+    const s = session("allow");
+    try {
+      const err = await collect(s.send("[capped] go")).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(UsageLimitError);
+      expect(err).toMatchObject({ code: "usage_limit", provider: "codex", resetsAt: 1798000000 });
     } finally { await s.close(); }
   });
 

@@ -101,6 +101,7 @@ export {
   ProviderNotInstalledError,
   AuthRequiredError,
   ProviderError,
+  UsageLimitError,
   toApiError,
   type VersionSkew,
 } from "./core/errors.js";
