@@ -139,6 +139,19 @@ const { response, costUsd } = await engine.complete({ messages: [{ role: "user",
 
 Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `ProviderError`. `Yagami` and `YagamiEngine` turns reject with an `ApiError` (the HTTP `status` and `type`) whose `cause` is that typed failure, so check `err.cause instanceof AuthRequiredError`. Every CLI yagami starts is ended with everything it started in turn — a launcher that re-executes itself, an npm shim, an agent's MCP servers — and nothing is left waiting on an agent that never answers: an ACP handshake has 30 seconds, a model-list or version probe 20, and a turn aborted before its session exists closes the agent. A consumer that stops reading a turn early ends its process too.
 
+### Claude models and long context
+
+`ClaudeProvider.run()` and `AgentSession` request **1M context by default**, including startup model overrides in `options.model` and `setModel()` switches. The exported `claudeLongContextModel(model: string): string` applies the same policy for embedding bridges:
+
+- `opus`, `sonnet`, `haiku`, `fable`, and `best` stay dynamic aliases, with `[1m]` appended. The installed CLI resolves the current version for its provider/account; Yagami does not pin today's releases.
+- Versioned `claude-<family>-<version>` IDs retain their exact version, with `[1m]` appended. An existing `[1m]` suffix is unchanged. Unknown IDs, non-Claude IDs, and special modes such as `opusplan` pass through untouched; their context remains CLI-owned.
+- An omitted model, empty string, or `default` explicitly selects `sonnet[1m]` in these Yagami APIs, rather than inheriting an account/settings/environment default. This avoids accidentally opting into a paid Fable default. Select a family or pinned ID explicitly to use something else.
+- Unavailable long context fails; Yagami never retries an unsuffixed/shorter model. If a result reports a primary-model capacity below 1M after a 1M request, the turn fails rather than silently accepting a downgrade. Streamed output may already have arrived before this final check.
+
+`ClaudeProvider.listModels()` still discovers every row through the SDK's live `supportedModels()` control call, including future families/versions. `resolved_model` is the CLI's live resolution, not a Yagami version table. `context_window` is accompanied by `context_window_source`: `"requested"` describes the capacity Yagami actually requests for that row, **not verified account availability**; `"observed"` describes effective capacity from a prior result for that resolved model. Unknown context is omitted, never guessed as 200K. No inference request is made just to list models.
+
+The provider's `done.contextWindow` and `AgentSession.contextWindow` expose effective primary-model capacity from `SDKResultMessage.modelUsage[model].contextWindow`, not from the requested suffix; a subagent's smaller window is not mistaken for the primary model's. Raw SDK result messages remain available from `AgentSession`. The lower-level `claudeCodeSession()` intentionally keeps raw SDK model-selection semantics; call `claudeLongContextModel()` yourself there if desired.
+
 ### Building a UI on Claude Code
 
 `Yagami`/`YagamiEngine` are completions-only by design (server tools aside, they never hand you a tool call to run). To build an actual coding UI — tools, permissions, plan mode, a warm session across turns — use `AgentSession`, which wraps the full Claude Code agent with the lifecycle the interactive terminal gives you for free:

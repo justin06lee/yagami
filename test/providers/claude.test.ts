@@ -9,7 +9,8 @@ import { collect } from "../helpers/fakeProvider.js";
 
 const FAKE_CLAUDE = process.execPath;
 
-async function* sdkRun({ text = "hello", deltas, sessionId = "sess-1", model = "claude-x", thinking }: {
+async function* sdkRun({ text = "hello", deltas, sessionId = "sess-1", model = "claude-x", thinking, modelUsage }: {
+  modelUsage?: Record<string, { contextWindow: number }>;
   text?: string;
   deltas?: string[];
   sessionId?: string;
@@ -30,12 +31,54 @@ async function* sdkRun({ text = "hello", deltas, sessionId = "sess-1", model = "
     result: (deltas ?? [text]).join(""),
     usage: { input_tokens: 3, output_tokens: 5 },
     total_cost_usd: 0.01,
+    modelUsage,
   };
 }
 
 beforeEach(() => queryMock.mockReset());
 
 describe("ClaudeProvider.run", () => {
+  it("rejects CLI error results even when their subtype is success", async () => {
+    queryMock.mockImplementation(async function* () {
+      yield { type: "result", subtype: "success", is_error: true, result: "1M context unavailable", modelUsage: {}, usage: {} };
+    });
+    await expect(collect(new ClaudeProvider({ path: FAKE_CLAUDE }).run({ prompt: "ping", model: "opus" }))).rejects.toThrow(/1M context unavailable/);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+  });
+  it("rejects an observed long-context downgrade without retrying", async () => {
+    queryMock.mockImplementation(() => sdkRun({ model: "claude-haiku-99", modelUsage: { "claude-haiku-99": { contextWindow: 200_000 } } }));
+    await expect(collect(new ClaudeProvider({ path: FAKE_CLAUDE }).run({ prompt: "ping", model: "haiku" }))).rejects.toThrow(/requested.*1M.*200000/i);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    expect(queryMock.mock.calls[0]![0].options.model).toBe("haiku[1m]");
+  });
+  it("propagates unavailable 1M errors without retrying a shorter model", async () => {
+    queryMock.mockImplementation(async function* () { throw new Error("1M context is unavailable for this account"); });
+    await expect(collect(new ClaudeProvider({ path: FAKE_CLAUDE }).run({ prompt: "ping", model: "opus" }))).rejects.toThrow(/unavailable/);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+  });
+  it("reports observed primary context and annotates the live catalog from modelUsage", async () => {
+    const p = new ClaudeProvider({ path: FAKE_CLAUDE });
+    queryMock.mockImplementation(() => sdkRun({ model: "claude-sonnet-99", modelUsage: {
+      "claude-haiku-99": { contextWindow: 200_000 },
+      "claude-sonnet-99": { contextWindow: 1_000_000 },
+    } }));
+    const events = await collect(p.run({ prompt: "ping", model: "sonnet" }));
+    expect(events.at(-1)).toMatchObject({ type: "done", model: "claude-sonnet-99", contextWindow: 1_000_000 });
+    queryMock.mockImplementation(() => ({ supportedModels: async () => [
+      { value: "sonnet", displayName: "Sonnet", resolvedModel: "claude-sonnet-99" },
+    ] }));
+    expect((await p.listModels())[0]).toMatchObject({ context_window: 1_000_000, context_window_source: "observed" });
+  });
+  it("requests 1M on the dynamic default when model is omitted", async () => {
+    queryMock.mockImplementation(() => sdkRun());
+    await collect(new ClaudeProvider({ path: FAKE_CLAUDE }).run({ prompt: "ping" }));
+    expect(queryMock.mock.calls[0]![0].options.model).toBe("sonnet[1m]");
+  });
+  it("requests long context without pinning the live alias", async () => {
+    queryMock.mockImplementation(() => sdkRun());
+    await collect(new ClaudeProvider({ path: FAKE_CLAUDE }).run({ prompt: "ping", model: "sonnet" }));
+    expect(queryMock.mock.calls[0]![0].options.model).toBe("sonnet[1m]");
+  });
   it("maps SDK messages onto turn events", async () => {
     queryMock.mockImplementation(() => sdkRun({ deltas: ["hel", "lo"], thinking: "hm" }));
     const p = new ClaudeProvider({ path: FAKE_CLAUDE });
@@ -116,6 +159,30 @@ describe("ClaudeProvider.run", () => {
 });
 
 describe("ClaudeProvider.listModels", () => {
+  it("reports Yagami's safe dynamic Sonnet default instead of the CLI's different default", async () => {
+    queryMock.mockImplementation(() => ({ supportedModels: async () => [
+      { value: "default", displayName: "Default", resolvedModel: "claude-opus-99" },
+      { value: "sonnet", displayName: "Sonnet", resolvedModel: "claude-sonnet-99", description: "latest sonnet" },
+    ] }));
+    const p = new ClaudeProvider({ path: FAKE_CLAUDE });
+    expect((await p.listModels())[0]).toMatchObject({
+      id: "default", resolved_model: "claude-sonnet-99", description: "latest sonnet", context_window: 1_000_000,
+    });
+  });
+  it("keeps every live row and refreshes alias resolution without version constants", async () => {
+    let version = "future-a";
+    queryMock.mockImplementation(() => ({ supportedModels: async () => [
+      ...["opus", "sonnet", "haiku", "fable"].map(value => ({ value, displayName: value, resolvedModel: `claude-${value}-${version}` })),
+      { value: "custom", displayName: "Custom" },
+    ] }));
+    const p = new ClaudeProvider({ path: FAKE_CLAUDE });
+    const first = await p.listModels();
+    expect(first.map(m => m.id)).toEqual(["opus", "sonnet", "haiku", "fable", "custom"]);
+    for (const row of first.slice(0, 4)) expect(row).toMatchObject({ context_window: 1_000_000, context_window_source: "requested" });
+    expect(first.at(-1)).not.toHaveProperty("context_window");
+    version = "future-b";
+    expect((await p.listModels())[0]?.resolved_model).toBe("claude-opus-future-b");
+  });
   it("maps supportedModels", async () => {
     queryMock.mockImplementation(() => ({
       supportedModels: async () => [{
@@ -137,6 +204,8 @@ describe("ClaudeProvider.listModels", () => {
         display_name: "Sonnet",
         description: "fast",
         resolved_model: "claude-sonnet-5",
+        context_window: 1_000_000,
+        context_window_source: "requested",
         reasoning_efforts: [{ id: "low" }, { id: "high" }],
         supports_adaptive_thinking: true,
         supports_fast_mode: true,

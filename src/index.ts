@@ -81,6 +81,7 @@ export type {
   SessionPlanEntry,
   SessionPlan,
 } from "./core/provider.js";
+export { claudeLongContextModel } from "./core/claudeModels.js";
 export { ClaudeProvider, type ClaudeProviderOptions } from "./core/providers/claude.js";
 export { CodexProvider, type CodexProviderOptions, type CodexSandboxMode } from "./core/providers/codex.js";
 export { AcpProvider, type AcpProviderOptions, type AcpConnection } from "./core/providers/acp.js";

@@ -9,7 +9,7 @@ import { settingSourcesFor } from "../src/core/parity.js";
 const FAKE_CLAUDE = process.execPath;
 
 /** A fake Query that echoes the first queued user turn back as an assistant message. */
-function fakeQuery() {
+function fakeQuery(contextWindow?: number) {
   const interrupt = vi.fn(async () => {});
   const setModel = vi.fn(async () => {});
   const setPermissionMode = vi.fn(async () => {});
@@ -21,8 +21,8 @@ function fakeQuery() {
         yield { type: "system", subtype: "init", session_id: "sess-1" };
         if (!prompt) return;
         for await (const msg of prompt) {
-          yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: msg.message.content }] } };
-          yield { type: "result", subtype: "success", session_id: "sess-1", result: "ok" };
+          yield { type: "assistant", parent_tool_use_id: null, message: { model: "claude-sonnet-99", content: [{ type: "text", text: msg.message.content }] } };
+          yield { type: "result", subtype: "success", session_id: "sess-1", result: "ok", modelUsage: contextWindow ? { "claude-sonnet-99": { contextWindow } } : undefined };
           break;
         }
       },
@@ -54,6 +54,47 @@ async function runOneTurn(s: AgentSession) {
 beforeEach(() => queryMock.mockReset());
 
 describe("AgentSession", () => {
+  it("rejects observed context downgrade without retrying the turn", async () => {
+    fakeQuery(200_000);
+    const s = startAgentSession("ping", { claudePath: FAKE_CLAUDE });
+    await expect(runOneTurn(s)).rejects.toThrow(/requested.*1M.*200000/i);
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    s.close();
+  });
+  it("exposes observed context only after a result and clears it on switch", async () => {
+    fakeQuery(1_000_000);
+    const s = new AgentSession({ claudePath: FAKE_CLAUDE });
+    expect(s.contextWindow).toBeUndefined();
+    s.send("ping");
+    await runOneTurn(s);
+    expect(s.contextWindow).toBe(1_000_000);
+    await s.setModel("opus");
+    expect(s.contextWindow).toBeUndefined();
+    s.close();
+  });
+  it("retains a model switch made before the process starts", async () => {
+    fakeQuery();
+    const s = new AgentSession({ claudePath: FAKE_CLAUDE });
+    await s.setModel("haiku");
+    s.send("ping");
+    await runOneTurn(s);
+    s.close();
+    expect(lastOptions().model).toBe("haiku[1m]");
+  });
+  it.each([
+    [{}, "sonnet[1m]"],
+    [{ model: "default" }, "sonnet[1m]"],
+    [{ model: "opus" }, "opus[1m]"],
+    [{ model: "opus", options: { model: "haiku" } }, "haiku[1m]"],
+    [{ options: { model: "claude-fable-5-1" } }, "claude-fable-5-1[1m]"],
+    [{ model: "external-id" }, "external-id"],
+  ])("normalizes startup after extra SDK options: %j", async (options, expected) => {
+    fakeQuery();
+    const s = startAgentSession("ping", { claudePath: FAKE_CLAUDE, ...options });
+    await runOneTurn(s);
+    s.close();
+    expect(lastOptions().model).toBe(expected);
+  });
   it("mirrors the terminal by default and uses the claude_code preset", async () => {
     fakeQuery();
     const s = new AgentSession({ claudePath: FAKE_CLAUDE, cwd: "/proj" });
@@ -96,7 +137,7 @@ describe("AgentSession", () => {
     await s.setPermissionMode("plan");
     s.close();
     expect(fake.interrupt).toHaveBeenCalled();
-    expect(fake.setModel).toHaveBeenCalledWith("opus");
+    expect(fake.setModel).toHaveBeenCalledWith("opus[1m]");
     expect(fake.setPermissionMode).toHaveBeenCalledWith("plan");
     expect(fake.close).toHaveBeenCalled();
   });

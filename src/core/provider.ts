@@ -61,6 +61,8 @@ export type TurnEvent =
       type: "done";
       usage: Usage;
       costUsd?: number;
+      /** Effective primary-model capacity reported by the harness result. */
+      contextWindow?: number;
       model?: string;
       stopReason?: string;
     };

@@ -16,6 +16,7 @@ import {
 import { resolveClaudeExecutable } from "../executable.js";
 import { classifyProviderFailure, ProviderError, type VersionSkew } from "../errors.js";
 import { flattenToolResultContent, mcpToolAllowed, parseMcpToolName, type McpServerSpec } from "../mcp.js";
+import { claudeLongContextModel, claudeResultContextWindow } from "../claudeModels.js";
 import type { EngineModel } from "../models.js";
 import type { Provider, ProviderCapabilities, TurnEvent, TurnRequest } from "../provider.js";
 import type { ContentBlockParam, ThinkingParam, Usage } from "../types.js";
@@ -111,6 +112,7 @@ export class ClaudeProvider implements Provider {
     mcpServers: true,
   };
 
+  private readonly observedContexts = new Map<string, number>();
   private readonly configDir: string | undefined;
   private readonly workDir: string;
   private readonly appName: string;
@@ -169,7 +171,7 @@ export class ClaudeProvider implements Provider {
       options.canUseTool = allowMcp(mcp, req.serverTools ?? []);
       options.maxTurns = Math.max(options.maxTurns ?? 1, MCP_MAX_TURNS);
     }
-    if (req.model) options.model = req.model;
+    options.model = claudeLongContextModel(req.model ?? "");
     if (req.system !== undefined) options.systemPrompt = req.system;
     if (req.resume) {
       options.resume = req.resume;
@@ -238,6 +240,9 @@ export class ClaudeProvider implements Provider {
 
     if (req.signal?.aborted) return;
     if (!result) throw new ProviderError(this.id, "engine terminated without producing a result");
+    if (result.subtype === "success" && result.is_error) {
+      throw classifyProviderFailure(this.id, this.loginCommand, new Error(result.result || "engine reported an error"));
+    }
     if (result.subtype !== "success") {
       const detail = "errors" in result && result.errors.length > 0 ? result.errors.join("; ") : result.subtype;
       throw classifyProviderFailure(this.id, this.loginCommand, new Error(`engine error: ${detail}`));
@@ -248,8 +253,14 @@ export class ClaudeProvider implements Provider {
     // never has a tool_use to execute, so the turn is over.
     if (stopReason === "tool_use") stopReason = "end_turn";
 
+    const contextWindow = claudeResultContextWindow(result.modelUsage, model);
+    if (model && contextWindow) this.observedContexts.set(model, contextWindow);
+    if (options.model?.endsWith("[1m]") && contextWindow !== undefined && contextWindow < 1_000_000) {
+      throw new ProviderError(this.id, `requested 1M context for ${options.model}, but the CLI reported ${contextWindow} tokens`);
+    }
     yield {
       type: "done",
+      ...(contextWindow ? { contextWindow } : {}),
       usage: mapUsage(result.usage as unknown as Record<string, unknown>),
       ...(result.total_cost_usd !== undefined ? { costUsd: result.total_cost_usd } : {}),
       ...(model ? { model } : {}),
@@ -278,9 +289,22 @@ export class ClaudeProvider implements Provider {
           timer.unref?.();
         }),
       ]);
-      return models.map((m) => ({
+      // Yagami's safe default selects the live Sonnet alias, not the CLI's
+      // account default. Keep the catalog honest about what execution requests.
+      const catalog = models.flatMap((row) => {
+        if (row.value !== "default") return [row];
+        const sonnet = models.find((candidate) => candidate.value === "sonnet");
+        return sonnet ? [{ ...sonnet, value: "default", displayName: "Default (Sonnet, 1M)" }] : [];
+      });
+      return catalog.map((m) => ({
         id: m.value,
         display_name: m.displayName,
+        ...(claudeLongContextModel(m.value).endsWith("[1m]")
+          ? { context_window: 1_000_000, context_window_source: "requested" as const }
+          : {}),
+        ...(m.resolvedModel && this.observedContexts.has(m.resolvedModel)
+          ? { context_window: this.observedContexts.get(m.resolvedModel)!, context_window_source: "observed" as const }
+          : {}),
         ...(m.description ? { description: m.description } : {}),
         ...(m.resolvedModel ? { resolved_model: m.resolvedModel } : {}),
         ...(m.supportedEffortLevels?.length

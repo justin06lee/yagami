@@ -7,8 +7,9 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { claudeLongContextModel, claudeResultContextWindow } from "./claudeModels.js";
 import { resolveClaudeExecutable } from "./executable.js";
-import { classifyProviderFailure } from "./errors.js";
+import { classifyProviderFailure, ProviderError } from "./errors.js";
 import { settingSourcesFor, type Parity } from "./parity.js";
 import { PermissionAdapter, type PermissionHandler, type PermissionAdapterOptions } from "./permission.js";
 import { AsyncQueue } from "./providers/queue.js";
@@ -21,7 +22,7 @@ export interface AgentSessionOptions {
   cwd?: string;
   /** How closely to mirror the interactive terminal (default "terminal"). */
   parity?: Parity;
-  /** Model id/alias; the CLI default when omitted. */
+  /** Model id/alias; dynamic sonnet[1m] when omitted, empty, or default. */
   model?: string;
   /**
    * Host permission callback (see {@link PermissionAdapter}). Not consulted
@@ -34,7 +35,7 @@ export interface AgentSessionOptions {
   permission?: PermissionAdapterOptions;
   /** Reported to the CLI as the client application (e.g. your app name). */
   appName?: string;
-  /** Extra Agent SDK options, merged last (wins over the above). */
+  /** Extra Agent SDK options, merged last; the winning model is normalized for 1M. */
   options?: Options;
 }
 
@@ -58,6 +59,8 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
   private started = false;
   private closed = false;
   private currentSessionId: string | undefined;
+  private primaryModel: string | undefined;
+  private observedContextWindow: number | undefined;
 
   constructor(options: AgentSessionOptions = {}) {
     this.claudePath = resolveClaudeExecutable(options.claudePath ?? options.options?.pathToClaudeCodeExecutable);
@@ -77,8 +80,8 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
       settingSources: settingSourcesFor(options.parity ?? "terminal"),
       includePartialMessages: true,
       ...(options.cwd ? { cwd: options.cwd } : {}),
-      ...(options.model ? { model: options.model } : {}),
       ...options.options,
+      model: claudeLongContextModel(options.options?.model ?? options.model ?? ""),
       ...(canUseTool ? { canUseTool } : {}),
       pathToClaudeCodeExecutable: this.claudePath,
       env: {
@@ -97,6 +100,11 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
   /** The live Claude Code session id, once the first turn has started. */
   get sessionId(): string | undefined {
     return this.currentSessionId;
+  }
+
+  /** Effective primary-model capacity, unknown until a result reports it. */
+  get contextWindow(): number | undefined {
+    return this.observedContextWindow;
   }
 
   /** Queue a user turn. The process starts on the first send and stays warm. */
@@ -130,7 +138,14 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
     try {
       for await (const msg of this.query!) {
         if (msg.type === "system" && msg.subtype === "init") this.currentSessionId = msg.session_id;
-        else if (msg.type === "result") this.currentSessionId = msg.session_id;
+        else if (msg.type === "assistant" && msg.parent_tool_use_id === null) this.primaryModel = msg.message.model;
+        else if (msg.type === "result") {
+          this.currentSessionId = msg.session_id;
+          this.observedContextWindow = claudeResultContextWindow(msg.modelUsage, this.primaryModel);
+          if (this.baseOptions.model?.endsWith("[1m]") && this.observedContextWindow !== undefined && this.observedContextWindow < 1_000_000) {
+            throw new ProviderError("claude", `requested 1M context for ${this.baseOptions.model}, but the CLI reported ${this.observedContextWindow} tokens`);
+          }
+        }
         yield msg;
       }
     } catch (err) {
@@ -145,7 +160,11 @@ export class AgentSession implements AsyncIterable<SDKMessage> {
 
   /** Switch models mid-session (the CLI's /model). */
   async setModel(model: string): Promise<void> {
-    await this.query?.setModel(model);
+    const selected = claudeLongContextModel(model);
+    await this.query?.setModel(selected);
+    this.baseOptions.model = selected;
+    this.primaryModel = undefined;
+    this.observedContextWindow = undefined;
   }
 
   /** Switch permission mode mid-session (default/acceptEdits/plan/bypassPermissions). */
