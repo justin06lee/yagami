@@ -12,35 +12,46 @@ interface FakeOptions {
   modes?: boolean;
   promptError?: Error & { code?: number };
   sessionError?: Error & { code?: number };
+  /**
+   * Answer a model change the way the protocol asks: with the session's full
+   * options, whose reasoning levels are now the picked model's (null: that
+   * model has no reasoning option at all). A level the current model doesn't
+   * offer is then refused, as OpenCode refuses it.
+   */
+  modelEfforts?: Record<string, string[] | null>;
+  /** Never answer a change to this model. */
+  hangOnModel?: string;
 }
 
 function fakeConnection(opts: FakeOptions = {}) {
   let handlers: AcpHandlers = {};
   const calls: Record<string, unknown[]> = { setSessionMode: [], setSessionConfigOption: [], cancel: [], request: [] };
-  const configOptions = opts.models === false || opts.legacyModels ? [] : [
-    {
-      id: "model",
-      name: "Model",
-      category: "model",
-      type: "select",
-      currentValue: "a",
-      options: [
-        { value: "a", name: "Model A" },
-        { value: "b", name: "Model B" },
-      ],
-    },
-    {
-      id: "thought_level",
-      name: "Reasoning",
-      category: "thought_level",
-      type: "select",
-      currentValue: "medium",
-      options: [
-        { value: "medium", name: "Medium", description: "Balanced" },
-        { value: "high", name: "High", description: "Deeper" },
-      ],
-    },
-  ];
+  const modelOption = (current: string) => ({
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    currentValue: current,
+    options: [
+      { value: "a", name: "Model A" },
+      { value: "b", name: "Model B" },
+    ],
+  });
+  const describe: Record<string, string> = { medium: "Balanced", high: "Deeper" };
+  const effortOption = (levels: string[]) => ({
+    id: "thought_level",
+    name: "Reasoning",
+    category: "thought_level",
+    type: "select",
+    currentValue: levels[0],
+    options: levels.map((value) => ({
+      value,
+      name: value[0]!.toUpperCase() + value.slice(1),
+      ...(describe[value] ? { description: describe[value] } : {}),
+    })),
+  });
+  let levels: string[] | null = ["medium", "high"];
+  const configOptions = opts.models === false || opts.legacyModels ? [] : [modelOption("a"), effortOption(levels)];
   const modes = opts.modes === false ? null : { currentModeId: "build", availableModes: [{ id: "build" }, { id: "plan" }] };
   const models = opts.legacyModels
     ? {
@@ -65,9 +76,16 @@ function fakeConnection(opts: FakeOptions = {}) {
       calls["setSessionMode"]!.push(p);
       return {};
     },
-    setSessionConfigOption: async (p: unknown) => {
+    setSessionConfigOption: async (p: { configId: string; value: string }) => {
       calls["setSessionConfigOption"]!.push(p);
-      return {};
+      if (p.configId === "model" && p.value === opts.hangOnModel) return new Promise(() => {});
+      if (!opts.modelEfforts) return {};
+      if (p.configId === "model") {
+        levels = opts.modelEfforts[p.value] ?? null;
+        return { configOptions: [modelOption(p.value), ...(levels ? [effortOption(levels)] : [])] };
+      }
+      if (!levels?.includes(p.value)) throw new Error(`Invalid params: effort not found: ${p.value}`);
+      return { configOptions: [] };
     },
     cancel: async (p: unknown) => {
       calls["cancel"]!.push(p);
@@ -156,6 +174,20 @@ describe("AcpProvider.run", () => {
     expect(fake.calls["setSessionConfigOption"]).toHaveLength(1);
   });
 
+  it("checks effort against the picked model's levels, not the default model's", async () => {
+    // OpenCode: the default model offers levels, a local model offers none
+    const none = fakeConnection({ modelEfforts: { a: ["medium", "high"], b: null } });
+    await collect(provider(none).run({ prompt: "ping", model: "b", effort: "high" }));
+    expect(none.calls["setSessionConfigOption"]).toEqual([{ sessionId: "ses-1", configId: "model", value: "b" }]);
+
+    const other = fakeConnection({ modelEfforts: { a: ["medium", "high"], b: ["low", "max"] } });
+    const p = provider(other);
+    await collect(p.run({ prompt: "ping", model: "b", effort: "high" }));
+    expect(other.calls["setSessionConfigOption"]).toEqual([{ sessionId: "ses-1", configId: "model", value: "b" }]);
+    await collect(p.run({ prompt: "ping", model: "b", effort: "max" }));
+    expect(other.calls["setSessionConfigOption"]!.at(-1)).toEqual({ sessionId: "ses-1", configId: "thought_level", value: "max" });
+  });
+
   it("errors clearly when a model is requested but the agent has no model option", async () => {
     const fake = fakeConnection({ models: false });
     await expect(collect(provider(fake).run({ prompt: "ping", model: "x" }))).rejects.toThrowError(/no model option/);
@@ -194,6 +226,43 @@ describe("AcpProvider.run", () => {
         ],
         default_reasoning_effort: "medium",
       },
+    ]);
+    expect(fake.closed).toHaveBeenCalled();
+  });
+
+  it("lists each model with its own reasoning levels", async () => {
+    const fake = fakeConnection({ modelEfforts: { a: ["medium", "high"], b: null } });
+    expect(await provider(fake).listModels()).toEqual([
+      {
+        id: "a",
+        display_name: "Model A",
+        reasoning_efforts: [
+          { id: "medium", description: "Balanced" },
+          { id: "high", description: "Deeper" },
+        ],
+        default_reasoning_effort: "medium",
+        is_default: true,
+      },
+      { id: "b", display_name: "Model B" },
+    ]);
+
+    const other = fakeConnection({ modelEfforts: { a: ["medium", "high"], b: ["low", "max"] } });
+    expect((await provider(other).listModels())[1]).toEqual({
+      id: "b",
+      display_name: "Model B",
+      reasoning_efforts: [{ id: "low" }, { id: "max" }],
+      default_reasoning_effort: "low",
+    });
+  });
+
+  it("still lists models when the agent sits on a model change", async () => {
+    const fake = fakeConnection({ modelEfforts: { a: ["medium", "high"], b: null }, hangOnModel: "b" });
+    const p = new AcpProvider({ id: "fake", label: "Fake", command: "fake-agent", connect: async () => fake.conn, probeTimeoutMs: 200 });
+    const models = await p.listModels();
+    // b's own levels are unknown, so it is listed with the default model's
+    expect(models.map((m) => [m.id, m.reasoning_efforts?.map((e) => e.id)])).toEqual([
+      ["a", ["medium", "high"]],
+      ["b", ["medium", "high"]],
     ]);
     expect(fake.closed).toHaveBeenCalled();
   });
@@ -406,6 +475,15 @@ describe("AcpProvider.openSession", () => {
     await s.interrupt();
     expect(fake.calls["cancel"]).toEqual([{ sessionId: "ses-old" }]);
     await s.close();
+  });
+
+  it("skips an effort the picked model does not offer instead of failing the turn", async () => {
+    const fake = fakeConnection({ modelEfforts: { a: ["medium", "high"], b: null } });
+    const s = provider(fake).openSession({ cwd: "/tmp/proj", model: "b", effort: "high", permissions: { decide: async () => "deny" } });
+    const events = await collect(s.send("hi"));
+    await s.close();
+    expect(fake.calls["setSessionConfigOption"]).toEqual([{ sessionId: "ses-1", configId: "model", value: "b" }]);
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "end_turn" });
   });
 
   it("forwards ACP elicitations and plan updates through the generic session contract", async () => {
