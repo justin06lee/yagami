@@ -309,7 +309,7 @@ export class AcpProvider implements SessionProvider {
           debug(this.id, `could not switch to ${plan.id} mode; running in the agent's default mode`, err);
         });
       }
-      if (req.model) await this.selectModel(conn, sessionId, setup, req.model);
+      if (req.model) setup = await this.selectModel(conn, sessionId, setup, req.model);
       if (req.effort) await this.selectEffort(conn, sessionId, setup, req.effort);
 
       const sid = sessionId;
@@ -373,22 +373,31 @@ export class AcpProvider implements SessionProvider {
     return option?.type === "select" ? option : undefined;
   }
 
-  private async selectModel(conn: AcpConnection, sessionId: string, setup: SessionSetup, model: string): Promise<void> {
+  /**
+   * Select a model and return what the session reports afterwards. A
+   * session's other options describe its current model, so the reasoning
+   * levels in `setup` stop being true once the model changes: OpenCode
+   * offers a different set per model and none on a local one, and refuses
+   * a level the picked model doesn't have.
+   */
+  private async selectModel(conn: AcpConnection, sessionId: string, setup: SessionSetup, model: string): Promise<SessionSetup> {
     const option = this.modelOption(setup);
     if (option) {
-      if (option.currentValue === model) return;
-      await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value: model }).catch((err) => {
+      if (option.currentValue === model) return setup;
+      const changed = await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value: model }).catch((err) => {
         throw this.classify(err);
       });
-      return;
+      const configOptions = returnedOptions(changed);
+      // an agent that answers without its options leaves only the old list to go by
+      return configOptions ? { ...setup, configOptions } : setup;
     }
     const legacy = legacyModels(setup);
     if (legacy) {
-      if (legacy.current === model) return;
+      if (legacy.current === model) return setup;
       await conn.agent.request("session/set_model", { sessionId, modelId: model }).catch((err) => {
         throw this.classify(err);
       });
-      return;
+      return setup;
     }
     throw new ProviderError(this.id, `cannot select model "${model}": the agent exposes no model option (omit the model to use its default)`);
   }
@@ -416,12 +425,12 @@ export class AcpProvider implements SessionProvider {
    * or mid-update) used to hold the probe open — and its process alive —
    * for as long as the host ran.
    */
-  private async probe<T>(ask: (conn: AcpConnection) => Promise<T>): Promise<T> {
+  private async probe<T>(ask: (conn: AcpConnection, deadline: number) => Promise<T>): Promise<T> {
     const conn = await this.connectImpl(this.workDir);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        ask(conn),
+        ask(conn, Date.now() + this.probeTimeoutMs),
         new Promise<never>((_, reject) => {
           timer = setTimeout(
             () => reject(new ProviderError(this.id, `${this.label} did not answer within ${Math.round(this.probeTimeoutMs / 1000)}s`)),
@@ -437,7 +446,7 @@ export class AcpProvider implements SessionProvider {
   }
 
   async listModels(): Promise<EngineModel[]> {
-    return this.probe(async (conn) => {
+    return this.probe(async (conn, deadline) => {
       const created = await conn.agent.newSession({ cwd: this.workDir, mcpServers: [] }).catch((err) => {
         throw this.classify(err);
       });
@@ -448,21 +457,82 @@ export class AcpProvider implements SessionProvider {
         : legacy?.available ?? [];
       const current = option ? option.currentValue : legacy?.current;
       const reasoning = effortOption(created);
-      const efforts = reasoning
-        ? flattenSelectOptions(reasoning).map((entry) => ({
-            id: entry.value,
-            ...(entry.description ? { description: entry.description } : {}),
-          }))
-        : [];
-      return choices.map((o) => ({
-        id: o.id,
-        display_name: o.name,
-        ...(o.description ? { description: o.description } : {}),
-        ...(efforts.length > 0 ? { reasoning_efforts: efforts } : {}),
-        ...(reasoning ? { default_reasoning_effort: reasoning.currentValue } : {}),
-        ...(o.id === current ? { is_default: true } : {}),
-      }));
+      const own = option
+        ? await this.modelEfforts(
+            conn,
+            created.sessionId,
+            option,
+            choices.map((o) => o.id).filter((id) => id !== current),
+            // half of what is left: the list matters more than every model's levels
+            Math.max(0, (deadline - Date.now()) / 2),
+          )
+        : new Map<string, SelectOption | undefined>();
+      return choices.map((o) => {
+        // a model whose own levels could not be read is listed with the session's
+        const levels = own.has(o.id) ? own.get(o.id) : reasoning;
+        const efforts = levels
+          ? flattenSelectOptions(levels).map((entry) => ({
+              id: entry.value,
+              ...(entry.description ? { description: entry.description } : {}),
+            }))
+          : [];
+        return {
+          id: o.id,
+          display_name: o.name,
+          ...(o.description ? { description: o.description } : {}),
+          ...(efforts.length > 0 ? { reasoning_efforts: efforts } : {}),
+          ...(levels ? { default_reasoning_effort: levels.currentValue } : {}),
+          ...(o.id === current ? { is_default: true } : {}),
+        };
+      });
     });
+  }
+
+  /**
+   * Each model's own reasoning-level option, read by selecting the model in
+   * a probe session nobody will use and looking at what the session offers
+   * then (undefined: that model has none). A model is left out when the
+   * agent doesn't say — it answers without its options, refuses the model,
+   * or doesn't get to it within `budgetMs`.
+   */
+  private async modelEfforts(
+    conn: AcpConnection,
+    sessionId: string,
+    option: SelectOption,
+    models: string[],
+    budgetMs: number,
+  ): Promise<Map<string, SelectOption | undefined>> {
+    const found = new Map<string, SelectOption | undefined>();
+    let stopped = false;
+    const walk = async () => {
+      for (const model of models) {
+        if (stopped) return;
+        let changed: unknown;
+        try {
+          changed = await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value: model });
+        } catch (err) {
+          debug(this.id, `${this.label} would not select "${model}" to read its reasoning levels`, err);
+          continue;
+        }
+        if (stopped) return;
+        const configOptions = returnedOptions(changed);
+        // no options in the answer: this agent won't say for any model
+        if (!configOptions) return;
+        if (this.modelOption({ configOptions })?.currentValue !== model) continue;
+        found.set(model, effortOption({ configOptions }));
+      }
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      walk(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, budgetMs);
+        timer.unref?.();
+      }),
+    ]);
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    return found;
   }
 
   /**
@@ -500,7 +570,7 @@ interface AcpSessionConfig {
   modelConfigId: string;
   connect: (cwd: string) => Promise<AcpConnection>;
   classify: (err: unknown, context?: string) => Error;
-  selectModel: (conn: AcpConnection, sessionId: string, setup: SessionSetup, model: string) => Promise<void>;
+  selectModel: (conn: AcpConnection, sessionId: string, setup: SessionSetup, model: string) => Promise<SessionSetup>;
   selectEffort: (conn: AcpConnection, sessionId: string, setup: SessionSetup, effort: string) => Promise<void>;
   options: ProviderSessionOptions;
 }
@@ -559,7 +629,7 @@ class AcpAgentSession implements ProviderSession {
         debug(this.provider, `could not switch to the requested "${mode}" mode`, err);
       });
     }
-    if (options.model) await this.cfg.selectModel(conn, sessionId, setup, options.model);
+    if (options.model) setup = await this.cfg.selectModel(conn, sessionId, setup, options.model);
     if (options.effort) await this.cfg.selectEffort(conn, sessionId, setup, options.effort);
     conn.setHandlers({
       onPermission: (p) => this.onPermission(p),
@@ -791,6 +861,12 @@ function effortOption(setup: SessionSetup): SelectOption | undefined {
       (candidate.category === "thought_level" || /^(?:thought[_-]?level|reasoning[_-]?effort|effort)$/i.test(candidate.id)),
   );
   return option?.type === "select" ? option : undefined;
+}
+
+/** The options an agent sent back with a config change, when it sent any. */
+function returnedOptions(changed: unknown): SessionConfigOption[] | undefined {
+  const configOptions = (changed as { configOptions?: unknown } | null | undefined)?.configOptions;
+  return Array.isArray(configOptions) && configOptions.length > 0 ? (configOptions as SessionConfigOption[]) : undefined;
 }
 
 /** The legacy `models` list of a session, when the agent sends one. */
