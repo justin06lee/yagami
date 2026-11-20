@@ -10,6 +10,7 @@ import type { EngineModel } from "../models.js";
 import type {
   Provider,
   ProviderCapabilities,
+  ProviderStatus,
   ProviderSession,
   ProviderSessionOptions,
   SessionProvider,
@@ -19,7 +20,7 @@ import type {
 import type { ContentBlockParam, Usage } from "../types.js";
 import { CodexAgentSession } from "./codexSession.js";
 import { spawnJsonl } from "./jsonl.js";
-import { killTree } from "./process.js";
+import { killTree, runCommand } from "./process.js";
 import { VERSION } from "../../version.js";
 
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
@@ -263,6 +264,16 @@ export class CodexProvider implements SessionProvider {
         })}\n`,
       );
     });
+  }
+
+  /** Is Codex signed in? Asks the CLI itself (`codex login status`), no model call. */
+  async status(): Promise<ProviderStatus> {
+    const out = await runCommand(this.executable, ["login", "status"], { env: this.env, cwd: this.workDir });
+    const said = `${out.stdout}\n${out.stderr}`.trim();
+    const line = said.split("\n")[0]?.slice(0, 200);
+    if (/not logged in/i.test(said)) return { signedIn: false, ...(line ? { detail: line } : {}) };
+    if (out.code === 0 && /logged in/i.test(said)) return { signedIn: true, ...(line ? { detail: line } : {}) };
+    return line ? { detail: line } : {};
   }
 
   async version(): Promise<string | undefined> {

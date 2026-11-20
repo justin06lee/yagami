@@ -3,6 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 vi.mock("../../src/core/providers/jsonl.js", () => ({ spawnJsonl: spawnMock }));
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { CodexProvider, writeTempImages } from "../../src/core/providers/codex.js";
 import { AuthRequiredError } from "../../src/core/errors.js";
 import { collect } from "../helpers/fakeProvider.js";
@@ -95,5 +98,19 @@ describe("CodexProvider", () => {
 
   it("refuses URL image sources", () => {
     expect(() => writeTempImages([{ type: "image", source: { type: "url", url: "https://x" } }])).toThrowError(/base64/);
+  });
+
+  it("asks the CLI whether it is signed in", async () => {
+    /** A stand-in `codex` that answers `login status`. */
+    const fakeCli = (line: string, code: number): string => {
+      const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "yagami-codex-")), "codex");
+      fs.writeFileSync(file, `#!/bin/sh\n[ "$1 $2" = "login status" ] || exit 9\necho "${line}"\nexit ${code}\n`, { mode: 0o755 });
+      return file;
+    };
+    const status = (line: string, code: number) => new CodexProvider({ path: fakeCli(line, code), workDir: "/tmp/ws" }).status();
+    expect(await status("Logged in using ChatGPT", 0)).toEqual({ signedIn: true, detail: "Logged in using ChatGPT" });
+    expect(await status("Not logged in", 1)).toEqual({ signedIn: false, detail: "Not logged in" });
+    // something else entirely: no claim either way
+    expect((await status("error: unrecognized subcommand", 2)).signedIn).toBeUndefined();
   });
 });

@@ -32,6 +32,7 @@
     "smoke": "tsx scripts/smoke.ts",
     "live:providers": "tsx scripts/live-providers.ts",
     "live:session": "tsx scripts/live-session.ts",
+    "live:harnesses": "tsx scripts/live-harnesses.ts",
     "prepack": "bun run build",
     "prepublishOnly": "bun run typecheck && bun run test"
   },

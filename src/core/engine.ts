@@ -3,10 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ProviderError, ProviderNotInstalledError, toApiError } from "./errors.js";
+import { listHarnesses, type Harness } from "./harnesses.js";
 import { debug } from "./log.js";
 import type { EngineModel } from "./models.js";
-import { parseModelRef, qualifiedModel, type Provider, type TurnEvent, type TurnRequest } from "./provider.js";
-import { loadProviders, type ProviderConfigEntry } from "./providers/registry.js";
+import { parseModelRef, qualifiedModel, type PlanLimit, type PlanUsage, type Provider, type TurnEvent, type TurnRequest } from "./provider.js";
+import { loadProviders, presetFor, type ProviderConfigEntry } from "./providers/registry.js";
 import { SessionCache } from "./sessionCache.js";
 import { SseSynthesizer } from "./sse.js";
 import {
@@ -52,6 +53,18 @@ export interface CompleteResult {
   sessionId?: string;
   provider: string;
   ignored: string[];
+  /** Effective context size of the model that answered, where the harness reports it. */
+  contextWindow?: number;
+  /** The plan's usage windows as reported during the turn (Claude Code). */
+  limits?: PlanLimit[];
+}
+
+export interface CompleteOptions {
+  /** Aborting ends the turn and the CLI behind it. */
+  signal?: AbortSignal;
+  /** Reply text as it arrives. The resolved response still carries all of it. */
+  onText?: (delta: string) => void;
+  onThinking?: (delta: string) => void;
 }
 
 export interface StreamStart {
@@ -96,6 +109,8 @@ export class YagamiEngine {
   readonly defaultProviderId: string;
   private readonly defaultModel: string | undefined;
   private readonly cache: SessionCache;
+  /** Per-provider settings the engine was built from; empty for hand-picked instances. */
+  private readonly providerConfig: Record<string, ProviderConfigEntry>;
   private readonly modelsPromises = new Map<string, Promise<EngineModel[]>>();
   /** Model lists that have arrived, for checks that cannot wait on a probe. */
   private readonly modelsLoaded = new Map<string, EngineModel[]>();
@@ -109,6 +124,7 @@ export class YagamiEngine {
     if (options.providers) {
       this.providers = new Map(options.providers.map((p) => [p.id, p]));
       this.unavailable = new Map();
+      this.providerConfig = {};
     } else {
       const config: Record<string, ProviderConfigEntry> = { ...options.providerConfig };
       if (options.claudePath || options.claudeConfigDir) {
@@ -121,6 +137,7 @@ export class YagamiEngine {
       const loaded = loadProviders(config, { workDir, ...(options.appName ? { appName: options.appName } : {}) });
       this.providers = loaded.providers;
       this.unavailable = loaded.unavailable;
+      this.providerConfig = config;
     }
 
     const wanted = options.defaultProvider ?? (this.providers.has("claude") ? "claude" : [...this.providers.keys()][0]);
@@ -157,6 +174,50 @@ export class YagamiEngine {
     }
     const provider = this.providers.get(ref.providerId ?? this.defaultProviderId)!;
     return ref.model ? { provider, model: ref.model } : { provider };
+  }
+
+  /**
+   * Every known harness — installed or not — with its sign-in state and
+   * what to run when it is missing or signed out. No model is asked
+   * anything; `status: false` skips the sign-in checks too.
+   */
+  harnesses(options: { status?: boolean } = {}): Promise<Harness[]> {
+    return listHarnesses({
+      providerConfig: this.providerConfig,
+      providers: this.providers,
+      defaultProvider: this.defaultProviderId,
+      ...(options.status !== undefined ? { status: options.status } : {}),
+    });
+  }
+
+  /** The provider behind a harness id; throws ProviderNotInstalledError saying why there is none. */
+  harness(id: string): Provider {
+    const provider = this.providers.get(id);
+    if (provider) return provider;
+    throw new ProviderNotInstalledError(id, presetFor(id)?.installHint ?? "", this.unavailable.get(id) ?? "unknown harness");
+  }
+
+  /**
+   * One harness's own models, in its native ids, the default first. Rejects
+   * with the typed failure (not installed, signed out) rather than an
+   * ApiError. Lists are remembered for the life of the engine; `refresh`
+   * asks the CLI again.
+   */
+  async harnessModels(id: string, options: { refresh?: boolean } = {}): Promise<EngineModel[]> {
+    const provider = this.harness(id);
+    if (options.refresh) this.modelsPromises.delete(id);
+    const models = await this.providerModels(id, provider);
+    return [...models.filter((m) => m.is_default), ...models.filter((m) => !m.is_default)].map((m) => ({ ...m, provider: id }));
+  }
+
+  /**
+   * A harness's plan usage right now, without a model call — Claude Code's
+   * five-hour and seven-day windows. Undefined where the harness has no way
+   * to say.
+   */
+  async limits(id: string = this.defaultProviderId): Promise<PlanUsage | undefined> {
+    const provider = this.harness(id);
+    return provider.limits ? provider.limits() : undefined;
   }
 
   /**
@@ -370,23 +431,36 @@ export class YagamiEngine {
     this.cache.set(prefixKey(norm.system, played, provider.id), sessionId);
   }
 
-  async complete(req: MessagesRequest): Promise<CompleteResult> {
+  async complete(req: MessagesRequest, options: CompleteOptions = {}): Promise<CompleteResult> {
     const prepared = this.prepare(req);
     await this.confirmEffort(prepared);
+    let emitted = false;
+    const watched: CompleteOptions = {
+      ...options,
+      ...(options.onText
+        ? {
+            onText: (delta) => {
+              emitted = true;
+              options.onText!(delta);
+            },
+          }
+        : {}),
+    };
     try {
-      return await this.attemptComplete(prepared);
+      return await this.attemptComplete(prepared, watched);
     } catch (err) {
-      const fallback = this.prepareResumeFallback(req, prepared);
+      // text already handed to the caller cannot be taken back for a second attempt
+      const fallback = emitted || options.signal?.aborted ? undefined : this.prepareResumeFallback(req, prepared);
       if (!fallback) throw toApiError(err);
       try {
-        return await this.attemptComplete(fallback);
+        return await this.attemptComplete(fallback, watched);
       } catch (err2) {
         throw toApiError(err2);
       }
     }
   }
 
-  private async attemptComplete(prepared: PreparedTurn): Promise<CompleteResult> {
+  private async attemptComplete(prepared: PreparedTurn, options: CompleteOptions = {}): Promise<CompleteResult> {
     const { provider, turn, norm, requestedModel, ignored } = prepared;
     const stripper = norm.prefill ? new PrefillStripper(norm.prefill) : undefined;
     let sessionId: string | undefined;
@@ -402,15 +476,17 @@ export class YagamiEngine {
       else blocks.push({ type: "text", text: chunk });
     };
 
-    for await (const ev of provider.run(turn)) {
+    for await (const ev of provider.run({ ...turn, ...(options.signal ? { signal: options.signal } : {}) })) {
       if (ev.type === "session") {
         sessionId = ev.sessionId;
       } else if (ev.type === "text") {
         const out = stripper ? stripper.push(ev.text) : ev.text;
         text += out;
         appendText(out);
+        if (out) options.onText?.(out);
       } else if (ev.type === "thinking") {
         thinking += ev.text;
+        options.onThinking?.(ev.text);
       } else if (ev.type === "tool_use") {
         blocks.push(mcpToolUseBlock(ev));
       } else if (ev.type === "tool_result") {
@@ -423,8 +499,9 @@ export class YagamiEngine {
       const held = stripper.flush();
       text += held;
       appendText(held);
+      if (held) options.onText?.(held);
     }
-    if (!done) throw new ProviderError(provider.id, "turn ended without a result");
+    if (!done) throw new ProviderError(provider.id, options.signal?.aborted ? "turn aborted" : "turn ended without a result");
 
     // A client echoes the reply as its text blocks joined by newlines (see
     // transcript.ts), so that is the text the session is remembered under.
@@ -453,6 +530,8 @@ export class YagamiEngine {
       ...(sessionId ? { sessionId } : {}),
       provider: provider.id,
       ignored,
+      ...(done.contextWindow ? { contextWindow: done.contextWindow } : {}),
+      ...(done.limits ? { limits: done.limits } : {}),
     };
   }
 

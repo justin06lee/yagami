@@ -3,8 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const { queryMock } = vi.hoisted(() => ({ queryMock: vi.fn() }));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: queryMock }));
 
-import { ClaudeProvider } from "../../src/core/providers/claude.js";
-import { AuthRequiredError } from "../../src/core/errors.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { ClaudeProvider, planLimits } from "../../src/core/providers/claude.js";
+import { AuthRequiredError, UsageLimitError } from "../../src/core/errors.js";
 import { collect } from "../helpers/fakeProvider.js";
 
 const FAKE_CLAUDE = process.execPath;
@@ -155,6 +158,137 @@ describe("ClaudeProvider.run", () => {
     });
     const p = new ClaudeProvider({ path: FAKE_CLAUDE });
     await expect(collect(p.run({ prompt: "ping" }))).rejects.toThrowError(/kaboom/);
+  });
+});
+
+describe("ClaudeProvider plan limits", () => {
+  const WEEK = { status: "allowed", resetsAt: 1795474800, rateLimitType: "seven_day", unifiedWindows: { five_hour: { utilization: 0.4, resetsAt: 1795000000, status: "allowed_warning" }, seven_day: { utilization: 0.05, resetsAt: 1795474800, status: "allowed" } } };
+
+  it("reads every window a rate-limit event lists, or the one an older CLI reports", () => {
+    expect(planLimits(WEEK)).toEqual([
+      { window: "five_hour", utilization: 0.4, resetsAt: 1795000000, status: "warning" },
+      { window: "seven_day", utilization: 0.05, resetsAt: 1795474800, status: "allowed" },
+    ]);
+    expect(planLimits({ status: "rejected", resetsAt: 5, rateLimitType: "five_hour", utilization: 1 })).toEqual([
+      { window: "five_hour", utilization: 1, resetsAt: 5, status: "rejected" },
+    ]);
+    expect(planLimits({})).toEqual([]);
+  });
+
+  it("reports the plan's windows with the finished turn", async () => {
+    queryMock.mockImplementation(async function* () {
+      yield { type: "rate_limit_event", rate_limit_info: WEEK };
+      yield* sdkRun();
+    });
+    const events = await collect(new ClaudeProvider({ path: FAKE_CLAUDE }).run({ prompt: "ping" }));
+    expect(events.at(-1)).toMatchObject({ type: "done", limits: planLimits(WEEK) });
+  });
+
+  it("fails a used-up plan as UsageLimitError with its reset time", async () => {
+    const rejected = { status: "rejected", resetsAt: 1795251600, rateLimitType: "seven_day", unifiedWindows: { seven_day: { utilization: 1, resetsAt: 1795251600, status: "rejected" } } };
+    // what the CLI does: the event, an error result, then the SDK throws
+    queryMock.mockImplementation(async function* () {
+      yield { type: "system", subtype: "init", session_id: "s" };
+      yield { type: "rate_limit_event", rate_limit_info: rejected };
+      yield { type: "result", subtype: "success", is_error: true, result: "You've hit your weekly limit · resets Nov 21 at 6pm", usage: {}, api_error_status: 429 };
+      throw new Error("Claude Code returned an error result: You've hit your weekly limit · resets Nov 21 at 6pm");
+    });
+    const err = await collect(new ClaudeProvider({ path: FAKE_CLAUDE, id: "claude-work" }).run({ prompt: "ping" })).then(() => undefined, (e: unknown) => e);
+    expect(err).toBeInstanceOf(UsageLimitError);
+    expect(err).toMatchObject({ provider: "claude-work", resetsAt: 1795251600, code: "usage_limit" });
+    expect((err as Error).message).toBe("claude-work: You've hit your weekly limit · resets Nov 21 at 6pm");
+
+    // an older CLI that sends no event still says so in words
+    queryMock.mockImplementation(async function* () {
+      throw new Error("Claude AI usage limit reached");
+    });
+    const wordy = await collect(new ClaudeProvider({ path: FAKE_CLAUDE }).run({ prompt: "ping" })).then(() => undefined, (e: unknown) => e);
+    expect(wordy).toBeInstanceOf(UsageLimitError);
+    expect((wordy as UsageLimitError).resetsAt).toBeUndefined();
+  });
+
+  it("reads plan usage over a control session, as shares of each window", async () => {
+    const closed = vi.fn();
+    queryMock.mockImplementation(({ options }: { options: { abortController: AbortController } }) => {
+      options.abortController.signal.addEventListener("abort", closed);
+      return {
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+          subscription_type: "max",
+          rate_limits: {
+            five_hour: null,
+            seven_day: { utilization: 100, resets_at: "2026-11-21T09:00:00.030028+00:00" },
+            extra_usage: { is_enabled: false, utilization: null },
+            limits: [{ kind: "weekly_all", percent: 100 }],
+          },
+        }),
+      };
+    });
+    expect(await new ClaudeProvider({ path: FAKE_CLAUDE }).limits()).toEqual({
+      plan: "max",
+      windows: [{ window: "seven_day", utilization: 1, resetsAt: 1795251600, status: "rejected" }],
+    });
+    expect(closed).toHaveBeenCalled();
+
+    // a CLI too old to be asked
+    queryMock.mockImplementation(() => ({}));
+    expect(await new ClaudeProvider({ path: FAKE_CLAUDE }).limits()).toBeUndefined();
+  });
+});
+
+describe("ClaudeProvider accounts", () => {
+  const envOf = async (options: ConstructorParameters<typeof ClaudeProvider>[0]) => {
+    queryMock.mockImplementation(() => sdkRun());
+    await collect(new ClaudeProvider({ path: FAKE_CLAUDE, ...options }).run({ prompt: "ping" }));
+    return queryMock.mock.calls.at(-1)![0].options.env as NodeJS.ProcessEnv;
+  };
+
+  it("selects an account by its config directory, the default one by leaving the variable out", async () => {
+    const before = process.env["CLAUDE_CONFIG_DIR"];
+    process.env["CLAUDE_CONFIG_DIR"] = "/somewhere/else";
+    try {
+      // no choice made: the CLI runs as the host process would run it
+      expect((await envOf({})).CLAUDE_CONFIG_DIR).toBe("/somewhere/else");
+      expect((await envOf({ configDir: "~/.claude-personal" })).CLAUDE_CONFIG_DIR).toBe(path.join(os.homedir(), ".claude-personal"));
+      // naming ~/.claude outright reads as a different, signed-out account
+      expect("CLAUDE_CONFIG_DIR" in (await envOf({ configDir: "~/.claude" }))).toBe(false);
+    } finally {
+      if (before === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+      else process.env["CLAUDE_CONFIG_DIR"] = before;
+    }
+  });
+
+  it("is its own provider under its own id, with a login command for that account", () => {
+    const personal = new ClaudeProvider({ path: FAKE_CLAUDE, id: "claude-personal", label: "Claude Code (personal)", configDir: "~/.claude-personal" });
+    expect(personal).toMatchObject({ id: "claude-personal", label: "Claude Code (personal)" });
+    expect(personal.loginCommand).toBe(`CLAUDE_CONFIG_DIR=${path.join(os.homedir(), ".claude-personal")} claude auth login`);
+    expect(new ClaudeProvider({ path: FAKE_CLAUDE, configDir: "~/.claude" }).loginCommand).toBe("claude auth login");
+  });
+});
+
+describe("ClaudeProvider.status", () => {
+  /** A stand-in `claude` that answers `auth status --json` with `body`. */
+  const fakeCli = (body: string): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yagami-claude-"));
+    const file = path.join(dir, "claude");
+    fs.writeFileSync(file, `#!/bin/sh\n[ "$1 $2 $3" = "auth status --json" ] || exit 9\ncat <<EOF\n${body}\nEOF\n`, { mode: 0o755 });
+    return file;
+  };
+
+  it("asks the CLI whether the account is signed in", async () => {
+    const signedIn = new ClaudeProvider({ path: fakeCli('{"loggedIn": true, "email": "me@example.com", "subscriptionType": "max"}') });
+    expect(await signedIn.status()).toEqual({ signedIn: true, account: "me@example.com", plan: "max" });
+    expect(await new ClaudeProvider({ path: fakeCli('{"loggedIn": false, "authMethod": "none"}') }).status()).toEqual({ signedIn: false });
+  });
+
+  it("asks about the account it was given", async () => {
+    const p = new ClaudeProvider({ path: fakeCli('{"loggedIn": true, "email": "$CLAUDE_CONFIG_DIR"}'), configDir: "/tmp/other-account" });
+    expect(await p.status()).toMatchObject({ signedIn: true, account: "/tmp/other-account" });
+  });
+
+  it("cannot tell with a CLI that has no such command", async () => {
+    const status = await new ClaudeProvider({ path: fakeCli("error: unknown command 'auth'") }).status();
+    expect(status.signedIn).toBeUndefined();
+    expect(status.detail).toMatch(/unknown command/);
   });
 });
 

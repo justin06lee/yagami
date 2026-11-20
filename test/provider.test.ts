@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { parseModelRef, qualifiedModel } from "../src/core/provider.js";
 import { createProvider, detectProviders, PROVIDER_PRESETS, presetFor } from "../src/core/providers/registry.js";
-import { ProviderNotInstalledError } from "../src/core/errors.js";
+import { ClaudeProvider } from "../src/core/providers/claude.js";
+import { PrintProvider } from "../src/core/providers/print.js";
+import { classifyProviderFailure, ProviderError, ProviderNotInstalledError, UsageLimitError } from "../src/core/errors.js";
 import { SseSynthesizer } from "../src/core/sse.js";
 
 const IDS = ["claude", "codex", "opencode"];
@@ -56,6 +58,62 @@ describe("registry", () => {
     const detected = detectProviders({ claude: { enabled: false } });
     expect(detected.find((d) => d.id === "claude")?.installed).toBe(false);
   });
+
+  it("launches the newer harnesses the way their own CLIs document", () => {
+    // Antigravity's plan mode plans instead of answering; its default mode asks before acting
+    expect(presetFor("antigravity")).toMatchObject({ kind: "acp", command: "agy", args: ["acp"], turnMode: "default" });
+    expect(presetFor("grok")).toMatchObject({ kind: "acp", command: "grok", args: ["agent", "stdio"], loginCommand: "grok login" });
+    expect(presetFor("kimi")).toMatchObject({ label: "Kimi Code", command: "kimi", args: ["acp"], loginCommand: "kimi login" });
+    expect(presetFor("muse")).toMatchObject({ command: "muse", args: ["acp"], env: { MUSE_EXPERIMENTAL_ACP: "on" }, loginCommand: "muse login" });
+    // a print mode cannot be refused a tool, so none is preset
+    expect(PROVIDER_PRESETS.filter((p) => p.kind === "print")).toEqual([]);
+  });
+
+  it("holds Grok to its read-only sandbox for completion turns, not for interactive sessions", () => {
+    expect(presetFor("grok")?.turnEnv).toEqual({ GROK_SANDBOX: "read-only" });
+    const grok = createProvider("grok", { path: process.execPath }) as unknown as { env: NodeJS.ProcessEnv; turnEnv: NodeJS.ProcessEnv };
+    expect(grok.turnEnv["GROK_SANDBOX"]).toBe("read-only");
+    expect(grok.env["GROK_SANDBOX"]).toBe(process.env["GROK_SANDBOX"]);
+  });
+
+  it("keeps every preset distinct and complete", () => {
+    const ids = PROVIDER_PRESETS.map((p) => p.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const preset of PROVIDER_PRESETS) {
+      expect(preset.label, preset.id).not.toBe("");
+      expect(preset.command, preset.id).not.toBe("");
+      expect(preset.loginCommand, preset.id).not.toBe("");
+      expect(preset.installHint, preset.id).not.toBe("");
+    }
+  });
+
+  it("builds a second Claude account as its own provider", () => {
+    const node = process.execPath;
+    const personal = createProvider("claude-personal", { kind: "claude", path: node, configDir: "~/.claude-personal" });
+    expect(personal).toBeInstanceOf(ClaudeProvider);
+    expect(personal).toMatchObject({ id: "claude-personal", label: "Claude Code (claude-personal)" });
+    expect(createProvider("work", { kind: "claude", path: node, label: "Work" }).label).toBe("Work");
+    // a custom Claude entry looks for `claude`, not for a binary named after its id
+    const detected = detectProviders({ "claude-personal": { kind: "claude", configDir: "~/.claude-personal" } });
+    const claude = detected.find((d) => d.id === "claude")!;
+    expect(detected.find((d) => d.id === "claude-personal")).toMatchObject({
+      kind: "claude",
+      label: "Claude Code (claude-personal)",
+      installed: claude.installed,
+      loginCommand: "claude auth login",
+    });
+  });
+
+  it("builds a print-mode CLI from config alone", () => {
+    const p = createProvider("mine", { kind: "print", command: process.execPath, args: ["-p", "{prompt}"], modelArgs: ["--model", "{model}"], models: ["a"] });
+    expect(p).toBeInstanceOf(PrintProvider);
+    expect((p as PrintProvider).buildArgs({ prompt: "hi", model: "a" })).toEqual({ args: ["-p", "hi", "--model", "a"], stdin: false });
+    expect(detectProviders({ mine: { kind: "print", command: "definitely-not-a-real-binary-xyz" } }).find((d) => d.id === "mine")).toMatchObject({ kind: "print", installed: false });
+  });
+
+  it("refuses a second Codex provider instead of quietly making an ACP agent of it", () => {
+    expect(() => createProvider("codex-two", { kind: "codex" })).toThrowError(/second codex provider/);
+  });
 });
 
 describe("SseSynthesizer", () => {
@@ -72,5 +130,18 @@ describe("SseSynthesizer", () => {
     expect(starts).toEqual([0, 1, 2]);
     const delta = events.find((e) => e.event === "message_delta")!.data as { delta: { stop_reason: string } };
     expect(delta.delta.stop_reason).toBe("max_tokens");
+  });
+});
+
+describe("classifyProviderFailure", () => {
+  it("types a used-up plan, in any harness's words, and leaves a passing rate limit alone", () => {
+    for (const said of ["You've hit your usage limit. Try again at 6pm.", "You've hit your weekly limit · resets Nov 21", "Quota exceeded for this billing period", "You are out of credits"]) {
+      const err = classifyProviderFailure("codex", "codex login", new Error(said));
+      expect(err, said).toBeInstanceOf(UsageLimitError);
+      expect(err.message).toBe(`codex: ${said}`);
+    }
+    const passing = classifyProviderFailure("codex", "codex login", new Error("429 rate limit exceeded, retry in 2s"));
+    expect(passing).toBeInstanceOf(ProviderError);
+    expect(passing).not.toBeInstanceOf(UsageLimitError);
   });
 });

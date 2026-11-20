@@ -6,7 +6,8 @@ import { Command } from "commander";
 import { YagamiEngine } from "./core/engine.js";
 import { qualifiedModel } from "./core/provider.js";
 import { ClaudeProvider } from "./core/providers/claude.js";
-import { createProvider, detectProviders } from "./core/providers/registry.js";
+import { listHarnesses } from "./core/harnesses.js";
+import { createProvider } from "./core/providers/registry.js";
 import { startYagami } from "./server.js";
 import {
   clearServerState,
@@ -346,7 +347,7 @@ program
     );
 
     console.log("\nproviders   (model ids route as \"<provider>:<model>\"; bare ids go to the default)");
-    const detected = detectProviders(providerConfig);
+    const detected = await listHarnesses({ providerConfig, defaultProvider });
     const installed = detected.filter((d) => d.installed);
     for (const d of detected) {
       const marker = d.id === defaultProvider ? "*" : " ";
@@ -362,9 +363,16 @@ program
         version = `✗ ${err instanceof Error ? err.message : String(err)}`;
       }
       console.log(`  ${marker} ${d.id.padEnd(11)} ${d.path}${version ? ` (${version})` : ""}`);
+      if (d.signedIn === true) {
+        console.log(`    ${"".padEnd(11)} signed in${d.account ? ` as ${d.account}` : ""}${d.plan ? ` (${d.plan})` : ""}`);
+      } else if (d.signedIn === false) {
+        console.log(`    ${"".padEnd(11)} ✗ not signed in — run: ${d.loginCommand}`);
+      } else if (d.detail) {
+        console.log(`    ${"".padEnd(11)} sign-in unknown — ${d.detail}`);
+      }
     }
     const hidden = detected.filter((d) => !d.installed && presetIsNiche(d.id)).length;
-    if (hidden > 0) console.log(`    … ${hidden} more ACP presets not installed (see README for the full list)`);
+    if (hidden > 0) console.log(`    … ${hidden} more presets not installed (see README for the full list)`);
     if (!installed.some((d) => d.id === defaultProvider)) {
       failed = true;
       console.log(`  ✗ default provider "${defaultProvider}" is not installed`);
@@ -411,7 +419,7 @@ program
 
 /** Presets most people won't have; hidden from doctor unless installed. */
 function presetIsNiche(id: string): boolean {
-  return !["claude", "codex", "opencode", "gemini", "copilot", "cursor", "qwen", "goose", "kimi"].includes(id);
+  return !["claude", "codex", "opencode", "gemini", "antigravity", "copilot", "cursor", "grok", "kimi", "muse", "qwen", "goose"].includes(id);
 }
 
 program

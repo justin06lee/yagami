@@ -19,7 +19,10 @@ export {
   type YagamiMessages,
   type YagamiChatCompletions,
   type MessageStreamEvent,
+  type TurnOptions,
+  type TurnResult,
 } from "./core/client.js";
+export { listHarnesses, type Harness, type ListHarnessesOptions } from "./core/harnesses.js";
 export {
   chatToMessagesRequest,
   toChatCompletion,
@@ -39,6 +42,7 @@ export {
   YagamiEngine,
   type EngineOptions,
   type CompleteResult,
+  type CompleteOptions,
   type StreamStart,
   type StreamOptions,
   type StreamResultInfo,
@@ -59,7 +63,16 @@ export {
   type PermissionAdapterOptions,
 } from "./core/permission.js";
 export { settingSourcesFor, type Parity } from "./core/parity.js";
-export type { Provider, ProviderCapabilities, TurnRequest, TurnEvent, ModelRef } from "./core/provider.js";
+export type {
+  Provider,
+  ProviderCapabilities,
+  ProviderStatus,
+  PlanLimit,
+  PlanUsage,
+  TurnRequest,
+  TurnEvent,
+  ModelRef,
+} from "./core/provider.js";
 export { parseModelRef, qualifiedModel, isSessionProvider } from "./core/provider.js";
 // the harness-generic agentic session contract (Codex app-server, ACP agents)
 export type {
@@ -85,6 +98,7 @@ export { claudeLongContextModel } from "./core/claudeModels.js";
 export { ClaudeProvider, type ClaudeProviderOptions } from "./core/providers/claude.js";
 export { CodexProvider, type CodexProviderOptions, type CodexSandboxMode } from "./core/providers/codex.js";
 export { AcpProvider, type AcpProviderOptions, type AcpConnection } from "./core/providers/acp.js";
+export { PrintProvider, type PrintProviderOptions } from "./core/providers/print.js";
 export {
   PROVIDER_PRESETS,
   createProvider,
