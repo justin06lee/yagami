@@ -92,12 +92,24 @@ export function looksLikeAuthFailure(text: string): boolean {
 }
 
 /**
+ * A plan that is out of usage, in the words the harnesses use for it. A
+ * plain "rate limit" is left out on purpose: that one passes on its own.
+ */
+const USAGE_LIMIT = /\b(?:usage|weekly|daily|monthly|session|5-hour|five-hour) limit\b|\bquota (?:exceeded|exhausted)\b|\bout of (?:credits|quota)\b/i;
+
+/** Does this error text say the plan is used up, rather than that something broke? */
+export function looksLikeUsageLimit(text: string): boolean {
+  return USAGE_LIMIT.test(text);
+}
+
+/**
  * Normalize any thrown value into a typed yagami error for `provider`,
- * recognizing sign-in failures by message.
+ * recognizing sign-in failures and a used-up plan by message.
  */
 export function classifyProviderFailure(provider: string, loginCommand: string, err: unknown): YagamiError {
   if (err instanceof YagamiError) return err;
   const message = err instanceof Error ? err.message : String(err);
+  if (looksLikeUsageLimit(message)) return new UsageLimitError(provider, undefined, message.split("\n")[0]!.slice(0, 300));
   if (looksLikeAuthFailure(message)) {
     return new AuthRequiredError(provider, loginCommand, message.split("\n")[0]?.slice(0, 200));
   }

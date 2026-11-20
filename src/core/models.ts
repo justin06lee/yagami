@@ -20,10 +20,14 @@ export interface EngineModel {
   description?: string;
   /** Canonical wire id an alias resolves to (e.g. "sonnet" → "claude-sonnet-5"). */
   resolved_model?: string;
-  /** Context requested by Yagami, or effective capacity observed from a result. */
+  /** Context requested by Yagami, listed by the harness, or effective capacity observed from a result. */
   context_window?: number;
-  /** A request is not a guarantee of provider/account availability. */
-  context_window_source?: "requested" | "observed";
+  /**
+   * Where the number comes from. "requested" is what Yagami asks for, not a
+   * guarantee of provider/account availability; "reported" is the harness's
+   * own model list; "observed" is what a finished turn said.
+   */
+  context_window_source?: "requested" | "reported" | "observed";
   /** Provider that serves this model (set by the engine when aggregating). */
   provider?: string;
   /** Reasoning levels this particular model accepts. */

@@ -13,13 +13,15 @@ import {
   type ThinkingConfig,
   type EffortLevel,
 } from "@anthropic-ai/claude-agent-sdk";
-import { resolveClaudeExecutable } from "../executable.js";
-import { classifyProviderFailure, ProviderError, type VersionSkew } from "../errors.js";
+import { expandHome, resolveClaudeExecutable } from "../executable.js";
+import { classifyProviderFailure, looksLikeUsageLimit, ProviderError, UsageLimitError, type VersionSkew } from "../errors.js";
+import { debug } from "../log.js";
 import { flattenToolResultContent, mcpToolAllowed, parseMcpToolName, type McpServerSpec } from "../mcp.js";
 import { claudeLongContextModel, claudeResultContextWindow } from "../claudeModels.js";
 import type { EngineModel } from "../models.js";
-import type { Provider, ProviderCapabilities, TurnEvent, TurnRequest } from "../provider.js";
+import type { PlanLimit, PlanUsage, Provider, ProviderCapabilities, ProviderStatus, TurnEvent, TurnRequest } from "../provider.js";
 import type { ContentBlockParam, ThinkingParam, Usage } from "../types.js";
+import { runCommand } from "./process.js";
 import { VERSION } from "../../version.js";
 
 // The API surface is pure completions: even though `tools: []` removes every
@@ -78,9 +80,17 @@ const allowMcp = (servers: Record<string, McpServerSpec>, serverTools: string[])
 };
 
 export interface ClaudeProviderOptions {
+  /** Provider id (default "claude"). A second account is a second provider under its own id. */
+  id?: string;
+  label?: string;
   /** Path to the `claude` binary. Auto-resolved when omitted. */
   path?: string;
-  /** Optional CLAUDE_CONFIG_DIR override for the spawned CLI. */
+  /**
+   * The Claude Code account to use, by its config directory
+   * (CLAUDE_CONFIG_DIR). Omitted, the CLI runs as the host process would run
+   * it; `~/.claude` selects the default account even when the host's own
+   * environment points somewhere else.
+   */
   configDir?: string;
   /** Working directory for completion turns (inert — tools are disabled). */
   workDir?: string;
@@ -95,10 +105,10 @@ interface RawStreamEvent {
 
 /** Claude Code through the Agent SDK, pointed at the user's signed-in binary. */
 export class ClaudeProvider implements Provider {
-  readonly id = "claude";
-  readonly label = "Claude Code";
+  readonly id: string;
+  readonly label: string;
   readonly executable: string;
-  readonly loginCommand = "claude (then /login)";
+  readonly loginCommand: string;
   readonly capabilities: ProviderCapabilities = {
     resume: true,
     fork: true,
@@ -118,8 +128,12 @@ export class ClaudeProvider implements Provider {
   private readonly appName: string;
 
   constructor(options: ClaudeProviderOptions = {}) {
+    this.id = options.id ?? "claude";
+    this.label = options.label ?? "Claude Code";
     this.executable = resolveClaudeExecutable(options.path);
-    this.configDir = options.configDir;
+    this.configDir = options.configDir ? path.resolve(expandHome(options.configDir)) : undefined;
+    const elsewhere = this.configDir && this.configDir !== path.join(os.homedir(), ".claude");
+    this.loginCommand = `${elsewhere ? `CLAUDE_CONFIG_DIR=${this.configDir} ` : ""}claude auth login`;
     this.appName = options.appName ?? "yagami";
     this.workDir = options.workDir ?? path.join(os.tmpdir(), "yagami-workspace");
     fs.mkdirSync(this.workDir, { recursive: true });
@@ -140,12 +154,22 @@ export class ClaudeProvider implements Provider {
       skills: [],
       maxTurns: 1,
       canUseTool: DENY_ALL_TOOLS,
-      env: {
-        ...process.env,
-        ...(this.configDir ? { CLAUDE_CONFIG_DIR: this.configDir } : {}),
-        CLAUDE_AGENT_SDK_CLIENT_APP: `${this.appName}/${VERSION}`,
-      },
+      env: { ...this.accountEnv(), CLAUDE_AGENT_SDK_CLIENT_APP: `${this.appName}/${VERSION}` },
     };
+  }
+
+  /**
+   * The environment that selects this provider's account. The default
+   * account is the *absence* of CLAUDE_CONFIG_DIR: the CLI keys its stored
+   * login on the variable, so naming `~/.claude` outright reads as a
+   * different, signed-out account.
+   */
+  private accountEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (!this.configDir) return env;
+    if (this.configDir === path.join(os.homedir(), ".claude")) delete env["CLAUDE_CONFIG_DIR"];
+    else env["CLAUDE_CONFIG_DIR"] = this.configDir;
+    return env;
   }
 
   async *run(req: TurnRequest): AsyncGenerator<TurnEvent, void, undefined> {
@@ -191,6 +215,9 @@ export class ClaudeProvider implements Provider {
     let sawText = false;
     // Ids of MCP tool calls surfaced so far; only their results are reported.
     const mcpCalls = new Set<string>();
+    // The plan's usage windows, latest report per window.
+    const limits = new Map<string, PlanLimit>();
+    const usedUp = (): PlanLimit | undefined => [...limits.values()].find((l) => l.status === "rejected");
 
     try {
       for await (const msg of query({ prompt, options })) {
@@ -228,12 +255,14 @@ export class ClaudeProvider implements Provider {
             if (!mcpCalls.has(id)) continue;
             yield { type: "tool_result", toolUseId: id, isError: block["is_error"] === true, content: flattenToolResultContent(block["content"]) };
           }
+        } else if (msg.type === "rate_limit_event") {
+          for (const limit of planLimits(msg.rate_limit_info)) limits.set(limit.window, limit);
         } else if (msg.type === "result") {
           result = msg;
         }
       }
     } catch (err) {
-      throw classifyProviderFailure(this.id, this.loginCommand, err);
+      throw this.failure(err, usedUp());
     } finally {
       req.signal?.removeEventListener("abort", onAbort);
     }
@@ -241,7 +270,7 @@ export class ClaudeProvider implements Provider {
     if (req.signal?.aborted) return;
     if (!result) throw new ProviderError(this.id, "engine terminated without producing a result");
     if (result.subtype === "success" && result.is_error) {
-      throw classifyProviderFailure(this.id, this.loginCommand, new Error(result.result || "engine reported an error"));
+      throw this.failure(new Error(result.result || "engine reported an error"), usedUp());
     }
     if (result.subtype !== "success") {
       const detail = "errors" in result && result.errors.length > 0 ? result.errors.join("; ") : result.subtype;
@@ -265,7 +294,85 @@ export class ClaudeProvider implements Provider {
       ...(result.total_cost_usd !== undefined ? { costUsd: result.total_cost_usd } : {}),
       ...(model ? { model } : {}),
       ...(stopReason ? { stopReason } : {}),
+      ...(limits.size > 0 ? { limits: [...limits.values()] } : {}),
     };
+  }
+
+  /** A turn's failure, typed: a used-up plan is a UsageLimitError with its reset time. */
+  private failure(err: unknown, usedUp: PlanLimit | undefined): Error {
+    const message = (err instanceof Error ? err.message : String(err)).replace(/^Claude Code returned an error result: /, "");
+    if (usedUp || looksLikeUsageLimit(message)) return new UsageLimitError(this.id, usedUp?.resetsAt, message);
+    return classifyProviderFailure(this.id, this.loginCommand, err);
+  }
+
+  /** Is this account signed in? Asks the CLI itself (`claude auth status`), no model call. */
+  async status(): Promise<ProviderStatus> {
+    const out = await runCommand(this.executable, ["auth", "status", "--json"], { env: this.accountEnv(), cwd: this.workDir });
+    let parsed: { loggedIn?: unknown; email?: unknown; subscriptionType?: unknown } | undefined;
+    try {
+      parsed = JSON.parse(out.stdout) as typeof parsed;
+    } catch {
+      parsed = undefined;
+    }
+    if (!parsed || typeof parsed.loggedIn !== "boolean") {
+      // an older CLI without `auth status`: nothing to go by short of a turn
+      return { detail: (out.stderr || out.stdout).trim().split("\n")[0]?.slice(0, 200) || "claude auth status gave no answer" };
+    }
+    return {
+      signedIn: parsed.loggedIn,
+      ...(typeof parsed.email === "string" ? { account: parsed.email } : {}),
+      ...(typeof parsed.subscriptionType === "string" ? { plan: parsed.subscriptionType } : {}),
+    };
+  }
+
+  /**
+   * The account's plan windows right now — what `/usage` shows — read over
+   * a short-lived control session, no model call. Undefined when the CLI
+   * cannot say (an API-key login, an older CLI).
+   */
+  async limits(): Promise<PlanUsage | undefined> {
+    const abortController = new AbortController();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const idle = (async function* (): AsyncGenerator<SDKUserMessage> {
+      await gate;
+    })();
+    const q = query({ prompt: idle, options: { ...this.baseOptions(), abortController } });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // the SDK marks this call experimental and may rename it
+      const ask = (q as unknown as Record<string, (() => Promise<unknown>) | undefined>)["usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET"];
+      if (typeof ask !== "function") return undefined;
+      const usage = (await Promise.race([
+        ask.call(q),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("timed out reading plan usage")), 15_000);
+          timer.unref?.();
+        }),
+      ])) as { subscription_type?: unknown; rate_limits?: Record<string, unknown> | null };
+      if (!usage.rate_limits) return undefined;
+      const windows: PlanLimit[] = [];
+      for (const [window, raw] of Object.entries(usage.rate_limits)) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+        const row = raw as { utilization?: unknown; resets_at?: unknown };
+        if (typeof row.utilization !== "number" || !("resets_at" in row)) continue;
+        const resetsAt = typeof row.resets_at === "string" ? Date.parse(row.resets_at) : NaN;
+        windows.push({
+          window,
+          utilization: row.utilization / 100,
+          ...(Number.isFinite(resetsAt) ? { resetsAt: Math.floor(resetsAt / 1000) } : {}),
+          status: row.utilization >= 100 ? "rejected" : "allowed",
+        });
+      }
+      return { ...(typeof usage.subscription_type === "string" ? { plan: usage.subscription_type } : {}), windows };
+    } catch (err) {
+      debug(this.id, "could not read plan usage", err);
+      return undefined;
+    } finally {
+      if (timer) clearTimeout(timer);
+      release();
+      abortController.abort();
+    }
   }
 
   /** Ask the CLI which models it supports via a short-lived control session. */
@@ -313,6 +420,7 @@ export class ClaudeProvider implements Provider {
         ...(m.supportsAdaptiveThinking ? { supports_adaptive_thinking: true } : {}),
         ...(m.supportsFastMode ? { supports_fast_mode: true } : {}),
         ...(m.supportsAutoMode ? { supports_auto_mode: true } : {}),
+        ...(m.value === "default" ? { is_default: true } : {}),
       }));
     } catch (err) {
       throw classifyProviderFailure(this.id, this.loginCommand, err);
@@ -382,6 +490,29 @@ function mapThinking(t: ThinkingParam | undefined): ThinkingConfig | undefined {
   }
   if (t.type === "disabled") return { type: "disabled" };
   return { type: "adaptive" };
+}
+
+/** The windows one `rate_limit_event` describes. */
+export function planLimits(info: unknown): PlanLimit[] {
+  const raw = (info ?? {}) as Record<string, unknown>;
+  const status = (value: unknown): PlanLimit["status"] | undefined =>
+    value === "rejected" ? "rejected" : value === "allowed_warning" ? "warning" : value === "allowed" ? "allowed" : undefined;
+  const one = (window: string, row: Record<string, unknown>): PlanLimit => {
+    const s = status(row["status"]);
+    return {
+      window,
+      ...(typeof row["utilization"] === "number" ? { utilization: row["utilization"] } : {}),
+      ...(typeof row["resetsAt"] === "number" ? { resetsAt: row["resetsAt"] } : {}),
+      ...(s ? { status: s } : {}),
+    };
+  };
+  // newer CLIs list every window; older ones report only the one that moved
+  const windows = raw["unifiedWindows"];
+  if (windows && typeof windows === "object" && !Array.isArray(windows)) {
+    const rows = Object.entries(windows as Record<string, unknown>).filter(([, row]) => row && typeof row === "object");
+    if (rows.length > 0) return rows.map(([window, row]) => one(window, row as Record<string, unknown>));
+  }
+  return typeof raw["rateLimitType"] === "string" ? [one(raw["rateLimitType"], raw)] : [];
 }
 
 export function mapUsage(usage: Record<string, unknown>): Usage {

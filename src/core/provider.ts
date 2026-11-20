@@ -65,7 +65,48 @@ export type TurnEvent =
       contextWindow?: number;
       model?: string;
       stopReason?: string;
+      /** The plan's usage windows as the harness reported them during the turn. */
+      limits?: PlanLimit[];
     };
+
+/**
+ * One usage window of a subscription plan — Claude Code's five-hour and
+ * seven-day allowances, for instance.
+ */
+export interface PlanLimit {
+  /** The harness's own name for the window: "five_hour", "seven_day", "seven_day_opus", … */
+  window: string;
+  /** Share of the window used so far, 0 to 1, when the harness says. */
+  utilization?: number;
+  /** When the window resets, in epoch seconds. */
+  resetsAt?: number;
+  /** "rejected" means the window is used up and turns fail until it resets. */
+  status?: "allowed" | "warning" | "rejected";
+}
+
+/** What a harness says about the account it is signed in with. */
+export interface PlanUsage {
+  /** Plan name as the harness reports it ("max", "pro", …). */
+  plan?: string;
+  windows: PlanLimit[];
+}
+
+/**
+ * Whether a harness is ready to take a turn, found without asking a model
+ * anything. `signedIn` is left out when the harness gives no way to tell
+ * short of running a turn.
+ */
+export interface ProviderStatus {
+  signedIn?: boolean;
+  /** Account the CLI is signed in as, when it says. */
+  account?: string;
+  /** Plan name, when it says. */
+  plan?: string;
+  /** The command that signs this CLI in, when the CLI names a more exact one than the preset's. */
+  loginCommand?: string;
+  /** Why the check came out the way it did, in the harness's words. */
+  detail?: string;
+}
 
 /**
  * A coding-agent harness yagami can drive: a signed-in CLI on this machine,
@@ -85,6 +126,10 @@ export interface Provider {
   listModels(): Promise<EngineModel[]>;
   /** CLI version string, if it can be determined. */
   version(): Promise<string | undefined>;
+  /** Sign-in state, checked quickly and without a model call. */
+  status?(): Promise<ProviderStatus>;
+  /** The plan's usage windows right now, without a model call, where the harness reports them. */
+  limits?(): Promise<PlanUsage | undefined>;
 }
 
 export interface ModelRef {

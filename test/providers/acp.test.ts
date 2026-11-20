@@ -21,6 +21,16 @@ interface FakeOptions {
   modelEfforts?: Record<string, string[] | null>;
   /** Never answer a change to this model. */
   hangOnModel?: string;
+  /** Report token counts the way Grok does: under the prompt result's `_meta`. */
+  usageInMeta?: boolean;
+  /** List models both ways, the older list carrying context sizes (Grok). */
+  contextSizes?: Record<string, number>;
+  /** Sign-in commands the agent names in its handshake. */
+  authMethods?: unknown[];
+  /** Never answer newSession. */
+  hangOnSession?: boolean;
+  /** Offer the modes as a "mode" config option only, as OpenCode 2 does. */
+  modeOption?: boolean;
 }
 
 function fakeConnection(opts: FakeOptions = {}) {
@@ -51,8 +61,16 @@ function fakeConnection(opts: FakeOptions = {}) {
     })),
   });
   let levels: string[] | null = ["medium", "high"];
-  const configOptions = opts.models === false || opts.legacyModels ? [] : [modelOption("a"), effortOption(levels)];
-  const modes = opts.modes === false ? null : { currentModeId: "build", availableModes: [{ id: "build" }, { id: "plan" }] };
+  const modeOption = {
+    id: "mode",
+    name: "Mode",
+    category: "mode",
+    type: "select",
+    currentValue: "build",
+    options: [{ value: "build", name: "Build" }, { value: "plan", name: "Plan" }],
+  };
+  const configOptions = opts.models === false || opts.legacyModels ? [] : [modelOption("a"), effortOption(levels), ...(opts.modeOption ? [modeOption] : [])];
+  const modes = opts.modes === false || opts.modeOption ? null : { currentModeId: "build", availableModes: [{ id: "build" }, { id: "plan" }] };
   const models = opts.legacyModels
     ? {
         currentModelId: "auto",
@@ -61,9 +79,15 @@ function fakeConnection(opts: FakeOptions = {}) {
           { modelId: "gemini-pro", name: "Gemini Pro" },
         ],
       }
-    : undefined;
+    : opts.contextSizes
+      ? {
+          currentModelId: "a",
+          availableModels: Object.entries(opts.contextSizes).map(([modelId, totalContextTokens]) => ({ modelId, name: modelId, _meta: { totalContextTokens } })),
+        }
+      : undefined;
   const agent = {
     newSession: async () => {
+      if (opts.hangOnSession) return new Promise(() => {});
       if (opts.sessionError) throw opts.sessionError;
       return { sessionId: "ses-1", configOptions, modes, ...(models ? { models } : {}) };
     },
@@ -97,6 +121,7 @@ function fakeConnection(opts: FakeOptions = {}) {
       push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "po" } });
       push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ng" } });
       push({ sessionUpdate: "usage_update", used: 10, size: 100, cost: { amount: 0.002, currency: "USD" } });
+      if (opts.usageInMeta) return { stopReason: "end_turn", _meta: { inputTokens: 70, outputTokens: 30, cachedReadTokens: 9 } };
       return { stopReason: "end_turn", usage: { inputTokens: 7, outputTokens: 3 } };
     },
   };
@@ -107,6 +132,7 @@ function fakeConnection(opts: FakeOptions = {}) {
       protocolVersion: 1,
       agentCapabilities: opts.resume === false ? {} : ({ sessionCapabilities: { resume: {} } } as never),
       agentInfo: { name: "FakeAgent", version: "9.9" },
+      ...(opts.authMethods ? { authMethods: opts.authMethods } : {}),
     } as never,
     setHandlers: (h) => {
       handlers = h;
@@ -133,6 +159,9 @@ describe("AcpProvider.run", () => {
         type: "done",
         usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
         costUsd: 0.002,
+        // the size the agent's usage update gave, and the default model it ran
+        contextWindow: 100,
+        model: "a",
         stopReason: "end_turn",
       },
     ]);
@@ -143,6 +172,30 @@ describe("AcpProvider.run", () => {
     const fake = fakeConnection();
     await collect(provider(fake).run({ prompt: "ping" }));
     expect(fake.calls["setSessionMode"]).toEqual([{ sessionId: "ses-1", modeId: "plan" }]);
+  });
+
+  it("switches to plan through the mode option when that is the only place the agent has it", async () => {
+    const fake = fakeConnection({ modeOption: true });
+    await collect(provider(fake).run({ prompt: "ping", model: "b" }));
+    expect(fake.calls["setSessionMode"]).toEqual([]);
+    // the mode first, so nothing runs before the agent is held to reading
+    expect(fake.calls["setSessionConfigOption"]).toEqual([
+      { sessionId: "ses-1", configId: "mode", value: "plan" },
+      { sessionId: "ses-1", configId: "model", value: "b" },
+    ]);
+  });
+
+  it("runs in the mode it was told to, for an agent whose plan mode does not answer", async () => {
+    const stays = fakeConnection();
+    const inBuild = new AcpProvider({ id: "fake", label: "Fake", command: "fake-agent", connect: async () => stays.conn, turnMode: "build" });
+    await collect(inBuild.run({ prompt: "ping" }));
+    // already there: nothing to switch, and plan is left alone
+    expect(stays.calls["setSessionMode"]).toEqual([]);
+
+    const moves = fakeConnection({ modeOption: true });
+    const inPlan = new AcpProvider({ id: "fake", label: "Fake", command: "fake-agent", connect: async () => moves.conn, turnMode: "plan" });
+    await collect(inPlan.run({ prompt: "ping" }));
+    expect(moves.calls["setSessionConfigOption"]).toEqual([{ sessionId: "ses-1", configId: "mode", value: "plan" }]);
   });
 
   it("selects the requested model only when it differs from the current one", async () => {
@@ -267,6 +320,36 @@ describe("AcpProvider.run", () => {
     expect(fake.closed).toHaveBeenCalled();
   });
 
+  it("reads token counts an agent reports under _meta, and leaves a requested model's name to the engine", async () => {
+    const fake = fakeConnection({ usageInMeta: true });
+    const events = await collect(provider(fake).run({ prompt: "ping", model: "b" }));
+    expect(events.at(-1)).toEqual({
+      type: "done",
+      usage: { input_tokens: 70, output_tokens: 30, cache_read_input_tokens: 9, cache_creation_input_tokens: 0 },
+      costUsd: 0.002,
+      contextWindow: 100,
+      stopReason: "end_turn",
+    });
+  });
+
+  it("lists context sizes the agent reports, then the ones a turn showed", async () => {
+    const fake = fakeConnection({ contextSizes: { a: 256_000 } });
+    const p = provider(fake);
+    expect((await p.listModels()).map((m) => [m.id, m.context_window, m.context_window_source])).toEqual([
+      ["a", 256_000, "reported"],
+      ["b", undefined, undefined],
+    ]);
+    await collect(p.run({ prompt: "ping", model: "b" }));
+    expect((await p.listModels())[1]).toMatchObject({ id: "b", context_window: 100, context_window_source: "observed" });
+  });
+
+  it("does not call a plan without access a sign-in problem", async () => {
+    const err = Object.assign(new Error("Authentication required: Your current subscription does not have access right now. Upgrade your plan"), { code: -32000 });
+    const failure = await collect(provider(fakeConnection({ promptError: err })).run({ prompt: "ping" })).then(() => undefined, (e: unknown) => e);
+    expect(failure).toBeInstanceOf(ProviderError);
+    expect(failure).not.toBeInstanceOf(AuthRequiredError);
+  });
+
   it("lists models from the session's older models list (Gemini CLI)", async () => {
     const fake = fakeConnection({ legacyModels: true });
     expect(await provider(fake).listModels()).toEqual([
@@ -277,6 +360,47 @@ describe("AcpProvider.run", () => {
 
   it("reports the agent's advertised version", async () => {
     expect(await provider(fakeConnection()).version()).toBe("FakeAgent 9.9");
+  });
+});
+
+describe("AcpProvider.status", () => {
+  it("is signed in when the agent opens a session, and closes the agent", async () => {
+    const fake = fakeConnection();
+    expect(await provider(fake).status()).toEqual({ signedIn: true });
+    expect(fake.closed).toHaveBeenCalled();
+  });
+
+  it("is signed out when the agent refuses the session, with the login command the agent names", async () => {
+    const refused = Object.assign(new Error("Authentication required"), { code: -32000 });
+    const plain = await provider(fakeConnection({ sessionError: refused })).status();
+    expect(plain).toMatchObject({ signedIn: false });
+    expect(plain.loginCommand).toBeUndefined();
+
+    const fake = fakeConnection({
+      sessionError: refused,
+      authMethods: [{ id: "login", name: "Login", _meta: { "terminal-auth": { command: "/opt/homebrew/bin/kimi", args: ["login"] } } }],
+    });
+    expect(await provider(fake).status()).toMatchObject({ signedIn: false, loginCommand: "kimi login" });
+    expect(fake.closed).toHaveBeenCalled();
+  });
+
+  it("cannot tell when the agent fails some other way or never answers", async () => {
+    const broken = await provider(fakeConnection({ sessionError: new Error("spawn EACCES") })).status();
+    expect(broken.signedIn).toBeUndefined();
+    expect(broken.detail).toMatch(/EACCES/);
+
+    vi.useFakeTimers();
+    try {
+      const fake = fakeConnection({ hangOnSession: true });
+      const pending = provider(fake).status();
+      await vi.advanceTimersByTimeAsync(13_000);
+      const status = await pending;
+      expect(status.signedIn).toBeUndefined();
+      expect(status.detail).toMatch(/did not answer/);
+      expect(fake.closed).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

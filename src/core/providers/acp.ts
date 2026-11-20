@@ -27,6 +27,7 @@ import type {
   AgentEvent,
   Provider,
   ProviderCapabilities,
+  ProviderStatus,
   ProviderSession,
   ProviderSessionOptions,
   SessionPermissionDecision,
@@ -65,6 +66,20 @@ export interface AcpProviderOptions {
   /** Explicit executable path override (wins over `command`). */
   path?: string;
   env?: Record<string, string>;
+  /**
+   * Extra environment for completion turns and probes only — what holds the
+   * agent to reading (Grok's `GROK_SANDBOX=read-only`). Interactive sessions
+   * (`openSession`) run without it.
+   */
+  turnEnv?: Record<string, string>;
+  /**
+   * The session mode completion turns run in, for an agent whose "plan"
+   * mode is not a read-only way of answering. Antigravity's turns every
+   * prompt into a planning exercise that ends without a reply; its "default"
+   * mode answers, and asks before each edit or command. Omitted: a
+   * plan/read-only/ask mode when the agent offers one.
+   */
+  turnMode?: string;
   workDir?: string;
   appName?: string;
   /** Id of the session config option that selects the model (default "model"). */
@@ -83,6 +98,8 @@ export interface AcpProviderOptions {
 
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 20_000;
+/** A sign-in check is for a list on screen: it gets less time than a model probe. */
+const STATUS_TIMEOUT_MS = 12_000;
 
 /**
  * Translate session MCP server specs into ACP `newSession` servers. They are
@@ -138,12 +155,19 @@ export class AcpProvider implements SessionProvider {
 
   private readonly args: string[];
   private readonly env: NodeJS.ProcessEnv;
+  private readonly turnEnv: NodeJS.ProcessEnv;
+  private readonly turnMode: string | undefined;
   private readonly workDir: string;
   private readonly appName: string;
   private readonly modelConfigId: string;
+  /** Connects for a completion turn or probe: the agent held to reading. */
   private readonly connectImpl: (cwd: string) => Promise<AcpConnection>;
+  /** Connects for an interactive session: the agent as its user runs it. */
+  private readonly connectSession: (cwd: string) => Promise<AcpConnection>;
   private readonly handshakeTimeoutMs: number;
   private readonly probeTimeoutMs: number;
+  /** Context sizes agents reported while running a model, by model id. */
+  private readonly observedContexts = new Map<string, number>();
 
   constructor(options: AcpProviderOptions) {
     this.id = options.id;
@@ -156,20 +180,23 @@ export class AcpProvider implements SessionProvider {
         });
     this.args = options.args ?? [];
     this.env = { ...process.env, ...options.env };
+    this.turnEnv = { ...this.env, ...options.turnEnv };
+    this.turnMode = options.turnMode;
     this.workDir = options.workDir ?? path.join(os.tmpdir(), "yagami-workspace");
     this.appName = options.appName ?? "yagami";
     this.modelConfigId = options.modelConfigId ?? "model";
-    this.connectImpl = options.connect ?? ((cwd) => this.spawnConnection(cwd));
+    this.connectImpl = options.connect ?? ((cwd) => this.spawnConnection(cwd, this.turnEnv));
+    this.connectSession = options.connect ?? ((cwd) => this.spawnConnection(cwd, this.env));
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
     this.probeTimeoutMs = options.probeTimeoutMs ?? PROBE_TIMEOUT_MS;
     fs.mkdirSync(this.workDir, { recursive: true });
   }
 
-  private spawnConnection(cwd: string): Promise<AcpConnection> {
+  private spawnConnection(cwd: string, env: NodeJS.ProcessEnv): Promise<AcpConnection> {
     return new Promise<AcpConnection>((resolve, reject) => {
       let child: ChildProcess;
       try {
-        child = spawn(this.executable, this.args, { cwd, env: this.env, stdio: ["pipe", "pipe", "pipe"] });
+        child = spawn(this.executable, this.args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
       } catch (err) {
         reject(classifyProviderFailure(this.id, this.loginCommand, err));
         return;
@@ -260,6 +287,9 @@ export class AcpProvider implements SessionProvider {
   private classify(err: unknown, context = ""): Error {
     const message = err instanceof Error ? err.message : String(err);
     const code = (err as { code?: number } | undefined)?.code;
+    // Kimi answers a signed-in account whose plan lacks access with the
+    // auth-required code; signing in again would not help that
+    if (/\b(?:subscription|upgrade your plan)\b/i.test(message)) return new ProviderError(this.id, message.split("\n")[0]!.slice(0, 300));
     // -32000 is ACP's "authentication required" error code.
     if (code === -32000 || looksLikeAuthFailure(message) || looksLikeAuthFailure(context)) {
       return new AuthRequiredError(this.id, this.loginCommand, message.slice(0, 200));
@@ -272,6 +302,7 @@ export class AcpProvider implements SessionProvider {
     const queue = new AsyncQueue<TurnEvent>();
     let sessionId: string | undefined;
     let costUsd: number | undefined;
+    let contextWindow: number | undefined;
     const onAbort = () => {
       if (sessionId) void conn.agent.cancel({ sessionId }).catch(() => {});
       // no session to cancel yet: the only way to stop is to close the agent
@@ -299,16 +330,8 @@ export class AcpProvider implements SessionProvider {
         sessionId = created.sessionId;
         setup = created;
       }
-      const modes = setup.modes as { currentModeId?: string; availableModes?: Array<{ id: string }> } | null | undefined;
       yield { type: "session", sessionId };
-
-      // Hardening: prefer a read-only/plan mode when the agent offers one.
-      const plan = modes?.availableModes?.find((m) => /^(plan|read[-_]?only|ask)$/i.test(m.id));
-      if (plan && modes?.currentModeId !== plan.id) {
-        await conn.agent.setSessionMode({ sessionId, modeId: plan.id }).catch((err: unknown) => {
-          debug(this.id, `could not switch to ${plan.id} mode; running in the agent's default mode`, err);
-        });
-      }
+      setup = await this.holdToReading(conn, sessionId, setup);
       if (req.model) setup = await this.selectModel(conn, sessionId, setup, req.model);
       if (req.effort) await this.selectEffort(conn, sessionId, setup, req.effort);
 
@@ -325,16 +348,23 @@ export class AcpProvider implements SessionProvider {
           } else if (u.sessionUpdate === "usage_update") {
             const cost = (u as { cost?: { amount?: number; currency?: string } | null }).cost;
             if (cost && typeof cost.amount === "number" && (cost.currency ?? "USD") === "USD") costUsd = cost.amount;
+            const size = (u as { size?: unknown }).size;
+            if (typeof size === "number" && size > 0) contextWindow = size;
           }
         },
       });
+      const model = req.model ?? this.currentModel(setup);
       conn.agent
         .prompt({ sessionId, prompt: toAcpBlocks(req.prompt, req.media ?? [], this.id) })
         .then((res) => {
+          if (model && contextWindow) this.observedContexts.set(model, contextWindow);
           queue.push({
             type: "done",
-            usage: mapAcpUsage((res.usage ?? undefined) as Record<string, unknown> | undefined),
+            usage: promptUsage(res),
             ...(costUsd !== undefined ? { costUsd } : {}),
+            ...(contextWindow ? { contextWindow } : {}),
+            // with no model asked for, say which one the agent's default turned out to be
+            ...(!req.model && model ? { model } : {}),
             stopReason: mapStopReason(res.stopReason),
           });
           queue.end();
@@ -358,12 +388,51 @@ export class AcpProvider implements SessionProvider {
     return new AcpAgentSession({
       id: this.id,
       modelConfigId: this.modelConfigId,
-      connect: (cwd) => this.connectImpl(cwd),
+      connect: (cwd) => this.connectSession(cwd),
       classify: (err, ctx) => this.classify(err, ctx),
       selectModel: (conn, sessionId, setup, model) => this.selectModel(conn, sessionId, setup, model),
       selectEffort: (conn, sessionId, setup, effort) => this.selectEffort(conn, sessionId, setup, effort),
       options,
     });
+  }
+
+  /**
+   * Hardening: put the session in a read-only/plan mode when the agent
+   * offers one (or in the preset's `turnMode`). Agents offer it two ways —
+   * ACP's session modes, and a "mode" config option, which is the only place
+   * OpenCode 2 has it. Refusing permission requests is not enough by itself:
+   * an agent the user has set to approve everything never asks.
+   */
+  private async holdToReading(conn: AcpConnection, sessionId: string, setup: SessionSetup): Promise<SessionSetup> {
+    const reading = this.turnMode ? { test: (id: string) => id === this.turnMode } : /^(plan|read[-_]?only|ask)$/i;
+    const modes = setup.modes as { currentModeId?: string; availableModes?: Array<{ id: string }> } | null | undefined;
+    const plan = modes?.availableModes?.find((m) => reading.test(m.id));
+    if (plan) {
+      if (modes?.currentModeId !== plan.id) {
+        await conn.agent.setSessionMode({ sessionId, modeId: plan.id }).catch((err: unknown) => {
+          debug(this.id, `could not switch to ${plan.id} mode; running in the agent's default mode`, err);
+        });
+      }
+      return setup;
+    }
+    const option = setup.configOptions?.find((o) => o.type === "select" && (o.category === "mode" || o.id === "mode"));
+    if (option?.type !== "select") return setup;
+    const value = flattenSelectOptions(option).find((o) => reading.test(o.value))?.value;
+    if (!value || option.currentValue === value) return setup;
+    try {
+      const changed = await conn.agent.setSessionConfigOption({ sessionId, configId: option.id, value });
+      const configOptions = returnedOptions(changed);
+      return configOptions ? { ...setup, configOptions } : setup;
+    } catch (err) {
+      debug(this.id, `could not switch to ${value} mode; running in the agent's default mode`, err);
+      return setup;
+    }
+  }
+
+  /** The model a session is on, as far as it says. */
+  private currentModel(setup: SessionSetup): string | undefined {
+    const option = this.modelOption(setup);
+    return option ? option.currentValue : legacyModels(setup)?.current;
   }
 
   /** The session's model config option, when it is a select. */
@@ -456,6 +525,8 @@ export class AcpProvider implements SessionProvider {
         ? flattenSelectOptions(option).map((o) => ({ id: o.value, name: o.name, description: o.description }))
         : legacy?.available ?? [];
       const current = option ? option.currentValue : legacy?.current;
+      // an agent may list its models both ways; the older list is where Grok puts context sizes
+      const reported = new Map((legacyModels(created)?.available ?? []).flatMap((m) => (m.contextWindow ? [[m.id, m.contextWindow] as const] : [])));
       const reasoning = effortOption(created);
       const own = option
         ? await this.modelEfforts(
@@ -476,10 +547,16 @@ export class AcpProvider implements SessionProvider {
               ...(entry.description ? { description: entry.description } : {}),
             }))
           : [];
+        const observed = this.observedContexts.get(o.id);
         return {
           id: o.id,
           display_name: o.name,
           ...(o.description ? { description: o.description } : {}),
+          ...(reported.has(o.id)
+            ? { context_window: reported.get(o.id)!, context_window_source: "reported" as const }
+            : observed
+              ? { context_window: observed, context_window_source: "observed" as const }
+              : {}),
           ...(efforts.length > 0 ? { reasoning_efforts: efforts } : {}),
           ...(levels ? { default_reasoning_effort: levels.currentValue } : {}),
           ...(o.id === current ? { is_default: true } : {}),
@@ -533,6 +610,50 @@ export class AcpProvider implements SessionProvider {
     stopped = true;
     if (timer) clearTimeout(timer);
     return found;
+  }
+
+  /**
+   * Is the agent signed in? Opens a session and closes it: an agent that
+   * needs a login refuses the session (ACP's auth-required error), and no
+   * model is asked anything either way.
+   */
+  async status(): Promise<ProviderStatus> {
+    let conn: AcpConnection | undefined;
+    let over = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const check = async (): Promise<ProviderStatus> => {
+      conn = await this.connectImpl(this.workDir);
+      // the handshake came too late to be waited for: nobody else will close this one
+      if (over) {
+        conn.close();
+        return {};
+      }
+      try {
+        await conn.agent.newSession({ cwd: this.workDir, mcpServers: [] });
+        return { signedIn: true };
+      } catch (err) {
+        const failure = this.classify(err);
+        if (!(failure instanceof AuthRequiredError)) throw failure;
+        const how = loginHint(conn.init);
+        return { signedIn: false, ...(how ? { loginCommand: how } : {}), detail: failure.message };
+      }
+    };
+    try {
+      return await Promise.race([
+        check(),
+        new Promise<ProviderStatus>((resolve) => {
+          timer = setTimeout(() => resolve({ detail: `${this.label} did not answer within ${Math.round(STATUS_TIMEOUT_MS / 1000)}s` }), STATUS_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (err) {
+      if (err instanceof AuthRequiredError) return { signedIn: false, detail: err.message };
+      return { detail: (err instanceof Error ? err.message : String(err)).split("\n")[0]!.slice(0, 200) };
+    } finally {
+      over = true;
+      if (timer) clearTimeout(timer);
+      (conn as AcpConnection | undefined)?.close();
+    }
   }
 
   /**
@@ -777,7 +898,7 @@ class AcpAgentSession implements ProviderSession {
       .then((res) => {
         queue.push({
           type: "done",
-          usage: mapAcpUsage((res.usage ?? undefined) as Record<string, unknown> | undefined),
+          usage: promptUsage(res),
           ...(this.costUsd !== undefined ? { costUsd: this.costUsd } : {}),
           stopReason: mapStopReason(res.stopReason),
         });
@@ -872,17 +993,19 @@ function returnedOptions(changed: unknown): SessionConfigOption[] | undefined {
 /** The legacy `models` list of a session, when the agent sends one. */
 function legacyModels(
   setup: SessionSetup,
-): { current?: string; available: Array<{ id: string; name: string; description?: string }> } | undefined {
+): { current?: string; available: Array<{ id: string; name: string; description?: string; contextWindow?: number }> } | undefined {
   const raw = setup.models as { availableModels?: unknown; currentModelId?: unknown } | null | undefined;
   if (!raw || !Array.isArray(raw.availableModels)) return undefined;
   const available = (raw.availableModels as Array<Record<string, unknown>>).flatMap((m) => {
     const id = m["modelId"];
     if (typeof id !== "string") return [];
     const description = m["description"];
+    const context = (m["_meta"] as { totalContextTokens?: unknown } | null | undefined)?.totalContextTokens;
     return [{
       id,
       name: typeof m["name"] === "string" ? m["name"] : id,
       ...(typeof description === "string" && description ? { description } : {}),
+      ...(typeof context === "number" && context > 0 ? { contextWindow: context } : {}),
     }];
   });
   if (available.length === 0) return undefined;
@@ -920,6 +1043,32 @@ function toAcpBlocks(text: string, media: ContentBlockParam[], providerId: strin
   }
   if (text.length > 0 || blocks.length === 0) blocks.push({ type: "text", text });
   return blocks;
+}
+
+/**
+ * The command an agent names for signing in, when its handshake carries one
+ * a person can run (Kimi's `terminal-auth`).
+ */
+function loginHint(init: InitializeResponse): string | undefined {
+  for (const method of (init.authMethods ?? []) as Array<Record<string, unknown>>) {
+    const terminal = (method["_meta"] as Record<string, unknown> | null | undefined)?.["terminal-auth"] as
+      | { command?: unknown; args?: unknown }
+      | undefined;
+    if (typeof terminal?.command !== "string") continue;
+    const args = Array.isArray(terminal.args) ? terminal.args.filter((a): a is string => typeof a === "string") : [];
+    return [path.basename(terminal.command), ...args].join(" ");
+  }
+  return undefined;
+}
+
+/**
+ * Token counts of a finished prompt. The protocol's place for them is
+ * `usage`; Grok reports the same fields under `_meta` instead.
+ */
+function promptUsage(res: { usage?: unknown; _meta?: unknown }): Usage {
+  const meta = res._meta as Record<string, unknown> | null | undefined;
+  const usage = res.usage ?? (typeof meta?.["inputTokens"] === "number" ? meta : undefined);
+  return mapAcpUsage((usage ?? undefined) as Record<string, unknown> | undefined);
 }
 
 function mapAcpUsage(u: Record<string, unknown> | undefined): Usage {

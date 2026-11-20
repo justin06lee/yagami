@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawnSync, type ChildProcess } from "node:child_process";
 import { debug } from "../log.js";
 
 /**
@@ -86,4 +86,36 @@ export function killTree(child: ChildProcess | undefined | null, graceMs = GRACE
     for (const member of tree) if (isAlive(member)) signal(member, "SIGKILL");
   }, graceMs);
   timer.unref?.();
+}
+
+export interface CommandResult {
+  /** Exit code; undefined when the command could not run or was cut off. */
+  code: number | undefined;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Run a short CLI subcommand (`auth status`, `--version`) to the end and
+ * hand back what it printed. Never throws: a command that is missing, fails
+ * or outlives `timeoutMs` comes back with no exit code.
+ */
+export function runCommand(
+  command: string,
+  args: string[],
+  options: { env?: NodeJS.ProcessEnv; cwd?: string; timeoutMs?: number } = {},
+): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      command,
+      args,
+      { env: options.env, cwd: options.cwd, timeout: options.timeoutMs ?? 10_000, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const code = err ? (typeof (err as { code?: unknown }).code === "number" ? ((err as { code: number }).code) : undefined) : 0;
+        resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
+      },
+    );
+    // a status command that waits on a terminal must not wait on ours
+    child.stdin?.end();
+  });
 }

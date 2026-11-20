@@ -137,7 +137,65 @@ const engine = new YagamiEngine({
 const { response, costUsd } = await engine.complete({ messages: [{ role: "user", content: "hello" }] });
 ```
 
-Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `ProviderError`. `Yagami` and `YagamiEngine` turns reject with an `ApiError` (the HTTP `status` and `type`) whose `cause` is that typed failure, so check `err.cause instanceof AuthRequiredError`. Every CLI yagami starts is ended with everything it started in turn — a launcher that re-executes itself, an npm shim, an agent's MCP servers — and nothing is left waiting on an agent that never answers: an ACP handshake has 30 seconds, a model-list or version probe 20, and a turn aborted before its session exists closes the agent. A consumer that stops reading a turn early ends its process too.
+Every provider implements one small `Provider` contract (`run(turn)` → normalized `session`/`text`/`thinking`/`done` events, plus `listModels()` and `version()`, and optionally `status()` for sign-in state and `limits()` for plan usage), so adding a harness that isn't ACP-capable is one file. Failures are typed: `AuthRequiredError` (carries the login command), `ProviderNotInstalledError` (carries the install hint), `UsageLimitError` (a used-up plan, with `resetsAt` when the harness says), `ProviderError`. `Yagami` and `YagamiEngine` turns reject with an `ApiError` (the HTTP `status` and `type`) whose `cause` is that typed failure, so check `err.cause instanceof AuthRequiredError`. Every CLI yagami starts is ended with everything it started in turn — a launcher that re-executes itself, an npm shim, an agent's MCP servers — and nothing is left waiting on an agent that never answers: an ACP handshake has 30 seconds, a model-list or version probe 20, and a turn aborted before its session exists closes the agent. A consumer that stops reading a turn early ends its process too.
+
+### Harness list, models and one-call turns
+
+For an app that shows its user a list of AI connectors and sends chat turns through whichever one they pick, the client has a small host-facing surface on top of the SDK shapes:
+
+```ts
+import { Yagami, UsageLimitError, AuthRequiredError } from "@justin06lee/yagami";
+
+const yagami = new Yagami();
+
+// Every harness yagami knows, installed or not. Starts each installed CLI
+// briefly to ask whether it is signed in; no model is called.
+for (const h of await yagami.harnesses()) {
+  // { id, label, kind, installed, signedIn?, available, account?, plan?,
+  //   loginCommand, installHint, detail?, isDefault, capabilities? }
+  console.log(h.label, h.available ? "ready" : h.installed ? `run: ${h.loginCommand}` : `install: ${h.installHint}`);
+}
+
+// One harness's models in its own ids, the default first.
+const models = await yagami.models.for("grok");   // [{ id, display_name, is_default?, context_window?, … }]
+
+// One read-only completion turn.
+const reply = await yagami.turn({
+  harness: "grok",                 // omitted: the default harness
+  model: models[0].id,             // omitted: the harness's own default
+  system: "Answer in Korean.",
+  text: "What does this announcement ask for?",
+  images: [{ data: pngBase64, mediaType: "image/png" }],
+  webSearch: true,                 // where the harness can; otherwise listed in reply.ignored
+  effort: "high",
+  onText: (delta) => process.stdout.write(delta),
+  signal: controller.signal,
+});
+reply.text;                        // the whole reply
+reply.usage;                       // { input, output, cacheRead, cacheWrite }
+reply.contextWindow;               // the answering model's context size, where reported
+reply.limits;                      // Claude Code: [{ window: "seven_day", utilization: 0.05, resetsAt, status }]
+
+// Plan usage without a turn (Claude Code's /usage): five_hour, seven_day, …
+const usage = await yagami.limits("claude");      // { plan: "max", windows: [...] } | undefined
+```
+
+`harnesses()` leaves `signedIn` out when a harness gives no way to tell without running a turn; `available` is "installed and not known to be signed out". `listHarnesses()` is the same list as a plain function, for a machine where nothing is installed yet and `new Yagami()` has no CLI to stand on. A `PlanLimit`'s `utilization` is a share from 0 to 1 and `resetsAt` is epoch seconds; `status: "rejected"` means that window is used up.
+
+`turn()` rejects with the typed failure itself rather than an `ApiError`: `UsageLimitError` when the plan is used up (`resetsAt` set when the harness says when it resets), `AuthRequiredError` (`loginCommand`), `ProviderNotInstalledError` (`installHint`), `ProviderError` for anything else the harness said, and an `AbortError` when you abort. A harness you name is that harness or a failure: it never falls through to the default one. Token counts are the harness's own (all zero from a print-mode CLI, which reports none), and Claude Code's `input` leaves out what was read from or written to the prompt cache.
+
+**Two Claude Code accounts** are two harnesses. Give the second its config directory under its own id:
+
+```ts
+const yagami = new Yagami({
+  providerConfig: {
+    "claude-personal": { kind: "claude", configDir: "~/.claude-personal", label: "Claude Code (personal)" },
+  },
+});
+await yagami.turn({ harness: "claude-personal", text: "hello" });
+```
+
+`claude` itself runs as your process would run it (its own `CLAUDE_CONFIG_DIR`, or the default account). `configDir: "~/.claude"` selects the default account outright, whatever the environment says. The same entry works in `config.json` under `providers`.
 
 ### Claude models and long context
 
@@ -233,11 +291,14 @@ A bare model id goes to the **default provider** (Claude Code unless you change 
 |---|---|---|---|---|---|
 | `claude` — Claude Code | Agent SDK → your `claude` binary | yes, forking | yes (+ documents) | native | native |
 | `codex` — Codex CLI | `codex exec --json` (read-only sandbox) | yes | yes | emulated | effort only |
-| `opencode`, `gemini`, `copilot`, `cursor`, `qwen`, `goose`, `kimi`, `kilo`, `cline`, `auggie`, `amp`, `grok`, `droid`, `codex-acp`, `claude-acp` | Agent Client Protocol over stdio | if the agent supports it | if the agent supports it | emulated | `thought_level` when exposed |
+| `opencode`, `gemini`, `antigravity`, `copilot`, `cursor`, `grok`, `kimi`, `muse`, `qwen`, `goose`, `kilo`, `cline`, `auggie`, `droid`, `kiro`, `junie`, `devin`, `vibe`, `qoder`, `codebuddy`, `poolside`, `stakpak`, `cortex`, `autohand`, `kimchi`, `minimax`, `bob`, `nova`, `vtcode`, `dirac`, `dimcode`, `deepagents`, `fast-agent`, `glm`, `corust`, `crow`, `harn`, `sigit`, `minion`, `amp`, `codex-acp`, `claude-acp` | Agent Client Protocol over stdio | if the agent supports it | if the agent supports it | emulated | `thought_level` when exposed |
+| any CLI you add with `kind: "print"` | its non-interactive print mode | no | no | emulated | no |
+
+The ACP row is the [ACP registry](https://agentclientprotocol.com/registry)'s coding agents, each launched as the registry launches it under the command its own installer puts on `PATH`: Google Antigravity (`agy acp`), Grok Build (`grok agent stdio`), Kimi Code (`kimi acp`), Muse Code (`muse acp`), Kiro (`kiro-cli acp`), Junie, Devin, Mistral Vibe (`vibe-acp`), Qoder, CodeBuddy, Poolside (`pool acp`) and the rest. A print-mode CLI gets the prompt on stdin (or as an argument) and its stdout is the reply: no sessions, no token counts, no model list. None is preset, because a print mode has no permission channel: yagami refuses every tool an ACP agent asks for, but cannot refuse a print-mode CLI anything, so whether a turn can edit files or run commands is up to the flags you give it. Freebuff is not here because it cannot be driven at all: its CLI is a terminal UI only, with no print mode and no ACP (as of 0.2.36).
 
 "Emulated" means the system prompt is folded into the user turn as a `<system>` block; unsupported `thinking`/`effort` are accepted and reported in `x-yagami-ignored` rather than rejected. An ACP agent whose model has no reasoning-level option, or not the level asked for, keeps its own (the debug log says so); the levels are the requested model's, which can differ from the agent's default model or be absent, as with OpenCode's local models. Without native forking, a resumed session is single-use: a sibling branch of the same conversation falls back to transcript replay instead of corrupting the shared session.
 
-Any other ACP agent works too — add it to config with its launch command:
+Any other agent works too — add it to config with its launch command. `kind` says how to drive an id that isn't a preset: `"acp"` (the default), `"print"` for a CLI with only a non-interactive mode, or `"claude"` for another Claude Code account:
 
 ```jsonc
 {
@@ -246,12 +307,15 @@ Any other ACP agent works too — add it to config with its launch command:
     "codex":    { "sandbox": "read-only" },                 // "workspace-write" if you trust the callers
     "gemini":   { "path": "/opt/homebrew/bin/gemini" },
     "my-agent": { "command": "my-agent", "args": ["acp"], "label": "My Agent" },
+    "my-cli":   { "kind": "print", "command": "my-cli", "args": ["-p", "{prompt}"],   // no {prompt}: the prompt goes to stdin
+                  "modelArgs": ["--model", "{model}"], "models": ["small", "big"] },
+    "claude-personal": { "kind": "claude", "configDir": "~/.claude-personal" },
     "goose":    { "enabled": false }                        // hide a preset even if installed
   }
 }
 ```
 
-`yagami doctor` shows every known harness, whether it's installed and signed in, its version, and — for Claude — whether the bundled Agent SDK build matches your binary. Launch commands come from the ACP registry; sign-in hints are best-effort.
+`yagami doctor` shows every known harness, whether it's installed, whether it's signed in and as whom, its version, and — for Claude — whether the bundled Agent SDK build matches your binary. Sign-in is asked of the CLI itself, with no model call: `claude auth status`, `codex login status`, and for an ACP agent whether it opens a session or refuses with ACP's auth-required error. Install and login commands are each vendor's documented ones; where a CLI has no separate login command the hint says to run it and sign in, and an agent that names its own login command in the ACP handshake (Kimi) overrides the preset's.
 
 ### CLI
 
@@ -289,11 +353,11 @@ A config file that exists but isn't valid JSON is an error, not "no config": the
 
 ## How it works
 
-- **Engine**: each request becomes one sandboxed turn on the chosen harness. Claude runs with `tools: []`, `settingSources: []` (your CLAUDE.md/skills never leak into API completions), `strictMcpConfig: true` and `skills: []` (your claude.ai connectors and skills stay out too; only a request's own MCP servers load), `maxTurns: 1` and a deny-all permission callback — a request with server tools or MCP servers lifts the turn cap (24 and 64) and allows exactly those tools; Codex runs in its read-only sandbox with no approvals (the prompt reaches it on stdin, never as an argument, so a message that starts with `-` is a message and a long replayed transcript can't overflow the argument list); ACP agents are moved to a plan/read-only mode when they offer one and every permission request is refused. All of them work in a throwaway directory. The API is text-in/text-out; a leaked key can burn tokens but never edit anything on the host — though note that agents other than Claude keep their own read-only tools, so they can still *look* at that empty directory.
+- **Engine**: each request becomes one sandboxed turn on the chosen harness. Claude runs with `tools: []`, `settingSources: []` (your CLAUDE.md/skills never leak into API completions), `strictMcpConfig: true` and `skills: []` (your claude.ai connectors and skills stay out too; only a request's own MCP servers load), `maxTurns: 1` and a deny-all permission callback — a request with server tools or MCP servers lifts the turn cap (24 and 64) and allows exactly those tools; Codex runs in its read-only sandbox with no approvals (the prompt reaches it on stdin, never as an argument, so a message that starts with `-` is a message and a long replayed transcript can't overflow the argument list); ACP agents are moved to a plan/read-only mode when they offer one — as an ACP session mode or as a `mode` config option, which is where OpenCode 2 has it — and every permission request is refused; Antigravity stays in its `default` mode, which asks before each edit or command (its plan mode plans instead of answering); Grok, which offers no such mode, runs under its own `read-only` sandbox profile (`GROK_SANDBOX`), which lets it write only to temp directories and `~/.grok`. A print-mode CLI added in config runs with exactly the flags you gave it. All of them work in a throwaway directory. The API is text-in/text-out; a leaked key can burn tokens but never edit anything on the host — though note that agents other than Claude keep their own read-only tools, so they can still *look* at that empty directory. One limit to know: refusing permission requests only holds an agent that asks. An ACP agent that offers no plan mode and that you have configured to approve everything by itself will act on that configuration; of the presets, a write attempt was checked against OpenCode (plan mode), Antigravity (refused permission) and Grok (sandbox).
 - **Dialects**: `POST /v1/messages` is native. `POST /v1/chat/completions` translates OpenAI shapes at the edge — system/developer messages fold into `system`, `image_url` parts become image blocks, streams are re-emitted as `chat.completion.chunk` events ending in `[DONE]`, and thinking output rides along as `reasoning_content`. Errors on that path come back OpenAI-shaped too. `GET /v1/models` serves one merged shape both SDKs parse.
 - **Multi-turn**: the Messages API is stateless but harness sessions aren't. yagami hashes each conversation prefix (per provider) and remembers which session produced it; a follow-up request resumes that session and sends only the new user message. Unmatched histories fall back to replaying the transcript in a single prompt, and if a cached session turns out to be gone, the stale mapping is dropped and the request transparently retries via replay. The cache persists across restarts at `~/.config/yagami/sessions.json`.
 - **Streaming**: every harness's output is normalized into deltas and re-emitted as a proper Anthropic SSE sequence — `message_start` → thinking/text content blocks → `message_delta` → `message_stop` (or the OpenAI chunk sequence on the chat-completions path). Claude and ACP agents stream tokens; Codex streams per message part.
-- **Models**: `GET /v1/models` asks each installed CLI what it supports (Claude via the SDK, Codex via its app-server protocol, ACP agents via their session config, or the session model list agents like Gemini CLI still send) — probed once per process, then cached. An ACP agent's reasoning levels are read per model, by selecting each one in the probe session; a model the agent won't report on is listed with its default model's levels. Library callers also receive native model metadata when reported: reasoning levels/default, input modalities, fast/auto/adaptive-thinking flags, personality and multi-agent support, service tiers, and the provider's default model. Failed probes are skipped and retried next time; a static fallback list is served only if nothing answers (`x-yagami-models-source` says which).
+- **Models**: `GET /v1/models` asks each installed CLI what it supports (Claude via the SDK, Codex via its app-server protocol, ACP agents via their session config, or the session model list agents like Gemini CLI still send) — probed once per process, then cached. `context_window` comes with `context_window_source`: `"requested"` (what yagami asks Claude for), `"reported"` (the harness's own list, as Grok gives it) or `"observed"` (what a finished turn on that model said). An ACP agent's reasoning levels are read per model, by selecting each one in the probe session; a model the agent won't report on is listed with its default model's levels. Library callers also receive native model metadata when reported: reasoning levels/default, input modalities, fast/auto/adaptive-thinking flags, personality and multi-agent support, service tiers, and the provider's default model. Failed probes are skipped and retried next time; a static fallback list is served only if nothing answers (`x-yagami-models-source` says which).
 - **Auth**: `x-api-key` or `Authorization: Bearer`, compared in constant time. Binds to `127.0.0.1` by default and warns loudly on anything else. Request bodies are capped at 32 MB (the real API's limit; `413` beyond it), and a port that's already taken fails `yagami start` with one line instead of a crash.
 
 Extra response headers: `x-yagami-provider`, `x-yagami-cost-usd` (what the turn would have cost at API prices, when the harness reports it), `x-yagami-session`, `x-yagami-ignored` (accepted-but-unsupported params). `/healthz` answers `{ ok, service, version }` to anyone (liveness); with a valid key it also reports the default provider, installed providers, the binary's path, uptime, request count, and the cumulative would-be cost — `yagami status` shows the same.

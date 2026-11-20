@@ -1,5 +1,5 @@
 import type { EngineModel } from "../../src/core/models.js";
-import type { Provider, ProviderCapabilities, TurnEvent, TurnRequest } from "../../src/core/provider.js";
+import type { PlanLimit, PlanUsage, Provider, ProviderCapabilities, ProviderStatus, TurnEvent, TurnRequest } from "../../src/core/provider.js";
 
 export const FULL_CAPS: ProviderCapabilities = {
   resume: true,
@@ -21,6 +21,8 @@ export interface ReplyOptions {
   model?: string;
   /** Split the text into these chunks instead of one event. */
   chunks?: string[];
+  contextWindow?: number;
+  limits?: PlanLimit[];
 }
 
 /** Events for one successful turn. */
@@ -33,6 +35,8 @@ export function reply(text: string, opts: ReplyOptions = {}): TurnEvent[] {
     usage: { input_tokens: 3, output_tokens: 5 },
     costUsd: opts.costUsd ?? 0.01,
     ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.contextWindow ? { contextWindow: opts.contextWindow } : {}),
+    ...(opts.limits ? { limits: opts.limits } : {}),
   });
   return events;
 }
@@ -47,6 +51,10 @@ export class FakeProvider implements Provider {
   models: EngineModel[] = [{ id: "fake-1", display_name: "Fake 1" }];
   modelsError: Error | undefined;
   script: Script;
+  /** Set to give the provider a sign-in check (`status()`); a thrown Error is thrown. */
+  signIn: ProviderStatus | Error | undefined;
+  /** Set to give the provider plan usage (`limits()`). */
+  plan: PlanUsage | undefined;
 
   constructor(
     readonly id: string,
@@ -74,6 +82,15 @@ export class FakeProvider implements Provider {
 
   async version(): Promise<string | undefined> {
     return "fake 1.0";
+  }
+
+  async status(): Promise<ProviderStatus> {
+    if (this.signIn instanceof Error) throw this.signIn;
+    return this.signIn ?? {};
+  }
+
+  async limits(): Promise<PlanUsage | undefined> {
+    return this.plan;
   }
 }
 
