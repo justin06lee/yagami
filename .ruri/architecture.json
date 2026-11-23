@@ -1,0 +1,166 @@
+{
+  "description": "yagami is a self-hosted gateway that exposes the coding-agent CLIs already installed and signed in on a machine (Claude Code, Codex, OpenCode, Gemini CLI, and any ACP agent) as an Anthropic- and OpenAI-compatible API. It also ships a zero-config library so local apps can drive those CLIs without URLs or API keys. Intended for personal use only.",
+  "features": [
+    "Serves Anthropic /v1/messages and OpenAI /v1/chat/completions with one API key",
+    "Drives signed-in Claude Code via the Agent SDK, no separate vendor keys",
+    "Drives Codex via codex exec and ACP-registry agents via Agent Client Protocol",
+    "Zero-config Yagami library client mirroring Anthropic and OpenAI SDK surfaces",
+    "Library syncs with the host's yagami config file and environment variables",
+    "Anthropic server tools web_search and web_fetch run inside the engine",
+    "MCP connector: mcp_servers and mcp_toolset connect tools for a single turn",
+    "Streaming SSE responses synthesized in both Anthropic and OpenAI dialects",
+    "Full agentic Claude Code sessions embeddable for building UIs",
+    "Session cache maps conversation prefixes to Claude Code session ids for resume",
+    "Detects installed and signed-in CLIs and reports harness status",
+    "Settings parity modes: terminal, project, or isolated config loading"
+  ],
+  "layers": [
+    {
+      "name": "Packaging and CLI",
+      "what": "Node CLI built with commander; start, stop, status, key, daemon mode; tsup bundling to dist/cli.js",
+      "slug": "cli",
+      "paths": [
+        "src/cli.ts",
+        "src/index.ts",
+        "src/version.ts",
+        "tsup.config.ts",
+        "scripts/smoke.ts"
+      ]
+    },
+    {
+      "name": "HTTP server",
+      "what": "Hono app on @hono/node-server; routes for Anthropic and OpenAI dialects, key auth, server config and state files",
+      "slug": "http-server",
+      "paths": [
+        "src/server.ts",
+        "src/server/"
+      ]
+    },
+    {
+      "name": "Engine",
+      "what": "YagamiEngine core: request normalization, prefix keys, provider routing, SSE synthesis, error mapping",
+      "slug": "engine",
+      "paths": [
+        "src/core/engine.ts",
+        "src/core/transcript.ts",
+        "src/core/sse.ts",
+        "src/core/sessionCache.ts",
+        "src/core/openai.ts",
+        "src/core/serverTools.ts",
+        "src/core/mcp.ts",
+        "src/core/types.ts",
+        "src/core/models.ts",
+        "src/core/claudeModels.ts"
+      ]
+    },
+    {
+      "name": "Library client",
+      "what": "Zero-config Yagami client, host config loading, harness listing, Claude Code session wrapper",
+      "slug": "library",
+      "paths": [
+        "src/core/client.ts",
+        "src/core/hostConfig.ts",
+        "src/core/harnesses.ts",
+        "src/core/session.ts",
+        "src/core/agentSession.ts",
+        "src/core/parity.ts",
+        "scripts/live-harnesses.ts",
+        "scripts/live-session.ts"
+      ]
+    },
+    {
+      "name": "Provider adapters",
+      "what": "Provider interface and adapters: Claude Agent SDK, codex exec, ACP, print and JSONL process runners, queues",
+      "slug": "providers",
+      "paths": [
+        "src/core/provider.ts",
+        "src/core/providers/",
+        "src/core/executable.ts",
+        "src/core/permission.ts",
+        "src/core/interaction.ts",
+        "src/core/errors.ts",
+        "scripts/live-providers.ts",
+        "test/helpers/fakeProvider.ts"
+      ]
+    },
+    {
+      "name": "Diagnostics",
+      "what": "Logging sink for swallowed failures; the one place caught errors are reported",
+      "slug": "diagnostics",
+      "paths": [
+        "src/core/log.ts"
+      ]
+    },
+    {
+      "name": "Node runtime",
+      "what": "Node 20+ with Bun for install and build; Claude Code, Codex and ACP CLIs installed on the host",
+      "slug": "runtime"
+    }
+  ],
+  "flows": [
+    {
+      "name": "An HTTP request",
+      "steps": [
+        "client app",
+        "src/server/app.ts (Hono routes)",
+        "src/core/openai.ts or src/core/transcript.ts (dialect translation)",
+        "src/core/engine.ts (YagamiEngine)",
+        "src/core/providers/ (provider adapter)",
+        "src/core/sse.ts or completion body",
+        "client app"
+      ]
+    },
+    {
+      "name": "A library call",
+      "steps": [
+        "Yagami client (src/core/client.ts)",
+        "src/core/hostConfig.ts (host config)",
+        "src/core/engine.ts (YagamiEngine)",
+        "src/core/providers/registry.ts (provider selection)",
+        "CLI subprocess or Agent SDK"
+      ]
+    },
+    {
+      "name": "A server tool or MCP turn",
+      "steps": [
+        "src/core/serverTools.ts or src/core/mcp.ts (tool resolution)",
+        "src/core/engine.ts",
+        "src/core/providers/claude.ts",
+        "Claude Code CLI with WebSearch, WebFetch or MCP servers",
+        "mcp_tool_use and mcp_tool_result blocks in reply"
+      ]
+    }
+  ],
+  "layout": [
+    "src/cli.ts — yagami binary entry: commander commands",
+    "src/index.ts — library entry: Yagami, YagamiEngine, claudeCodeSession exports",
+    "src/server.ts — startYagami: wires engine, session cache and Hono app",
+    "src/server/app.ts — HTTP routes and auth",
+    "src/server/config.ts — config file, API key, server state paths",
+    "src/core/engine.ts — YagamiEngine, the central request handler",
+    "src/core/client.ts — zero-config library client",
+    "src/core/providers/ — one adapter per CLI or protocol",
+    "src/core/transcript.ts — request normalization and prefix keys",
+    "src/core/openai.ts — OpenAI Chat Completions translation",
+    "test/ — vitest suites, with test/providers/ and test/helpers/fakeProvider.ts",
+    "scripts/ — smoke and live checks against real CLIs",
+    "Makefile — build, install, update targets",
+    "package.json — scripts, dependencies, bin entry"
+  ],
+  "run": [
+    "make — bun install, build, and link yagami into ~/.local/bin",
+    "make update — stop running server, rebuild, reinstall, restart it",
+    "yagami start — run the server; first run generates and saves an API key",
+    "bun run dev — run the CLI from source with tsx",
+    "bun run build — bundle with tsup into dist/",
+    "bun run typecheck — tsc --noEmit",
+    "bun run test — vitest run",
+    "bun run smoke / live:providers / live:session / live:harnesses — script checks in scripts/"
+  ],
+  "conventions": [
+    "Package manager is bun; the Makefile runs bun install and bun run build",
+    "prepublishOnly must pass typecheck and test before publish",
+    "Keep the endpoint private and do not share API keys (README)"
+  ],
+  "builtAt": "5021b0e"
+}

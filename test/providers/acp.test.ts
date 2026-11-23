@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AcpConnection, AcpHandlers } from "../../src/core/providers/acp.js";
 import { AcpProvider, acpMcpServers, rejectOption } from "../../src/core/providers/acp.js";
-import { AuthRequiredError, ProviderError } from "../../src/core/errors.js";
+import { AuthRequiredError, ProviderError, UsageLimitError } from "../../src/core/errors.js";
 import { collect } from "../helpers/fakeProvider.js";
 
 interface FakeOptions {
@@ -348,6 +348,59 @@ describe("AcpProvider.run", () => {
     const failure = await collect(provider(fakeConnection({ promptError: err })).run({ prompt: "ping" })).then(() => undefined, (e: unknown) => e);
     expect(failure).toBeInstanceOf(ProviderError);
     expect(failure).not.toBeInstanceOf(AuthRequiredError);
+  });
+
+  describe("a failure whose reason is in the error's data", () => {
+    const rpc = (code: number, message: string, data?: unknown) => Object.assign(new Error(message), { code, ...(data !== undefined ? { data } : {}) });
+    const failure = (err: Error) => collect(provider(fakeConnection({ promptError: err })).run({ prompt: "ping" })).then(() => undefined, (e: unknown) => e);
+
+    it("is a used-up plan when the agent says payment required (Grok)", async () => {
+      const err = await failure(rpc(-32603, "Internal error", { message: "API error (status 402 Payment Required): Grok Build usage balance exhausted", http_status: 402 }));
+      expect(err).toBeInstanceOf(UsageLimitError);
+      expect(err).toMatchObject({ provider: "fake", code: "usage_limit", status: 402 });
+      expect((err as Error).message).toBe("fake: Grok Build usage balance exhausted (402)");
+      expect((err as UsageLimitError).resetsAt).toBeUndefined();
+    });
+
+    it("carries the reset time when the data has one", async () => {
+      const epoch = await failure(rpc(-32603, "Internal error", { message: "usage limit reached", http_status: 429, resets_at: 1795251600 }));
+      expect(epoch).toBeInstanceOf(UsageLimitError);
+      expect(epoch).toMatchObject({ resetsAt: 1795251600, status: 429 });
+      const iso = await failure(rpc(-32603, "Internal error", { error: { message: "You are out of credits" }, resetsAt: "2026-11-21T09:00:00Z" }));
+      expect(iso).toMatchObject({ resetsAt: 1795251600 });
+    });
+
+    it("keeps a passing rate limit a ProviderError, with the reason and the status", async () => {
+      const err = await failure(rpc(-32603, "Internal error", { message: "API error (status 429 Too Many Requests): rate limit exceeded, retry in 2s", http_status: 429 }));
+      expect(err).toBeInstanceOf(ProviderError);
+      expect(err).not.toBeInstanceOf(UsageLimitError);
+      expect(err).toMatchObject({ status: 429 });
+      expect((err as Error).message).toBe("fake: rate limit exceeded, retry in 2s (429)");
+    });
+
+    it("reads the reason wherever the agent put it", async () => {
+      expect(((await failure(rpc(-32603, "Internal error", "upstream closed the stream"))) as Error).message).toBe("fake: upstream closed the stream");
+      expect(((await failure(rpc(-32603, "Internal error", { error: "model overloaded", status: 503 }))) as ProviderError).message).toBe("fake: model overloaded (503)");
+      expect(((await failure(rpc(-32603, "Internal error", { details: "boom" }))) as Error).message).toBe("fake: boom");
+      // a message that already says something keeps it, with the data's reason after it
+      expect(((await failure(rpc(-32603, "Prompt failed", { message: "context too long" }))) as Error).message).toBe("fake: Prompt failed: context too long");
+      // data with nothing to read adds nothing
+      expect(((await failure(rpc(-32602, "Invalid params: model not found: x", { providerId: "ollama", modelId: "x" }))) as Error).message).toBe("fake: Invalid params: model not found: x");
+      expect(((await failure(rpc(-32603, "Internal error"))) as Error).message).toBe("fake: Internal error");
+    });
+
+    it("is a sign-in problem when the data says so", async () => {
+      expect(await failure(rpc(-32603, "Internal error", { message: "API error (status 401 Unauthorized): token expired", http_status: 401 }))).toBeInstanceOf(AuthRequiredError);
+    });
+
+    it("is typed the same way in an interactive session", async () => {
+      const fake = fakeConnection({ promptError: rpc(-32603, "Internal error", { message: "API error (status 402 Payment Required): Grok Build usage balance exhausted", http_status: 402 }) });
+      const s = provider(fake).openSession({ cwd: "/tmp/proj", permissions: { decide: async () => "deny" } });
+      const err = await collect(s.send("hi")).then(() => undefined, (e: unknown) => e);
+      await s.close();
+      expect(err).toBeInstanceOf(UsageLimitError);
+      expect((err as Error).message).toBe("fake: Grok Build usage balance exhausted (402)");
+    });
   });
 
   it("lists models from the session's older models list (Gemini CLI)", async () => {

@@ -3,7 +3,7 @@ import { parseModelRef, qualifiedModel } from "../src/core/provider.js";
 import { createProvider, detectProviders, PROVIDER_PRESETS, presetFor } from "../src/core/providers/registry.js";
 import { ClaudeProvider } from "../src/core/providers/claude.js";
 import { PrintProvider } from "../src/core/providers/print.js";
-import { classifyProviderFailure, ProviderError, ProviderNotInstalledError, UsageLimitError } from "../src/core/errors.js";
+import { classifyProviderFailure, ProviderError, ProviderNotInstalledError, toApiError, UsageLimitError } from "../src/core/errors.js";
 import { SseSynthesizer } from "../src/core/sse.js";
 
 const IDS = ["claude", "codex", "opencode"];
@@ -140,8 +140,20 @@ describe("classifyProviderFailure", () => {
       expect(err, said).toBeInstanceOf(UsageLimitError);
       expect(err.message).toBe(`codex: ${said}`);
     }
+    for (const said of ["Grok Build usage balance exhausted", "Insufficient credits to run this request", "402 Payment Required", "You exceeded your current quota"]) {
+      expect(classifyProviderFailure("x", "x login", new Error(said)), said).toBeInstanceOf(UsageLimitError);
+    }
     const passing = classifyProviderFailure("codex", "codex login", new Error("429 rate limit exceeded, retry in 2s"));
     expect(passing).toBeInstanceOf(ProviderError);
     expect(passing).not.toBeInstanceOf(UsageLimitError);
+  });
+});
+
+describe("toApiError", () => {
+  it("answers a harness's own 429 as a rate limit, and keeps the typed failure as the cause", () => {
+    const limited = new ProviderError("grok", "rate limit exceeded (429)", 429);
+    expect(toApiError(limited)).toMatchObject({ status: 429, type: "rate_limit_error", cause: limited });
+    expect(toApiError(new ProviderError("grok", "boom", 503))).toMatchObject({ status: 500, type: "api_error" });
+    expect(toApiError(new UsageLimitError("grok", undefined, "balance exhausted (402)", 402))).toMatchObject({ status: 429, type: "rate_limit_error" });
   });
 });

@@ -1,0 +1,6 @@
+# ruri's files. The architecture, the layers' sheets and the component
+# index are the project's — commit them, and a clone opens with them.
+# What stays out is one person's: the catch-up from their chats, and
+# the files a session drops for the app to pick up.
+catchup.md
+*.jsonl

@@ -18,7 +18,16 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { ContentBlock as AcpContentBlock, HttpHeader, McpServer } from "@agentclientprotocol/sdk";
 import { resolveExecutable } from "../executable.js";
-import { classifyProviderFailure, looksLikeAuthFailure, AuthRequiredError, ProviderError } from "../errors.js";
+import {
+  classifyProviderFailure,
+  describeFailure,
+  looksLikeAuthFailure,
+  looksLikeUsageLimit,
+  AuthRequiredError,
+  ProviderError,
+  UsageLimitError,
+  YagamiError,
+} from "../errors.js";
 import { declineInput, elicitationRequest, elicitationResponse } from "../interaction.js";
 import { debug } from "../log.js";
 import type { EngineModel } from "../models.js";
@@ -285,16 +294,20 @@ export class AcpProvider implements SessionProvider {
   }
 
   private classify(err: unknown, context = ""): Error {
-    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof YagamiError) return err;
+    // the reason is often in the error's data, under a stock message
+    const { message, status, resetsAt } = describeFailure(err);
     const code = (err as { code?: number } | undefined)?.code;
     // Kimi answers a signed-in account whose plan lacks access with the
     // auth-required code; signing in again would not help that
-    if (/\b(?:subscription|upgrade your plan)\b/i.test(message)) return new ProviderError(this.id, message.split("\n")[0]!.slice(0, 300));
+    if (/\b(?:subscription|upgrade your plan)\b/i.test(message)) return new ProviderError(this.id, message.split("\n")[0]!.slice(0, 300), status);
+    // 402 is the upstream API refusing for want of balance, whatever words come with it
+    if (status === 402 || looksLikeUsageLimit(message)) return new UsageLimitError(this.id, resetsAt, message.split("\n")[0]!.slice(0, 300), status);
     // -32000 is ACP's "authentication required" error code.
-    if (code === -32000 || looksLikeAuthFailure(message) || looksLikeAuthFailure(context)) {
+    if (code === -32000 || status === 401 || looksLikeAuthFailure(message) || looksLikeAuthFailure(context)) {
       return new AuthRequiredError(this.id, this.loginCommand, message.slice(0, 200));
     }
-    return classifyProviderFailure(this.id, this.loginCommand, err);
+    return new ProviderError(this.id, message, status);
   }
 
   async *run(req: TurnRequest): AsyncGenerator<TurnEvent, void, undefined> {
