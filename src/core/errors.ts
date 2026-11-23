@@ -46,6 +46,8 @@ export class ProviderError extends YagamiError {
   constructor(
     readonly provider: string,
     message: string,
+    /** HTTP status of the upstream API call that failed, when the harness passes it on (429, 503, …). */
+    readonly status?: number,
   ) {
     super(`${provider}: ${message}`, "provider_error");
     this.name = "ProviderError";
@@ -58,6 +60,8 @@ export class UsageLimitError extends YagamiError {
     readonly provider: string,
     readonly resetsAt: number | undefined,
     message: string,
+    /** HTTP status the harness reported with it, when it did (402, 429). */
+    readonly status?: number,
   ) {
     super(`${provider}: ${message}`, "usage_limit");
     this.name = "UsageLimitError";
@@ -95,11 +99,61 @@ export function looksLikeAuthFailure(text: string): boolean {
  * A plan that is out of usage, in the words the harnesses use for it. A
  * plain "rate limit" is left out on purpose: that one passes on its own.
  */
-const USAGE_LIMIT = /\b(?:usage|weekly|daily|monthly|session|5-hour|five-hour) limit\b|\bquota (?:exceeded|exhausted)\b|\bout of (?:credits|quota)\b/i;
+const USAGE_LIMIT =
+  /\b(?:usage|weekly|daily|monthly|session|5-hour|five-hour) limit\b|\b(?:quota|balance|credits?) (?:is |are )?(?:exceeded|exhausted|depleted|used up)\b|\bexceeded your (?:current )?quota\b|\bout of (?:credits|quota)\b|\binsufficient (?:balance|credits?|quota|funds)\b|\bpayment required\b/i;
 
 /** Does this error text say the plan is used up, rather than that something broke? */
 export function looksLikeUsageLimit(text: string): boolean {
   return USAGE_LIMIT.test(text);
+}
+
+/** The phrases JSON-RPC gives its error codes: they say which code, not what went wrong. */
+const STOCK_PHRASE = /^(?:internal error|invalid params|invalid request|method not found|parse error|server error|unknown error)\.?$/i;
+
+/** A reset time in epoch seconds, from seconds, milliseconds or an ISO date. */
+function epochSeconds(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value > 1e12 ? value / 1000 : value);
+  if (typeof value === "string") {
+    const at = Date.parse(value);
+    if (Number.isFinite(at)) return Math.floor(at / 1000);
+  }
+  return undefined;
+}
+
+/**
+ * What a failure says once the reason is dug out of it. A protocol error
+ * (JSON-RPC, so every ACP agent) carries a stock phrase as its message and
+ * the actual reason in `data`: Grok answers a spent balance with "Internal
+ * error" and `{ message: "API error (status 402 Payment Required): …",
+ * http_status: 402 }`. Reading only the message loses the one thing a caller
+ * needs.
+ */
+export function describeFailure(err: unknown): { message: string; status?: number; resetsAt?: number } {
+  const base = err instanceof Error ? err.message : String(err);
+  const data = (err as { data?: unknown } | null | undefined)?.data;
+  const fields = data !== null && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : {};
+  const nested = fields["error"] !== null && typeof fields["error"] === "object" ? (fields["error"] as Record<string, unknown>) : {};
+  const said = [data, fields["message"], fields["error"], nested["message"], fields["detail"], fields["details"], fields["reason"], fields["description"]].find(
+    (value): value is string => typeof value === "string" && value.trim() !== "",
+  );
+  let status = [fields["http_status"], fields["httpStatus"], fields["status"], fields["statusCode"], fields["status_code"], nested["status"], nested["code"]].find(
+    (value): value is number => typeof value === "number" && value >= 400 && value <= 599,
+  );
+  let inner = said?.trim();
+  if (inner) {
+    // "API error (status 402 Payment Required): <reason>" — the status moves to the end
+    const wrapped = /^API error \(status (\d{3})[^)]*\):\s*/i.exec(inner);
+    if (wrapped) {
+      status ??= Number(wrapped[1]);
+      inner = inner.slice(wrapped[0].length) || inner;
+    }
+  }
+  let message = !inner ? base : STOCK_PHRASE.test(base.trim()) ? inner : base.includes(inner) ? base : `${base}: ${inner}`;
+  if (status !== undefined && !message.includes(String(status))) message = `${message} (${status})`;
+  const resetsAt = [fields["resetsAt"], fields["resets_at"], fields["resetAt"], fields["reset_at"], nested["resetsAt"], nested["resets_at"]]
+    .map(epochSeconds)
+    .find((value) => value !== undefined);
+  return { message: message.slice(0, 600), ...(status !== undefined ? { status } : {}), ...(resetsAt !== undefined ? { resetsAt } : {}) };
 }
 
 /**
@@ -126,6 +180,8 @@ export function toApiError(err: unknown): ApiError {
     return new ApiError(503, "api_error", err.message, { cause: err });
   }
   if (err instanceof UsageLimitError) return new ApiError(429, "rate_limit_error", err.message, { cause: err });
+  // the harness's upstream said slow down: that is the caller's to know, not a server fault
+  if (err instanceof ProviderError && err.status === 429) return new ApiError(429, "rate_limit_error", err.message, { cause: err });
   if (err instanceof YagamiError) return new ApiError(500, "api_error", err.message, { cause: err });
   const message = err instanceof Error ? err.message : String(err);
   return new ApiError(500, "api_error", `engine error: ${message}`, { cause: err });
