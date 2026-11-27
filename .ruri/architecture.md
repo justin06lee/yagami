@@ -1,6 +1,6 @@
 # yagami — architecture
 
-The shape of this project, for a model that has never seen it: where to change what, the stack it is built as, how the parts connect, where things are, how to run it. Where the work stands — git, decisions, what worked and what didn't, what's open — is in catchup.md beside this file.
+The shape of this project, for a model that has never seen it: the stack it is built as, top to bottom, how the parts connect, where things are, how to run it. This is the index. Each layer has a sheet of its own in `.ruri/layers/` — where to change what inside it, how it works, its key files, its traps — so read the one for the layer you are about to work in (`ruri layer <slug>` prints it), and leave the rest. Where the work stands — git, decisions, what worked and what didn't, what's open — is in catchup.md beside this file.
 Don't edit this file: ruri writes it. `ruri architecture` prints it with every line numbered, and once you have read it that way you can put right what your work changed — `ruri architecture add|set|drop <section> …`. The user corrects it on the architecture page.
 
 Read from the repo at 5021b0e; folded forward from finished turns since. Where it and the code disagree, the code is right.
@@ -9,11 +9,11 @@ yagami is a self-hosted gateway that exposes the coding-agent CLIs already insta
 
 ## The stack, top to bottom
 
-1. **Packaging and CLI** — Node CLI built with commander; start, stop, status, key, daemon mode; tsup bundling to dist/cli.js (`src/, ./, scripts/ · 5 files`)
+1. **Packaging and CLI** — Node CLI built with commander; start, stop, status, key, daemon mode; tsup bundling to dist/cli.js (`src/, ./, scripts/ · 5 files`) → `.ruri/layers/cli.md`
 2. **HTTP server** — Hono app on @hono/node-server; routes for Anthropic and OpenAI dialects, key auth, server config and state files (`src/, src/server/ · 1 file`)
 3. **Engine** — YagamiEngine core: request normalization, prefix keys, provider routing, SSE synthesis, error mapping (`src/core/ · 10 files`)
 4. **Library client** — Zero-config Yagami client, host config loading, harness listing, Claude Code session wrapper (`src/core/, scripts/ · 8 files`)
-5. **Provider adapters** — Provider interface and adapters: Claude Agent SDK, codex exec, ACP, print and JSONL process runners, queues (`src/core/, src/core/providers/, scripts/ +1 · 7 files`)
+5. **Provider adapters** — Provider interface and adapters: Claude Agent SDK, codex exec, ACP, print and JSONL process runners, queues (`src/core/, src/core/providers/, scripts/ +1 · 7 files`) → `.ruri/layers/providers.md`
 6. **Diagnostics** — Logging sink for swallowed failures; the one place caught errors are reported (`src/core/log.ts`)
 7. **Node runtime** — Node 20+ with Bun for install and build; Claude Code, Codex and ACP CLIs installed on the host
 
@@ -32,6 +32,7 @@ yagami is a self-hosted gateway that exposes the coding-agent CLIs already insta
 - src/server/config.ts — config file, API key, server state paths
 - src/core/engine.ts — YagamiEngine, the central request handler
 - src/core/client.ts — zero-config library client
+- src/core/errors.ts — ProviderError, UsageLimitError and ApiError classes
 - src/core/providers/ — one adapter per CLI or protocol
 - src/core/transcript.ts — request normalization and prefix keys
 - src/core/openai.ts — OpenAI Chat Completions translation
@@ -71,3 +72,4 @@ yagami is a self-hosted gateway that exposes the coding-agent CLIs already insta
 - Session cache maps conversation prefixes to Claude Code session ids for resume
 - Detects installed and signed-in CLIs and reports harness status
 - Settings parity modes: terminal, project, or isolated config loading
+- Reports agent error reasons and usage-limit errors to callers
