@@ -14,6 +14,11 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # TypeScript 7 (the Go compiler) has no compiler API, which tsup needs
+      # to emit .d.ts files; stay on 6.x until tsup builds them with 7.
+      - dependency-name: typescript
+        versions: [">=7"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
