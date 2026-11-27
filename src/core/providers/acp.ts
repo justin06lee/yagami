@@ -4,19 +4,33 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { PassThrough, Readable, Writable } from "node:stream";
+// The unstable entry: the stable one strips fields yagami reads — a
+// session's configOptions (models, effort levels) and a turn's usage.
 import {
-  ClientSideConnection,
+  client,
+  methods,
   ndJsonStream,
   PROTOCOL_VERSION,
+  type CancelNotification,
   type CreateElicitationRequest,
   type CreateElicitationResponse,
   type InitializeResponse,
+  type NewSessionRequest,
+  type NewSessionResponse,
+  type PromptRequest,
+  type PromptResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type ResumeSessionRequest,
+  type ResumeSessionResponse,
   type SessionConfigOption,
   type SessionNotification,
-} from "@agentclientprotocol/sdk";
-import type { ContentBlock as AcpContentBlock, HttpHeader, McpServer } from "@agentclientprotocol/sdk";
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
+  type SetSessionModeRequest,
+  type SetSessionModeResponse,
+} from "@agentclientprotocol/sdk/unstable";
+import type { ContentBlock as AcpContentBlock, HttpHeader, McpServer } from "@agentclientprotocol/sdk/unstable";
 import { resolveExecutable } from "../executable.js";
 import {
   classifyProviderFailure,
@@ -58,9 +72,21 @@ export interface AcpHandlers {
   onInput?: (p: CreateElicitationRequest) => Promise<CreateElicitationResponse>;
 }
 
+/** The agent-side calls yagami makes over a connection. */
+export interface AcpAgent {
+  newSession(params: NewSessionRequest): Promise<NewSessionResponse>;
+  resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse>;
+  prompt(params: PromptRequest): Promise<PromptResponse>;
+  cancel(params: CancelNotification): Promise<void>;
+  setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse>;
+  setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse>;
+  /** A method outside the typed set (an older agent's `session/set_model`). */
+  request(method: string, params: unknown): Promise<unknown>;
+}
+
 /** A live ACP agent process plus its negotiated connection. */
 export interface AcpConnection {
-  agent: ClientSideConnection;
+  agent: AcpAgent;
   init: InitializeResponse;
   setHandlers(handlers: AcpHandlers): void;
   close(): void;
@@ -224,18 +250,28 @@ export class AcpProvider implements SessionProvider {
         Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
         Readable.toWeb(jsonLinesOnly(child.stdout!, noteNoise)) as ReadableStream<Uint8Array>,
       );
-      const agent = new ClientSideConnection(
-        () => ({
-          requestPermission: (p) => (handlers.onPermission ? handlers.onPermission(p) : rejectOption(p)),
-          createElicitation: (p) =>
-            handlers.onInput ? handlers.onInput(p) : Promise.resolve({ action: "decline" }),
-          completeElicitation: () => {},
-          sessionUpdate: (n) => {
-            handlers.onUpdate?.(n);
-          },
-        }),
-        stream,
-      );
+      const connection = client({ name: this.appName })
+        .onRequest(methods.client.session.requestPermission, ({ params }) =>
+          handlers.onPermission ? handlers.onPermission(params) : rejectOption(params),
+        )
+        .onRequest(methods.client.elicitation.create, ({ params }) =>
+          handlers.onInput ? handlers.onInput(params) : Promise.resolve({ action: "decline" as const }),
+        )
+        .onNotification(methods.client.elicitation.complete, () => {})
+        .onNotification(methods.client.session.update, ({ params }) => {
+          handlers.onUpdate?.(params);
+        })
+        .connect(stream);
+      const peer = connection.agent;
+      const agent: AcpAgent = {
+        newSession: (p) => peer.request(methods.agent.session.new, p),
+        resumeSession: (p) => peer.request(methods.agent.session.resume, p),
+        prompt: (p) => peer.request(methods.agent.session.prompt, p),
+        cancel: (p) => peer.notify(methods.agent.session.cancel, p),
+        setSessionMode: (p) => peer.request(methods.agent.session.setMode, p).then((r) => r ?? {}),
+        setSessionConfigOption: (p) => peer.request(methods.agent.session.setConfigOption, p),
+        request: (method, params) => peer.request(method, params),
+      };
       let settled = false;
       // An agent that never answers the handshake used to be left running
       // for good, with nobody holding it and nothing to close it with.
@@ -258,8 +294,8 @@ export class AcpProvider implements SessionProvider {
         clearTimeout(handshake);
         reject(classifyProviderFailure(this.id, this.loginCommand, new Error(`${this.executable} exited with code ${code}${stderr ? `: ${stderr.trim().slice(-400)}` : ""}`)));
       });
-      agent
-        .initialize({
+      peer
+        .request(methods.agent.initialize, {
           protocolVersion: PROTOCOL_VERSION,
           clientInfo: { name: this.appName, version: VERSION },
           clientCapabilities: {
