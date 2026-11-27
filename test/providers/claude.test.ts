@@ -6,7 +6,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: queryMock }));
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ClaudeProvider, planLimits } from "../../src/core/providers/claude.js";
+import { ClaudeProvider, planLimits, versionAtLeast } from "../../src/core/providers/claude.js";
 import { AuthRequiredError, UsageLimitError } from "../../src/core/errors.js";
 import { collect } from "../helpers/fakeProvider.js";
 
@@ -346,5 +346,42 @@ describe("ClaudeProvider.listModels", () => {
         supports_auto_mode: true,
       },
     ]);
+  });
+});
+
+describe("ClaudeProvider MCP delivery", () => {
+  const fakeCli = (version: string) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yagami-claude-"));
+    const bin = path.join(dir, "claude");
+    fs.writeFileSync(bin, `#!/bin/sh\necho "${version} (Claude Code)"\n`, { mode: 0o755 });
+    return bin;
+  };
+  const mcpTurn = async (cli: string) => {
+    queryMock.mockImplementation(() => sdkRun());
+    const p = new ClaudeProvider({ path: cli });
+    await collect(p.run({ prompt: "ping", mcpServers: { editor: { url: "http://127.0.0.1:1/mcp", headers: { Authorization: "Bearer secret" } } } }));
+    await collect(p.run({ prompt: "again", mcpServers: { editor: { url: "http://127.0.0.1:1/mcp" } } }));
+    return queryMock.mock.calls.map((c) => c[0].options);
+  };
+
+  it("sends a request's MCP servers over stdin when the CLI is at least the SDK's build", async () => {
+    const [first, second] = await mcpTurn(fakeCli("9.9.999"));
+    expect(first.mcpServersDelivery).toBe("initialize");
+    expect(second.mcpServersDelivery).toBe("initialize");
+  });
+  it("stays on the command line for an older CLI, which would refuse the option", async () => {
+    const [first] = await mcpTurn(fakeCli("2.1.0"));
+    expect(first.mcpServersDelivery).toBe("argv");
+  });
+  it("leaves delivery unset on a turn without MCP servers", async () => {
+    queryMock.mockImplementation(() => sdkRun());
+    await collect(new ClaudeProvider({ path: fakeCli("9.9.999") }).run({ prompt: "ping" }));
+    expect(queryMock.mock.calls[0]![0].options.mcpServersDelivery).toBeUndefined();
+  });
+  it("compares dotted versions numerically", () => {
+    expect(versionAtLeast("2.1.332", "2.1.332")).toBe(true);
+    expect(versionAtLeast("2.1.1000", "2.1.332")).toBe(true);
+    expect(versionAtLeast("2.1.325", "2.1.332")).toBe(false);
+    expect(versionAtLeast("3.0.0", "2.9.9")).toBe(true);
   });
 });
