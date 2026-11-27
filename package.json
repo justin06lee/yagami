@@ -44,7 +44,7 @@
     "hono": "^4.13.23"
   },
   "devDependencies": {
-    "@types/node": "^24.19.4",
+    "@types/node": "^26.6.6",
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
