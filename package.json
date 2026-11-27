@@ -1,7 +1,7 @@
 {
   "name": "@justin06lee/yagami",
   "version": "0.15.1",
-  "description": "Self-hosted Anthropic- and OpenAI-compatible API backed by your signed-in coding-agent CLIs, plus a zero-config library for driving them from your own apps \u2014 no API keys needed.",
+  "description": "Self-hosted Anthropic- and OpenAI-compatible API backed by your signed-in coding-agent CLIs, plus a zero-config library for driving them from your own apps — no API keys needed.",
   "type": "module",
   "license": "MIT",
   "author": "justin06lee",
@@ -37,18 +37,18 @@
     "prepublishOnly": "bun run typecheck && bun run test"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.3.0",
-    "@anthropic-ai/claude-agent-sdk": "^0.3.0",
-    "@hono/node-server": "^1.14.0",
-    "commander": "^14.0.0",
-    "hono": "^4.7.0"
+    "@agentclientprotocol/sdk": "^1.9.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.332",
+    "@hono/node-server": "^1.19.19",
+    "commander": "^14.0.3",
+    "hono": "^4.13.23"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
-    "tsup": "^8.4.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.8.0",
-    "vitest": "^3.1.0"
+    "@types/node": "^24.19.4",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
   },
   "publishConfig": {
     "access": "public"

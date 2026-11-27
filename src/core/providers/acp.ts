@@ -227,9 +227,9 @@ export class AcpProvider implements SessionProvider {
       const agent = new ClientSideConnection(
         () => ({
           requestPermission: (p) => (handlers.onPermission ? handlers.onPermission(p) : rejectOption(p)),
-          unstable_createElicitation: (p) =>
+          createElicitation: (p) =>
             handlers.onInput ? handlers.onInput(p) : Promise.resolve({ action: "decline" }),
-          unstable_completeElicitation: () => {},
+          completeElicitation: () => {},
           sessionUpdate: (n) => {
             handlers.onUpdate?.(n);
           },

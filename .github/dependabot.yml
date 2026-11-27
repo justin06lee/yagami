@@ -1,0 +1,25 @@
+# Dependency updates, opened as PRs every day. CI checks each one; a patch or
+# minor update merges itself once CI passes (see ci.yml, job automerge).
+# Major updates stay open for a person to review. Nothing here publishes.
+version: 2
+updates:
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    versioning-strategy: increase
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        patterns: ["*"]

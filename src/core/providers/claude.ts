@@ -192,6 +192,10 @@ export class ClaudeProvider implements Provider {
         servers[name] = { type: "http", url: spec.url, ...(spec.headers ? { headers: spec.headers } : {}), alwaysLoad: true };
       }
       options.mcpServers = servers;
+      // A request's MCP headers carry its tokens: keep them off the command
+      // line (readable by every user of the machine) when the CLI can take
+      // them over stdin instead.
+      options.mcpServersDelivery = await this.mcpDelivery();
       options.canUseTool = allowMcp(mcp, req.serverTools ?? []);
       options.maxTurns = Math.max(options.maxTurns ?? 1, MCP_MAX_TURNS);
     }
@@ -341,10 +345,11 @@ export class ClaudeProvider implements Provider {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       // the SDK marks this call experimental and may rename it
-      const ask = (q as unknown as Record<string, (() => Promise<unknown>) | undefined>)["usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET"];
+      const ask = (q as unknown as Record<string, ((opts?: { skipBehaviors?: boolean }) => Promise<unknown>) | undefined>)["usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET"];
       if (typeof ask !== "function") return undefined;
       const usage = (await Promise.race([
-        ask.call(q),
+        // skip the local-transcript scan; only the plan windows are wanted
+        ask.call(q, { skipBehaviors: true }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("timed out reading plan usage")), 15_000);
           timer.unref?.();
@@ -431,6 +436,21 @@ export class ClaudeProvider implements Provider {
     }
   }
 
+  private delivery: Promise<"argv" | "initialize"> | undefined;
+  /**
+   * `initialize` sends MCP servers over stdin, but only a CLI at least as new
+   * as the one the SDK was built with understands it; older ones exit at
+   * startup. Checked once per provider.
+   */
+  private mcpDelivery(): Promise<"argv" | "initialize"> {
+    this.delivery ??= (async () => {
+      const bundled = bundledClaudeVersion();
+      const binary = (await this.version())?.match(/\d+\.\d+\.\d+/)?.[0];
+      return bundled && binary && versionAtLeast(binary, bundled) ? "initialize" : "argv";
+    })();
+    return this.delivery;
+  }
+
   async version(): Promise<string | undefined> {
     try {
       const out = spawnSync(this.executable, ["--version"], { encoding: "utf8", timeout: 10_000 });
@@ -465,6 +485,35 @@ export class ClaudeProvider implements Provider {
 }
 
 function sdkVersion(): string | undefined {
+  return sdkPackage()?.version;
+}
+
+/** The Claude Code build the bundled Agent SDK was made with. */
+function bundledClaudeVersion(): string | undefined {
+  return sdkPackage()?.claudeCodeVersion;
+}
+
+/** a ≥ b, for dotted numeric versions. */
+export function versionAtLeast(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const x = pa[i] ?? 0;
+    const y = pb[i] ?? 0;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    if (x !== y) return x > y;
+  }
+  return true;
+}
+
+let sdkPackageCache: { version?: string; claudeCodeVersion?: string } | null | undefined;
+function sdkPackage(): { version?: string; claudeCodeVersion?: string } | undefined {
+  if (sdkPackageCache !== undefined) return sdkPackageCache ?? undefined;
+  sdkPackageCache = readSdkPackage() ?? null;
+  return sdkPackageCache ?? undefined;
+}
+
+function readSdkPackage(): { version?: string; claudeCodeVersion?: string } | undefined {
   try {
     const req = createRequire(import.meta.url);
     const entry = req.resolve("@anthropic-ai/claude-agent-sdk");
@@ -472,8 +521,8 @@ function sdkVersion(): string | undefined {
     for (let i = 0; i < 4; i += 1) {
       const pkg = path.join(dir, "package.json");
       if (fs.existsSync(pkg)) {
-        const parsed = JSON.parse(fs.readFileSync(pkg, "utf8")) as { name?: string; version?: string };
-        if (parsed.name === "@anthropic-ai/claude-agent-sdk") return parsed.version;
+        const parsed = JSON.parse(fs.readFileSync(pkg, "utf8")) as { name?: string; version?: string; claudeCodeVersion?: string };
+        if (parsed.name === "@anthropic-ai/claude-agent-sdk") return { version: parsed.version, claudeCodeVersion: parsed.claudeCodeVersion };
       }
       dir = path.dirname(dir);
     }

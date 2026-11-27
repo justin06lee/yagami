@@ -698,3 +698,25 @@ describe("AcpProvider.openSession", () => {
       .toContain('"content":{"name":"Ruri"}');
   });
 });
+
+describe("AcpProvider over a real ACP connection", () => {
+  it("answers an agent's elicitation through the SDK's client handler", async () => {
+    const agent = new URL("../fixtures/acp-elicit-agent.mjs", import.meta.url).pathname;
+    const p = new AcpProvider({ id: "wire", label: "Wire", command: process.execPath, path: process.execPath, args: [agent] });
+    const requests: Array<Record<string, unknown>> = [];
+    const s = p.openSession({
+      cwd: "/tmp",
+      permissions: { decide: async () => "deny" },
+      input: {
+        respond: async (request: Record<string, unknown>) => {
+          requests.push(request);
+          return { action: "accept", values: { name: "Ruri" } };
+        },
+      },
+    } as never);
+    const events = await collect(s.send("work"));
+    await s.close();
+    expect(requests[0]).toMatchObject({ provider: "wire", kind: "form", message: "Name the workspace" });
+    expect(events.filter((e) => e.type === "text").map((e) => (e as { text: string }).text).join("")).toContain('"name":"Ruri"');
+  }, 20_000);
+});
