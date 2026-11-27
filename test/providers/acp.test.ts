@@ -719,4 +719,14 @@ describe("AcpProvider over a real ACP connection", () => {
     expect(requests[0]).toMatchObject({ provider: "wire", kind: "form", message: "Name the workspace" });
     expect(events.filter((e) => e.type === "text").map((e) => (e as { text: string }).text).join("")).toContain('"name":"Ruri"');
   }, 20_000);
+
+  it("carries a session's models and a turn's usage and context size over the wire", async () => {
+    const agent = new URL("../fixtures/acp-elicit-agent.mjs", import.meta.url).pathname;
+    const p = new AcpProvider({ id: "wire", label: "Wire", command: process.execPath, path: process.execPath, args: [agent] });
+    expect((await p.listModels()).map((m) => m.id)).toEqual(["m1"]);
+    const events = await collect(p.run({ prompt: "ping" }));
+    // no input handler on a completion turn: the question is declined
+    expect(events.filter((e) => e.type === "text").map((e) => (e as { text: string }).text).join("")).toContain('"action":"decline"');
+    expect(events.at(-1)).toMatchObject({ type: "done", usage: { input_tokens: 11, output_tokens: 4 }, contextWindow: 4096, costUsd: 0.001 });
+  }, 20_000);
 });
